@@ -1,8 +1,19 @@
-"""Tests for every annotation validation rule in the contract."""
+"""Tests for every annotation validation rule and CLI revision checking."""
 
 from __future__ import annotations
 
-from lerobot_check.schema import AnnotationRow, SubtaskSpec, TaskSpec
+from pathlib import Path
+
+import pytest
+
+from lerobot_check import cli
+from lerobot_check.schema import (
+    AnnotationRow,
+    SubtaskSpec,
+    TaskSpec,
+    save_annotations,
+    save_task_spec,
+)
 from lerobot_check.validate import validate_annotations
 
 
@@ -45,7 +56,6 @@ def test_valid_full_and_omitted_episodes() -> None:
         _row(episode_index=0, subtask="open_carton", start=0, end=100, contact=40, grasp=50),
         _row(episode_index=0, subtask="place_eggs", start=100, end=250, contact=120, grasp=130),
     ]
-    # Episode 1 is intentionally omitted; validate must allow missing episodes.
     violations = validate_annotations(rows, spec, {0: 250, 1: 300})
     assert violations == []
 
@@ -53,9 +63,7 @@ def test_valid_full_and_omitted_episodes() -> None:
 def test_valid_single_subtask_supplement_episode() -> None:
     spec = _make_spec(("stage_a", "stage_b", "stage_c"))
     rows = [
-        # Single-stage supplement covering the entire episode for stage_b only.
         _row(episode_index=0, subtask="stage_b", start=0, end=180, contact=30, grasp=45),
-        # Contiguous partial supplement covering stage_b -> stage_c.
         _row(episode_index=1, subtask="stage_b", start=0, end=90),
         _row(episode_index=1, subtask="stage_c", start=90, end=200),
     ]
@@ -66,13 +74,10 @@ def test_valid_single_subtask_supplement_episode() -> None:
 def test_missing_frames_start_middle_and_end() -> None:
     spec = _make_spec()
     rows = [
-        # Episode 0: missing leading frames [0, 10)
         _row(episode_index=0, subtask="open_carton", start=10, end=100),
         _row(episode_index=0, subtask="place_eggs", start=100, end=200),
-        # Episode 1: gap in the middle [100, 115)
         _row(episode_index=1, subtask="open_carton", start=0, end=100),
         _row(episode_index=1, subtask="place_eggs", start=115, end=200),
-        # Episode 2: missing trailing frames [180, 200)
         _row(episode_index=2, subtask="open_carton", start=0, end=100),
         _row(episode_index=2, subtask="place_eggs", start=100, end=180),
     ]
@@ -94,15 +99,10 @@ def test_overlap_violation() -> None:
 def test_out_of_range_violations() -> None:
     spec = _make_spec()
     rows = [
-        # Negative start
         _row(episode_index=0, subtask="open_carton", start=-5, end=100),
-        # End exceeds episode length
         _row(episode_index=1, subtask="open_carton", start=0, end=150),
-        # Episode index does not exist in dataset metadata
         _row(episode_index=99, subtask="open_carton", start=0, end=50),
-        # grasp == end (illegal because [start, end) is half-open)
         _row(episode_index=2, subtask="open_carton", start=0, end=100, grasp=100),
-        # contact < start
         _row(episode_index=3, subtask="open_carton", start=0, end=100, contact=-1),
     ]
     violations = validate_annotations(rows, spec, {0: 100, 1: 120, 2: 100, 3: 100})
@@ -135,13 +135,10 @@ def test_unknown_subtask_violation() -> None:
 def test_wrong_subtask_order_reversed_duplicate_and_skipped() -> None:
     spec = _make_spec(("stage_a", "stage_b", "stage_c"))
     rows = [
-        # Reversed order
         _row(episode_index=0, subtask="stage_b", start=0, end=100),
         _row(episode_index=0, subtask="stage_a", start=100, end=200),
-        # Duplicate subtask
         _row(episode_index=1, subtask="stage_a", start=0, end=100),
         _row(episode_index=1, subtask="stage_a", start=100, end=200),
-        # Non-contiguous skip (stage_a -> stage_c)
         _row(episode_index=2, subtask="stage_a", start=0, end=100),
         _row(episode_index=2, subtask="stage_c", start=100, end=200),
     ]
@@ -163,3 +160,79 @@ def test_empty_table_and_inconsistent_dataset_violations() -> None:
     ]
     violations = validate_annotations(rows, spec, {0: 100, 1: 100})
     assert [v.rule for v in violations] == ["inconsistent_dataset"]
+
+
+def test_revision_mismatch_violation() -> None:
+    spec = _make_spec()
+    rows = [_row(episode_index=0, subtask="open_carton", start=0, end=100, revision="x")]
+    violations = validate_annotations(
+        rows,
+        spec,
+        {0: 100},
+        expected_revision="4b03b879c274e11040d2ad882b56172354d0cb9d",
+    )
+    assert [v.rule for v in violations] == ["revision_mismatch"]
+
+
+def test_cli_validate_enforces_detected_revision_and_warns_on_local(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    spec = _make_spec()
+    spec_path = tmp_path / "spec.yaml"
+    save_task_spec(spec, spec_path)
+
+    ann_path = tmp_path / "annotations.csv"
+    save_annotations(
+        [_row(episode_index=0, subtask="open_carton", start=0, end=100, revision="x")],
+        ann_path,
+    )
+    fake_root = tmp_path / "dataset"
+    fake_root.mkdir()
+
+    class _FakeDatasetView:
+        detected_revision = "4b03b879c274e11040d2ad882b56172354d0cb9d"
+
+        def __init__(self, root: Path, *, repo_id: str | None = None, revision: str | None = None):
+            self.root = root
+            self.repo_id = repo_id or "org/ds"
+            self.revision = revision or self.detected_revision
+            self.episode_lengths = {0: 100}
+            self.total_episodes = 1
+
+    monkeypatch.setattr(cli, "DatasetView", _FakeDatasetView)
+
+    # 1. Detected revision mismatches row revision 'x' -> non-zero exit with revision_mismatch.
+    exit_code = cli.main(
+        [
+            "validate",
+            "--dataset-root",
+            str(fake_root),
+            "--task-spec",
+            str(spec_path),
+            "--annotations",
+            str(ann_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 1
+    assert "revision_mismatch" in captured.err
+
+    # 2. Undetected revision ('local') -> warning on stderr, exit 0.
+    _FakeDatasetView.detected_revision = "local"
+    exit_code = cli.main(
+        [
+            "validate",
+            "--dataset-root",
+            str(fake_root),
+            "--task-spec",
+            str(spec_path),
+            "--annotations",
+            str(ann_path),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert exit_code == 0
+    assert "Warning" in captured.err
+    assert "not verified" in captured.err

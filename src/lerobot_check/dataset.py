@@ -61,14 +61,18 @@ class ArmState:
         tcp_xyz: TCP positions of shape ``(N, 3)`` in meters.
         tcp_rot6d: 6D TCP orientations of shape ``(N, 6)``, storing the first two
             columns of the 3x3 rotation matrix (see module docstring).
-        gripper: Gripper position trajectory of shape ``(N,)`` where ``1.0`` is
-            open and values toward ``0.0`` are closed on Xense/Elite rigs.
+        gripper: Observed gripper position trajectory of shape ``(N,)`` where
+            ``1.0`` is open and values toward ``0.0`` are closed on Xense/Elite rigs.
+        action_gripper: Optional commanded gripper action trajectory of shape ``(N,)``
+            from the dataset's ``action`` feature, used to detect active squeezes
+            when ``action_gripper - gripper <= -gap``.
     """
 
     arm: str
     tcp_xyz: np.ndarray
     tcp_rot6d: np.ndarray
     gripper: np.ndarray
+    action_gripper: np.ndarray | None = None
 
 
 @dataclass(frozen=True)
@@ -256,6 +260,27 @@ def parse_arm_feature_indices(state_names: Sequence[str]) -> dict[str, ArmFeatur
     return arms
 
 
+def parse_action_gripper_indices(action_names: Sequence[str]) -> dict[str, int]:
+    """Extract per-arm gripper indices from ``action`` feature names.
+
+    Args:
+        action_names: Ordered feature names from ``meta/info.json`` for ``action``.
+
+    Returns:
+        Mapping from arm name (``"left"``, ``"right"``, or ``"default"``) to the
+        column index of ``gripper.pos`` inside ``action``.
+    """
+    name_to_idx = {name: idx for idx, name in enumerate(action_names)}
+    indices: dict[str, int] = {}
+    for prefix, arm_name in (("left_", "left"), ("right_", "right"), ("", "default")):
+        grip_key = f"{prefix}gripper.pos"
+        if grip_key in name_to_idx:
+            indices[arm_name] = name_to_idx[grip_key]
+            if arm_name == "default":
+                break
+    return indices
+
+
 def _build_episode_records(
     root: Path,
     meta: LeRobotDatasetMetadata,
@@ -352,6 +377,15 @@ class DatasetView:
         self.state_names: tuple[str, ...] = tuple(str(name) for name in raw_names)
         self.arm_indices: dict[str, ArmFeatureIndices] = parse_arm_feature_indices(self.state_names)
 
+        self.action_gripper_indices: dict[str, int] = {}
+        action_feature = self.meta.features.get("action")
+        if isinstance(action_feature, dict):
+            raw_action_names = action_feature.get("names")
+            if isinstance(raw_action_names, list):
+                self.action_gripper_indices = parse_action_gripper_indices(
+                    [str(name) for name in raw_action_names]
+                )
+
     @property
     def episode_lengths(self) -> dict[int, int]:
         """Return ``{episode_index: length}`` for all episodes in metadata."""
@@ -397,21 +431,51 @@ class DatasetView:
     def load_episode_arm_states(self, episode_index: int) -> list[ArmState]:
         """Load structured per-arm TCP and gripper trajectories for one episode.
 
+        Includes ``action_gripper`` whenever the dataset defines matching
+        ``action`` gripper columns.
+
         Args:
             episode_index: Zero-based episode index.
 
         Returns:
             List of ``ArmState`` objects (ordered by ``arm_indices``).
         """
-        states = self.load_episode_state_matrix(episode_index)
+        record = self.get_episode(episode_index)
+        columns = ["episode_index", "frame_index", "observation.state"]
+        has_action = bool(self.action_gripper_indices)
+        if has_action:
+            columns.append("action")
+
+        ep_table = pq.read_table(
+            record.data_path,
+            columns=columns,
+            filters=[("episode_index", "==", episode_index)],
+        )
+        frame_indices = ep_table["frame_index"].to_numpy()
+        order = np.argsort(frame_indices)
+        states = np.stack(ep_table["observation.state"].to_numpy()).astype(np.float64)[order]
+        if len(states) != record.length:
+            raise ValueError(
+                f"Episode {episode_index}: metadata length {record.length} != "
+                f"parquet row count {len(states)}"
+            )
+
+        actions: np.ndarray | None = None
+        if has_action:
+            actions = np.stack(ep_table["action"].to_numpy()).astype(np.float64)[order]
+
         result: list[ArmState] = []
         for arm_name, idx in self.arm_indices.items():
+            action_grip: np.ndarray | None = None
+            if actions is not None and arm_name in self.action_gripper_indices:
+                action_grip = actions[:, self.action_gripper_indices[arm_name]]
             result.append(
                 ArmState(
                     arm=arm_name,
                     tcp_xyz=states[:, list(idx.xyz)],
                     tcp_rot6d=states[:, list(idx.rot6d)],
                     gripper=states[:, idx.gripper],
+                    action_gripper=action_grip,
                 )
             )
         return result

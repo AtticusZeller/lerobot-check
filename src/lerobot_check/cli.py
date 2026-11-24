@@ -9,6 +9,7 @@ from pathlib import Path
 
 from lerobot_check.dataset import DatasetView, resolve_dataset_root
 from lerobot_check.propose import (
+    DEFAULT_RENDER_EVENT_TYPES,
     ProposeConfig,
     format_proposals_csv,
     load_proposal_event_frames,
@@ -44,6 +45,15 @@ def _parse_episode_list(values: Sequence[str] | None, total_episodes: int) -> li
     return sorted(episodes)
 
 
+def _parse_event_types(raw: str | None) -> tuple[str, ...]:
+    if not raw:
+        return DEFAULT_RENDER_EVENT_TYPES
+    items = tuple(part.strip() for part in raw.split(",") if part.strip())
+    if not items:
+        return DEFAULT_RENDER_EVENT_TYPES
+    return items
+
+
 def _add_dataset_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--dataset-root",
@@ -67,8 +77,9 @@ def _cmd_propose(args: argparse.Namespace) -> int:
     dataset = DatasetView(root, repo_id=args.repo_id)
     episodes = _parse_episode_list(args.episodes, dataset.total_episodes)
     config = ProposeConfig(
-        close_threshold=args.close_threshold,
-        open_threshold=args.open_threshold,
+        gripper_delta=args.gripper_delta,
+        squeeze_gap=args.squeeze_gap,
+        min_squeeze_s=args.min_squeeze_s,
         low_speed_threshold_mps=args.low_speed_threshold,
         min_low_speed_s=args.min_low_speed_s,
     )
@@ -76,10 +87,12 @@ def _cmd_propose(args: argparse.Namespace) -> int:
     if args.output is not None:
         write_proposals_csv(proposals, args.output)
         total_gripper = sum(len(p.gripper_events) for p in proposals)
+        total_squeeze = sum(len(p.squeeze_segments) for p in proposals)
         total_slow = sum(len(p.low_speed_segments) for p in proposals)
         print(
             f"Wrote {args.output}: {len(proposals)} episode(s), "
-            f"{total_gripper} gripper event(s), {total_slow} low-speed segment(s)."
+            f"{total_gripper} gripper motion(s), {total_squeeze} squeeze interval(s), "
+            f"{total_slow} low-speed segment(s)."
         )
     else:
         sys.stdout.write(format_proposals_csv(proposals))
@@ -95,24 +108,35 @@ def _cmd_render(args: argparse.Namespace) -> int:
     if args.frames is not None:
         frame_indices = parse_frame_spec(args.frames, record.length)
     else:
+        event_types = _parse_event_types(args.event_types)
         event_frames: list[int] = []
         if args.events is not None:
             event_frames.extend(parse_frame_spec(args.events, record.length))
         if args.proposals is not None:
-            event_frames.extend(load_proposal_event_frames(args.proposals, args.episode))
+            event_frames.extend(
+                load_proposal_event_frames(args.proposals, args.episode, event_types=event_types)
+            )
         if not event_frames:
             proposal = propose_episode(
                 dataset,
                 args.episode,
                 config=ProposeConfig(
-                    close_threshold=args.close_threshold,
-                    open_threshold=args.open_threshold,
+                    gripper_delta=args.gripper_delta,
+                    squeeze_gap=args.squeeze_gap,
+                    min_squeeze_s=args.min_squeeze_s,
                 ),
             )
-            event_frames = [ev.frame for ev in proposal.gripper_events]
+            if "gripper_close" in event_types:
+                event_frames.extend(
+                    ev.frame for ev in proposal.gripper_events if ev.kind == "close"
+                )
+            if "gripper_open" in event_types:
+                event_frames.extend(ev.frame for ev in proposal.gripper_events if ev.kind == "open")
+            if "squeeze" in event_types:
+                event_frames.extend(seg.start for seg in proposal.squeeze_segments)
         if not event_frames:
             print(
-                f"Episode {args.episode} has no candidate gripper events; "
+                f"Episode {args.episode} has no candidate events matching {event_types}; "
                 "pass --frames or --events explicitly.",
                 file=sys.stderr,
             )
@@ -161,12 +185,24 @@ def _cmd_validate(args: argparse.Namespace) -> int:
         return 1
 
     root = resolve_dataset_root(args.dataset_root, args.repo_id)
-    dataset = DatasetView(root, repo_id=args.repo_id)
+    dataset = DatasetView(root, repo_id=args.repo_id, revision=args.revision)
+
+    expected_revision: str | None = None
+    if dataset.revision == "local":
+        print(
+            "Warning: dataset revision could not be detected ('local'); "
+            "annotation revision was not verified.",
+            file=sys.stderr,
+        )
+    else:
+        expected_revision = dataset.revision
+
     violations = validate_annotations(
         rows,
         task_spec,
         dataset.episode_lengths,
         expected_repo_id=args.repo_id,
+        expected_revision=expected_revision,
     )
     if violations:
         for violation in violations:
@@ -195,7 +231,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     propose_parser = subparsers.add_parser(
         "propose",
-        help="Propose per-arm gripper close/open events and TCP low-speed segments.",
+        help="Propose gripper close/open motions, active squeezes, and TCP low-speed segments.",
     )
     _add_dataset_args(propose_parser)
     propose_parser.add_argument(
@@ -205,16 +241,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Episode indices or start:end ranges (comma or space separated). Default: all.",
     )
     propose_parser.add_argument(
-        "--close-threshold",
+        "--gripper-delta",
         type=float,
-        default=0.5,
-        help="Gripper position <= threshold triggers a close event (default: 0.5).",
+        default=0.06,
+        help="Relative gripper amplitude change required to emit close/open (default: 0.06).",
     )
     propose_parser.add_argument(
-        "--open-threshold",
+        "--squeeze-gap",
         type=float,
-        default=0.7,
-        help="Gripper position >= threshold triggers an open event (default: 0.7).",
+        default=0.05,
+        help="Gap threshold (action - state <= -gap) for squeeze intervals (default: 0.05).",
+    )
+    propose_parser.add_argument(
+        "--min-squeeze-s",
+        type=float,
+        default=0.2,
+        help="Minimum squeeze interval duration in seconds (default: 0.2).",
     )
     propose_parser.add_argument(
         "--low-speed-threshold",
@@ -264,7 +306,16 @@ def build_parser() -> argparse.ArgumentParser:
         "--proposals",
         type=Path,
         default=None,
-        help="Proposals CSV from `lerobot-check propose`; expands gripper events for --episode.",
+        help="Proposals CSV from `lerobot-check propose`; expands events for --episode.",
+    )
+    render_parser.add_argument(
+        "--event-types",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated proposal event types to render "
+            "(default: gripper_close,gripper_open,squeeze)."
+        ),
     )
     render_parser.add_argument(
         "--window-frames",
@@ -285,16 +336,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sampling stride in frames around events (default: 15).",
     )
     render_parser.add_argument(
-        "--close-threshold",
+        "--gripper-delta",
         type=float,
-        default=0.5,
-        help="Gripper close threshold used if auto-proposing events (default: 0.5).",
+        default=0.06,
+        help="Relative gripper delta used if auto-proposing events (default: 0.06).",
     )
     render_parser.add_argument(
-        "--open-threshold",
+        "--squeeze-gap",
         type=float,
-        default=0.7,
-        help="Gripper open threshold used if auto-proposing events (default: 0.7).",
+        default=0.05,
+        help="Squeeze gap used if auto-proposing events (default: 0.05).",
+    )
+    render_parser.add_argument(
+        "--min-squeeze-s",
+        type=float,
+        default=0.2,
+        help="Minimum squeeze duration (s) used if auto-proposing events (default: 0.2).",
     )
     render_parser.add_argument(
         "--cameras",
@@ -331,9 +388,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     validate_parser = subparsers.add_parser(
         "validate",
-        help="Validate an annotation CSV against a task spec and dataset episode lengths.",
+        help="Validate an annotation CSV against a task spec and dataset metadata.",
     )
     _add_dataset_args(validate_parser)
+    validate_parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        help="Expected dataset revision (overrides auto-detected local cache revision).",
+    )
     validate_parser.add_argument(
         "--annotations",
         type=Path,

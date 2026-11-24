@@ -3,8 +3,8 @@
 Reads the original 122-episode ``Xense/bi_elite_cs66_rt_egg_carton_to_tray_1016_fixed``
 dataset (pre-deletion episode numbering). Episode 108 is excluded, each cut frame
 is computed as ``round(cut_s * fps)`` (30 fps), and ``grasp`` is set to the first
-gripper-close frame reported by ``propose`` inside each subtask (left empty if the
-gripper does not close during that subtask).
+gripper close-motion start frame reported by ``propose`` inside each subtask (for
+the arm defined by ``task_spec.objects`` for that subtask, or any arm if omitted).
 """
 
 from __future__ import annotations
@@ -56,6 +56,18 @@ def load_cuts_csv(path: Path) -> dict[int, float]:
     return cuts
 
 
+def _arm_for_subtask(task_spec: TaskSpec, subtask: str) -> str | None:
+    """Resolve the single arm configured in ``task_spec.objects`` for ``subtask``, if any."""
+    matching = [obj for obj in task_spec.objects if obj.subtask == subtask]
+    grasp_arms = {obj.arm for obj in matching if obj.event == "grasp"}
+    if len(grasp_arms) == 1:
+        return next(iter(grasp_arms))
+    all_arms = {obj.arm for obj in matching}
+    if len(all_arms) == 1:
+        return next(iter(all_arms))
+    return None
+
+
 def build_annotations_from_cuts(
     cuts: Mapping[int, float],
     *,
@@ -93,6 +105,9 @@ def build_annotations_from_cuts(
 
     first_subtask = task_spec.subtasks[0].name
     second_subtask = task_spec.subtasks[1].name
+    first_arm = _arm_for_subtask(task_spec, first_subtask)
+    second_arm = _arm_for_subtask(task_spec, second_subtask)
+
     skipped = set(skip_episodes)
     rows: list[AnnotationRow] = []
 
@@ -111,8 +126,8 @@ def build_annotations_from_cuts(
             )
 
         proposal = proposals_by_episode[episode_index]
-        first_grasp = proposal.first_close_frame(0, cut_frame)
-        second_grasp = proposal.first_close_frame(cut_frame, length)
+        first_grasp = proposal.first_close_frame(0, cut_frame, arm=first_arm)
+        second_grasp = proposal.first_close_frame(cut_frame, length, arm=second_arm)
 
         rows.append(
             AnnotationRow(
@@ -200,16 +215,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Pre-deletion episode indices to omit (default: 108).",
     )
     parser.add_argument(
-        "--close-threshold",
+        "--gripper-delta",
         type=float,
-        default=0.5,
-        help="Gripper close threshold passed to propose (default: 0.5).",
-    )
-    parser.add_argument(
-        "--open-threshold",
-        type=float,
-        default=0.7,
-        help="Gripper open threshold passed to propose (default: 0.7).",
+        default=0.06,
+        help="Relative gripper delta passed to propose (default: 0.06).",
     )
     parser.add_argument(
         "-o",
@@ -230,10 +239,7 @@ def main(argv: list[str] | None = None) -> int:
     cuts = load_cuts_csv(args.cuts)
     skip_set = set(args.skip_episodes)
 
-    propose_config = ProposeConfig(
-        close_threshold=args.close_threshold,
-        open_threshold=args.open_threshold,
-    )
+    propose_config = ProposeConfig(gripper_delta=args.gripper_delta)
     proposals_by_episode = {
         ep: propose_episode(dataset, ep, config=propose_config)
         for ep in sorted(cuts)

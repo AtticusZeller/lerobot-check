@@ -1,4 +1,4 @@
-"""Tests for proprioceptive event proposal, hysteresis, and 6D rotation."""
+"""Tests for relative gripper motion, squeeze, TCP speed, and 6D rotation."""
 
 from __future__ import annotations
 
@@ -9,6 +9,7 @@ import pytest
 
 from lerobot_check.dataset import (
     ArmState,
+    parse_action_gripper_indices,
     parse_arm_feature_indices,
     rotation_6d_to_matrix,
 )
@@ -17,79 +18,183 @@ from lerobot_check.propose import (
     compute_tcp_linear_speed,
     detect_gripper_events,
     detect_low_speed_segments,
+    detect_squeeze_segments,
     load_proposal_event_frames,
     propose_episode_from_arms,
     write_proposals_csv,
 )
 
 
-def test_gripper_hysteresis_suppresses_threshold_jitter() -> None:
-    # Two real open->close->open cycles with heavy jitter around both thresholds
-    # (close_threshold=0.5, open_threshold=0.7).
-    signal = np.array(
+def test_relative_hysteresis_and_squeeze_mirroring_egg_pattern() -> None:
+    """Mirror real egg-pick pattern: ~0.33 plateau with +-0.01 jitter and dips to ~0.24."""
+    fps = 30.0
+    # Frames 0..11: plateau around 0.33 with +-0.01 jitter (must not trigger)
+    # Frames 12..14: close dip 0.30 -> 0.27 -> 0.24
+    # Frames 15..24: hold at ~0.24 with +-0.01 jitter; action commands 0.0 during [13, 25)
+    # Frames 25..27: open rise 0.27 -> 0.30 -> 0.33
+    # Frames 28..37: plateau around 0.33 with +-0.01 jitter
+    # Frames 38..40: second close dip 0.30 -> 0.27 -> 0.24
+    # Frames 41..48: hold at ~0.24 with +-0.01 jitter; action commands 0.0 during [39, 49)
+    # Frames 49..51: second open rise 0.27 -> 0.30 -> 0.33
+    # Frames 52..57: plateau around 0.33 with +-0.01 jitter
+    state = np.array(
         [
-            # Start open
-            1.0,
-            0.95,
-            0.60,
-            0.52,
-            # First real close at frame 4 (<= 0.5)
-            0.49,
-            # Jitter around 0.50..0.68 must NOT trigger open or extra close events
-            0.55,
-            0.46,
-            0.62,
-            0.44,
-            0.68,
+            # 0..11: plateau 0.33 +- 0.01
+            0.33,
+            0.34,
+            0.32,
+            0.33,
+            0.34,
+            0.32,
+            0.33,
+            0.33,
+            0.34,
+            0.32,
+            0.33,
+            0.33,
+            # 12..14: first close
             0.30,
+            0.27,
+            0.24,
+            # 15..24: hold ~0.24 +- 0.01
+            0.24,
             0.25,
-            # First real open at frame 12 (>= 0.7)
-            0.71,
-            # Jitter around 0.52..0.75 must NOT trigger close or extra open events
-            0.65,
-            0.73,
-            0.55,
-            0.78,
-            0.95,
-            # Second real close at frame 18 (<= 0.5)
-            0.50,
-            0.54,
-            0.48,
-            0.69,
-            0.22,
-            # Second real open at frame 23 (>= 0.7)
-            0.70,
-            0.66,
-            0.72,
-            1.0,
+            0.23,
+            0.24,
+            0.24,
+            0.25,
+            0.24,
+            0.23,
+            0.24,
+            0.24,
+            # 25..27: first open
+            0.27,
+            0.30,
+            0.33,
+            # 28..37: plateau 0.33 +- 0.01
+            0.33,
+            0.34,
+            0.32,
+            0.33,
+            0.34,
+            0.33,
+            0.32,
+            0.33,
+            0.34,
+            0.33,
+            # 38..40: second close
+            0.30,
+            0.27,
+            0.24,
+            # 41..48: hold ~0.24 +- 0.01
+            0.24,
+            0.25,
+            0.24,
+            0.23,
+            0.24,
+            0.24,
+            0.25,
+            0.24,
+            # 49..51: second open
+            0.27,
+            0.30,
+            0.33,
+            # 52..57: plateau 0.33 +- 0.01
+            0.33,
+            0.34,
+            0.32,
+            0.33,
+            0.34,
+            0.33,
         ],
         dtype=np.float64,
     )
-    events = detect_gripper_events(
-        signal,
-        episode_index=3,
-        arm="left",
-        fps=30.0,
-        close_threshold=0.5,
-        open_threshold=0.7,
-    )
-    assert [(ev.frame, ev.kind) for ev in events] == [
-        (4, "close"),
-        (12, "open"),
-        (18, "close"),
-        (23, "open"),
+    action = state.copy()
+    action[13:25] = 0.0
+    action[39:49] = 0.0
+    # Brief 3-frame dip (0.1s < min_duration_s=0.2s) must not emit a squeeze.
+    action[30:33] = 0.0
+
+    events = detect_gripper_events(state, episode_index=0, arm="left", fps=fps, delta=0.06)
+    assert [(ev.kind, ev.frame, ev.end_frame) for ev in events] == [
+        ("close", 12, 14),
+        ("open", 25, 27),
+        ("close", 38, 40),
+        ("open", 49, 51),
     ]
 
+    squeezes = detect_squeeze_segments(
+        state,
+        action,
+        episode_index=0,
+        arm="left",
+        fps=fps,
+        gap=0.05,
+        min_duration_s=0.2,
+    )
+    assert [(s.start, s.end) for s in squeezes] == [(13, 25), (39, 49)]
+    assert squeezes[0].median_gap == pytest.approx(-0.24, abs=0.01)
 
-def test_gripper_starting_closed_does_not_emit_spurious_close() -> None:
-    signal = np.array([0.2, 0.25, 0.4, 0.75, 0.8], dtype=np.float64)
-    events = detect_gripper_events(signal, episode_index=0, arm="left", fps=30.0)
-    assert [(ev.frame, ev.kind) for ev in events] == [(3, "open")]
+
+def test_relative_hysteresis_full_cycle_and_jitter_immunity() -> None:
+    """Verify full 1.0 -> 0.25 -> 1.0 cycle plus +-0.01 plateau jitter."""
+    fps = 30.0
+    signal = np.array(
+        [
+            # 0..5: open plateau ~1.0 with +-0.01 jitter
+            1.00,
+            0.99,
+            1.00,
+            0.99,
+            1.00,
+            1.00,
+            # 6..9: close ramp 0.80 -> 0.60 -> 0.40 -> 0.25
+            0.80,
+            0.60,
+            0.40,
+            0.25,
+            # 10..15: closed plateau ~0.25 with +-0.01 jitter
+            0.25,
+            0.26,
+            0.24,
+            0.25,
+            0.26,
+            0.25,
+            # 16..19: open ramp 0.45 -> 0.65 -> 0.85 -> 1.00
+            0.45,
+            0.65,
+            0.85,
+            1.00,
+            # 20..24: open plateau ~1.0 with +-0.01 jitter
+            1.00,
+            0.99,
+            1.00,
+            0.99,
+            1.00,
+        ],
+        dtype=np.float64,
+    )
+    events = detect_gripper_events(signal, episode_index=1, arm="left", fps=fps, delta=0.06)
+    assert [(ev.kind, ev.frame, ev.end_frame) for ev in events] == [
+        ("close", 6, 9),
+        ("open", 16, 19),
+    ]
+    assert events[0].amplitude == pytest.approx(-0.76, abs=0.02)
+    assert events[1].amplitude == pytest.approx(0.76, abs=0.02)
 
 
-def test_invalid_hysteresis_thresholds_raise() -> None:
-    with pytest.raises(ValueError, match="close_threshold"):
-        ProposeConfig(close_threshold=0.7, open_threshold=0.5)
+def test_small_jitter_only_produces_zero_events() -> None:
+    rng = np.random.default_rng(42)
+    signal = 0.33 + rng.uniform(-0.01, 0.01, size=200)
+    events = detect_gripper_events(signal, episode_index=0, arm="left", fps=30.0, delta=0.06)
+    assert events == []
+
+
+def test_invalid_propose_config_raises() -> None:
+    with pytest.raises(ValueError, match="gripper_delta"):
+        ProposeConfig(gripper_delta=0.0)
+    with pytest.raises(ValueError, match="squeeze_gap"):
+        ProposeConfig(squeeze_gap=-0.05)
 
 
 def test_tcp_linear_speed_and_low_speed_segments() -> None:
@@ -127,11 +232,15 @@ def test_tcp_linear_speed_and_low_speed_segments() -> None:
 
 def test_propose_episode_and_csv_round_trip(tmp_path: Path) -> None:
     n = 30
+    state_g = np.array([1.0] * 10 + [0.3] * 10 + [0.9] * 10, dtype=np.float64)
+    action_g = state_g.copy()
+    action_g[11:19] = 0.0
     left = ArmState(
         arm="left",
         tcp_xyz=np.zeros((n, 3), dtype=np.float64),
         tcp_rot6d=np.tile(np.array([1.0, 0.0, 0.0, 0.0, 1.0, 0.0]), (n, 1)),
-        gripper=np.array([1.0] * 10 + [0.3] * 10 + [0.9] * 10, dtype=np.float64),
+        gripper=state_g,
+        action_gripper=action_g,
     )
     proposal = propose_episode_from_arms(
         episode_index=2,
@@ -142,11 +251,12 @@ def test_propose_episode_and_csv_round_trip(tmp_path: Path) -> None:
     )
     assert proposal.first_close_frame(0, 30) == 10
     assert proposal.first_close_frame(15, 30) is None
+    assert [(s.start, s.end) for s in proposal.squeeze_segments] == [(11, 19)]
 
     csv_path = tmp_path / "proposals.csv"
     write_proposals_csv([proposal], csv_path)
-    loaded_frames = load_proposal_event_frames(csv_path, episode_index=2)
-    assert loaded_frames == [10, 20]
+    assert load_proposal_event_frames(csv_path, episode_index=2) == [10, 11, 20]
+    assert load_proposal_event_frames(csv_path, episode_index=2, event_types=("squeeze",)) == [11]
 
 
 def test_rotation_6d_to_matrix_matches_first_two_columns() -> None:
@@ -159,7 +269,6 @@ def test_rotation_6d_to_matrix_matches_first_two_columns() -> None:
         ],
         dtype=np.float64,
     )
-    # Column 0 then Column 1 of R, with slight scale/non-orthogonality to exercise Gram-Schmidt.
     col0 = expected[:, 0] * 1.2
     col1 = expected[:, 1] * 0.8 + 0.1 * expected[:, 0]
     r6d = np.concatenate([col0, col1])
@@ -169,7 +278,7 @@ def test_rotation_6d_to_matrix_matches_first_two_columns() -> None:
     assert np.linalg.det(reconstructed) == pytest.approx(1.0)
 
 
-def test_parse_arm_feature_indices_bimanual() -> None:
+def test_parse_arm_and_action_feature_indices_bimanual() -> None:
     names = [
         "left_tcp.x",
         "left_tcp.y",
@@ -199,3 +308,4 @@ def test_parse_arm_feature_indices_bimanual() -> None:
     assert parsed["left"].gripper == 9
     assert parsed["right"].xyz == (10, 11, 12)
     assert parsed["right"].gripper == 19
+    assert parse_action_gripper_indices(names) == {"left": 9, "right": 19}

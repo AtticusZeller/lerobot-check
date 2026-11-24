@@ -8,7 +8,7 @@ Run all commands from the repository root with `uv run`. Never write annotation 
 
 ### 1. Propose Candidate Events
 
-Extract per-arm gripper close/open transitions and low-speed TCP segments from `observation.state`:
+Extract per-arm relative gripper motions, active squeeze intervals, and low-speed TCP segments from `observation.state` and `action`:
 
 ```bash
 uv run lerobot-check propose \
@@ -17,29 +17,31 @@ uv run lerobot-check propose \
   -o /tmp/lerobot-check/proposals.csv
 ```
 
-The output CSV has columns `episode_index,arm,event_type,frame,end_frame,time_s,value`:
+The output CSV has columns `episode_index,arm,event_type,frame,end_frame,time_s,value`. All proposed events are **candidates** to narrow visual inspection — always confirm contact, grasp, and subtask boundaries visually on rendered frames rather than copying proposal frames blindly:
 
-- `gripper_close` / `gripper_open`: frame where the gripper crosses the close or open threshold (with hysteresis). On Xense/Elite rigs, `1.0` is fully open and values toward `0.0` are closed.
-- `low_speed`: contiguous interval `[frame, end_frame)` where TCP linear speed stays below the threshold.
+- `gripper_close` / `gripper_open`: detected by **relative-amplitude hysteresis** on `observation.state` gripper position (no absolute thresholds). A `gripper_close` fires when gripper position drops by at least `--gripper-delta` (default `0.06`) from its running local maximum; `gripper_open` fires when it rises by at least `--gripper-delta` from its running local minimum. `frame` is where the motion begins leaving its prior plateau, `end_frame` is where it settles, and `value` is the signed amplitude change (`end_pos - start_pos`). This catches both full cycles (`1.0 -> 0.25 -> 1.0`) and small partial cycles while holding a tool (e.g. `0.34 -> 0.24 -> 0.34`).
+- `squeeze`: contiguous interval `[frame, end_frame)` where the commanded gripper closes significantly past the observed state (`action_gripper - state_gripper <= -gap`, default `--squeeze-gap 0.05` for at least `--min-squeeze-s 0.2` s); `value` is the median `action - state` gap. A squeeze reliably highlights active object/tool grasps even when a rigid object or tongs physically blocks the jaws from moving far.
+- `low_speed`: contiguous interval `[frame, end_frame)` where TCP linear speed stays below `--low-speed-threshold` (default `0.02` m/s); `value` is the median TCP speed.
 
 ### 2. Render Multi-Camera Contact Sheets
 
 Render tiled `head | left_wrist | right_wrist` PNG sheets with frame numbers and timestamps drawn on each row.
 
-Start with a coarse pass centered on candidate gripper events:
+Start with a coarse pass centered on candidate events (use `--event-types squeeze` to focus specifically on active squeezes, or omit it to include `gripper_close,gripper_open,squeeze`):
 
 ```bash
 uv run lerobot-check render \
   --dataset-root /path/to/dataset \
   --episode 0 \
   --proposals /tmp/lerobot-check/proposals.csv \
-  --window-s 2.0 \
+  --event-types squeeze \
+  --window-s 1.5 \
   --stride 15 \
   --tile-width 320 \
   -o /tmp/lerobot-check/ep0000_coarse.png
 ```
 
-If a subtask does not close the gripper (for example pushing or flipping a lid with open fingers), render a uniform coarse sweep across the candidate region:
+If a subtask does not close or squeeze the gripper (for example pushing or flipping a lid with open fingers), render a uniform coarse sweep across the candidate region:
 
 ```bash
 uv run lerobot-check render \
@@ -71,6 +73,7 @@ Write one CSV per `(repo_id, revision)` with the exact header:
 repo_id,revision,episode_index,subtask,start,end,contact,grasp,success,annotator,note
 ```
 
+- Set `revision` to the exact dataset revision hash (never use a placeholder when the dataset has a known revision; `validate` rejects mismatched revisions).
 - Set `annotator` to `agent`.
 - Use lowercase `true` or `false` for `success`.
 - Leave `contact`, `grasp`, or `note` empty when not applicable.
@@ -86,7 +89,7 @@ uv run lerobot-check validate \
   --annotations /tmp/lerobot-check/annotations.csv
 ```
 
-The command exits with code `0` only when there are zero violations. Fix every reported violation and re-run `validate`.
+`validate` checks frame coverage, subtask ordering, `contact`/`grasp` bounds, and every row's `revision` against the dataset's detected revision (printing a warning without failing if the local copy has no detectable revision). The command exits with code `0` only when there are zero violations. Fix every reported violation and re-run `validate`.
 
 ## Judgement Rules
 
@@ -99,8 +102,8 @@ The command exits with code `0` only when there are zero violations. Fix every r
 
 ### Fine-Contact Events (`contact`, `grasp`)
 
-- `contact`: the earliest frame in `[start, end)` where the gripper fingers visibly touch the target object (or lid/handle) before grasping or manipulating it. Use the wrist camera (`left_wrist` / `right_wrist`) together with `head` to confirm contact rather than depth projection from `head` alone.
-- `grasp`: the earliest frame in `[start, end)` where the gripper finishes closing around the object and securely holds it (typically near the first `gripper_close` event from `propose`, confirmed visually when fingers stop closing on the object and motion starts).
+- `contact`: the earliest frame in `[start, end)` where the gripper fingers (or held tool) visibly touch the target object before grasping or manipulating it. Use the wrist camera (`left_wrist` / `right_wrist`) together with `head` to confirm contact rather than depth projection from `head` alone.
+- `grasp`: the earliest frame in `[start, end)` where the gripper finishes closing around the object and securely holds it (often aligned with a `gripper_close` or `squeeze` start candidate, confirmed visually when fingers stop closing on the object and lift/motion starts).
 - **Ordering invariant**: whenever present, `start <= contact <= grasp < end`.
 - **Nullable fields**: if a subtask manipulates an object without closing the gripper (e.g., lifting a carton lid with open jaws), leave `grasp` empty (and `contact` empty if contact cannot be determined reliably). Never fabricate frame numbers.
 

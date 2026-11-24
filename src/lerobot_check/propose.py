@@ -25,34 +25,47 @@ PROPOSAL_COLUMNS: tuple[str, ...] = (
     "value",
 )
 
+DEFAULT_RENDER_EVENT_TYPES: tuple[str, ...] = (
+    "gripper_close",
+    "gripper_open",
+    "squeeze",
+)
+
 
 @dataclass(frozen=True)
 class ProposeConfig:
-    """Thresholds for gripper transition and low-speed segment detection.
+    """Parameters for relative gripper motion, squeeze, and low-speed detection.
 
     Attributes:
-        close_threshold: Gripper position at or below which an open gripper
-            transitions to closed (``1.0`` = open, toward ``0.0`` = closed).
-        open_threshold: Gripper position at or above which a closed gripper
-            transitions back to open. Must be strictly greater than
-            ``close_threshold`` to provide hysteresis against signal jitter.
+        gripper_delta: Minimum relative amplitude change in observed gripper
+            position from the running local extremum to confirm a close or open
+            motion (default ``0.06``, calibrated above +-0.01-0.02 jitter and below
+            tool-held egg pick strokes of ~0.08-0.15).
+        squeeze_gap: Minimum positive magnitude ``gap`` such that
+            ``action_gripper - state_gripper <= -gap`` indicates the gripper is
+            actively commanding further closure against a grasped object or tool
+            (default ``0.05``).
+        min_squeeze_s: Minimum contiguous duration (seconds) required to emit a
+            ``squeeze`` interval (default ``0.2``).
         low_speed_threshold_mps: TCP linear speed (m/s) below which a frame is
-            considered slow.
+            considered slow (default ``0.02``).
         min_low_speed_s: Minimum contiguous duration (seconds) required to emit
-            a low-speed segment.
+            a low-speed segment (default ``0.3``).
     """
 
-    close_threshold: float = 0.5
-    open_threshold: float = 0.7
+    gripper_delta: float = 0.06
+    squeeze_gap: float = 0.05
+    min_squeeze_s: float = 0.2
     low_speed_threshold_mps: float = 0.02
     min_low_speed_s: float = 0.3
 
     def __post_init__(self) -> None:
-        if self.close_threshold >= self.open_threshold:
-            raise ValueError(
-                f"close_threshold ({self.close_threshold}) must be < "
-                f"open_threshold ({self.open_threshold}) for hysteresis."
-            )
+        if self.gripper_delta <= 0.0:
+            raise ValueError(f"gripper_delta must be positive, got {self.gripper_delta}")
+        if self.squeeze_gap <= 0.0:
+            raise ValueError(f"squeeze_gap must be positive, got {self.squeeze_gap}")
+        if self.min_squeeze_s <= 0.0:
+            raise ValueError(f"min_squeeze_s must be positive, got {self.min_squeeze_s}")
         if self.low_speed_threshold_mps <= 0.0:
             raise ValueError(
                 f"low_speed_threshold_mps must be positive, got {self.low_speed_threshold_mps}"
@@ -63,23 +76,63 @@ class ProposeConfig:
 
 @dataclass(frozen=True)
 class GripperEvent:
-    """Detected gripper close or open transition.
+    """Detected relative-amplitude gripper close or open motion.
 
     Attributes:
         episode_index: Zero-based episode index.
         arm: Arm identifier (e.g. ``"left"`` or ``"right"``).
-        kind: ``"close"`` or ``"open"``.
-        frame: Frame index where the threshold crossing occurred.
+        kind: ``"close"`` (decreasing gripper position) or ``"open"`` (increasing).
+        frame: Frame index where the motion begins leaving its prior plateau.
+        end_frame: Frame index where the motion settles near its new extremum.
         time_s: Timestamp of ``frame`` in seconds.
-        gripper_pos: Observed gripper position at ``frame``.
+        end_time_s: Timestamp of ``end_frame`` in seconds.
+        start_pos: Gripper state at the pre-motion extremum.
+        end_pos: Gripper state at the settled extremum.
     """
 
     episode_index: int
     arm: str
     kind: GripperEventKind
     frame: int
+    end_frame: int
     time_s: float
-    gripper_pos: float
+    end_time_s: float
+    start_pos: float
+    end_pos: float
+
+    @property
+    def amplitude(self) -> float:
+        """Signed position change ``end_pos - start_pos``."""
+        return self.end_pos - self.start_pos
+
+
+@dataclass(frozen=True)
+class SqueezeSegment:
+    """Contiguous active-squeeze interval ``[start, end)``.
+
+    Emitted when ``action_gripper - state_gripper <= -gap`` persists for at
+    least ``min_duration_s`` (indicating the gripper commands closure while an
+    object or tool physically resists full closure).
+
+    Attributes:
+        episode_index: Zero-based episode index.
+        arm: Arm identifier.
+        start: Inclusive start frame of the squeeze interval.
+        end: Exclusive end frame of the squeeze interval.
+        start_time_s: Start timestamp in seconds.
+        end_time_s: End timestamp in seconds.
+        min_gap: Most negative ``action - state`` value inside ``[start, end)``.
+        median_gap: Median ``action - state`` value inside ``[start, end)``.
+    """
+
+    episode_index: int
+    arm: str
+    start: int
+    end: int
+    start_time_s: float
+    end_time_s: float
+    min_gap: float
+    median_gap: float
 
 
 @dataclass(frozen=True)
@@ -115,15 +168,17 @@ class EpisodeProposal:
         episode_index: Zero-based episode index.
         length: Total number of frames in the episode.
         fps: Dataset frame rate in Hz.
-        gripper_events: Sorted per-arm gripper close/open events.
-        low_speed_segments: Sorted per-arm low-speed segments.
+        gripper_events: Sorted per-arm relative close/open motions.
+        squeeze_segments: Sorted per-arm active-squeeze intervals.
+        low_speed_segments: Sorted per-arm low-speed TCP segments.
     """
 
     episode_index: int
     length: int
     fps: float
     gripper_events: tuple[GripperEvent, ...]
-    low_speed_segments: tuple[LowSpeedSegment, ...]
+    squeeze_segments: tuple[SqueezeSegment, ...] = ()
+    low_speed_segments: tuple[LowSpeedSegment, ...] = ()
 
     def first_close_frame(
         self,
@@ -132,7 +187,7 @@ class EpisodeProposal:
         *,
         arm: str | None = None,
     ) -> int | None:
-        """Return the earliest gripper-close frame inside ``[start, end)``.
+        """Return the earliest gripper-close motion start frame inside ``[start, end)``.
 
         Args:
             start: Inclusive start frame of the search window.
@@ -140,7 +195,7 @@ class EpisodeProposal:
             arm: Optional arm filter; when ``None``, considers all arms.
 
         Returns:
-            Earliest matching close frame index, or ``None`` if none occurred.
+            Earliest matching close-motion start frame, or ``None`` if none occurred.
         """
         candidates = [
             ev.frame
@@ -150,40 +205,86 @@ class EpisodeProposal:
         return min(candidates) if candidates else None
 
 
+def _refine_motion_bounds(
+    values: np.ndarray,
+    *,
+    kind: GripperEventKind,
+    ext_start: int,
+    ext_end: int,
+    trigger_idx: int,
+    delta: float,
+) -> tuple[int, int]:
+    """Tighten a confirmed hysteresis swing to its actual motion start and settle frames.
+
+    Because plateau jitter can place the raw running extremum many frames before
+    motion begins (or after it settles), walk backward from ``trigger_idx`` to
+    the last frame still within a small tolerance of the start extremum and
+    forward from that start to the first frame reaching the end extremum band.
+    """
+    val_start = float(values[ext_start])
+    val_end = float(values[ext_end])
+    amp = abs(val_start - val_end)
+    eps = min(0.15 * amp, 0.25 * delta)
+
+    start_frame = ext_start
+    end_frame = ext_end
+    if kind == "close":
+        for k in range(trigger_idx, ext_start - 1, -1):
+            if float(values[k]) >= val_start - eps:
+                start_frame = min(k + 1, trigger_idx)
+                break
+        for k in range(start_frame, ext_end + 1):
+            if float(values[k]) <= val_end + eps:
+                end_frame = k
+                break
+    else:
+        for k in range(trigger_idx, ext_start - 1, -1):
+            if float(values[k]) <= val_start + eps:
+                start_frame = min(k + 1, trigger_idx)
+                break
+        for k in range(start_frame, ext_end + 1):
+            if float(values[k]) >= val_end - eps:
+                end_frame = k
+                break
+
+    return start_frame, end_frame
+
+
 def detect_gripper_events(
     gripper: np.ndarray,
     *,
     episode_index: int,
     arm: str,
     fps: float,
-    close_threshold: float = 0.5,
-    open_threshold: float = 0.7,
+    delta: float = 0.06,
 ) -> list[GripperEvent]:
-    """Detect gripper close/open transitions using Schmitt-trigger hysteresis.
+    """Detect gripper close/open motions using relative-amplitude hysteresis.
 
-    On Xense/Elite rigs, ``1.0`` represents an open gripper and smaller values
-    toward ``0.0`` represent a closed gripper. Using separate ``close_threshold``
-    and ``open_threshold`` prevents signal jitter around a single threshold from
-    emitting spurious alternating events.
+    Tracks the running local extremum of the observed gripper position without
+    any absolute thresholds: a ``"close"`` motion fires once position drops by
+    at least ``delta`` from the running local maximum, and an ``"open"`` motion
+    fires once position rises by at least ``delta`` from the running local
+    minimum. Small oscillations below ``delta`` are ignored.
+
+    Each emitted ``GripperEvent`` records the frame where the motion leaves its
+    pre-motion plateau in ``frame`` and where it settles near the new extremum
+    in ``end_frame``.
 
     Args:
-        gripper: 1D array of gripper positions across an episode.
+        gripper: 1D array of observed gripper positions across an episode.
         episode_index: Episode index recorded in emitted events.
         arm: Arm label recorded in emitted events.
         fps: Frame rate in Hz.
-        close_threshold: Upper bound that triggers a ``"close"`` event.
-        open_threshold: Lower bound that triggers an ``"open"`` event.
+        delta: Minimum relative amplitude change required to confirm a motion.
 
     Returns:
         Chronologically ordered list of ``GripperEvent`` records.
 
     Raises:
-        ValueError: If ``close_threshold >= open_threshold`` or ``fps <= 0``.
+        ValueError: If ``delta <= 0``, ``fps <= 0``, or ``gripper`` is not 1D.
     """
-    if close_threshold >= open_threshold:
-        raise ValueError(
-            f"close_threshold ({close_threshold}) must be < open_threshold ({open_threshold})"
-        )
+    if delta <= 0.0:
+        raise ValueError(f"delta must be positive, got {delta}")
     if fps <= 0.0:
         raise ValueError(f"fps must be positive, got {fps}")
 
@@ -193,37 +294,170 @@ def detect_gripper_events(
     if len(values) < 2:
         return []
 
-    midpoint = 0.5 * (close_threshold + open_threshold)
-    is_closed = bool(values[0] <= close_threshold or values[0] < midpoint)
+    # Direction state: 0 = undecided, -1 = closing (tracking min), +1 = opening (tracking max).
+    direction = 0
+    run_max = float(values[0])
+    max_idx = 0
+    run_min = float(values[0])
+    min_idx = 0
+    peak_idx = 0
+    trough_idx = 0
+    trigger_idx = 0
+
+    raw_swings: list[tuple[GripperEventKind, int, int, int]] = []
+
+    for i in range(1, len(values)):
+        v = float(values[i])
+        if direction == 0:
+            if v >= run_max:
+                run_max = v
+                max_idx = i
+            if v <= run_min:
+                run_min = v
+                min_idx = i
+            if run_max - v >= delta:
+                direction = -1
+                peak_idx = max_idx
+                trigger_idx = i
+                run_min = v
+                min_idx = i
+            elif v - run_min >= delta:
+                direction = 1
+                trough_idx = min_idx
+                trigger_idx = i
+                run_max = v
+                max_idx = i
+        elif direction == -1:
+            if v < run_min:
+                run_min = v
+                min_idx = i
+            elif v - run_min >= delta:
+                raw_swings.append(("close", peak_idx, min_idx, trigger_idx))
+                direction = 1
+                trough_idx = min_idx
+                trigger_idx = i
+                run_max = v
+                max_idx = i
+        else:
+            if v > run_max:
+                run_max = v
+                max_idx = i
+            elif run_max - v >= delta:
+                raw_swings.append(("open", trough_idx, max_idx, trigger_idx))
+                direction = -1
+                peak_idx = max_idx
+                trigger_idx = i
+                run_min = v
+                min_idx = i
+
+    if direction == -1:
+        raw_swings.append(("close", peak_idx, min_idx, trigger_idx))
+    elif direction == 1:
+        raw_swings.append(("open", trough_idx, max_idx, trigger_idx))
 
     events: list[GripperEvent] = []
-    for frame in range(1, len(values)):
-        pos = float(values[frame])
-        if not is_closed and pos <= close_threshold:
-            is_closed = True
-            events.append(
-                GripperEvent(
-                    episode_index=episode_index,
-                    arm=arm,
-                    kind="close",
-                    frame=frame,
-                    time_s=frame / fps,
-                    gripper_pos=pos,
-                )
+    for kind, ext_start, ext_end, trig in raw_swings:
+        start_frame, end_frame = _refine_motion_bounds(
+            values,
+            kind=kind,
+            ext_start=ext_start,
+            ext_end=ext_end,
+            trigger_idx=trig,
+            delta=delta,
+        )
+        events.append(
+            GripperEvent(
+                episode_index=episode_index,
+                arm=arm,
+                kind=kind,
+                frame=start_frame,
+                end_frame=end_frame,
+                time_s=start_frame / fps,
+                end_time_s=end_frame / fps,
+                start_pos=float(values[ext_start]),
+                end_pos=float(values[ext_end]),
             )
-        elif is_closed and pos >= open_threshold:
-            is_closed = False
-            events.append(
-                GripperEvent(
-                    episode_index=episode_index,
-                    arm=arm,
-                    kind="open",
-                    frame=frame,
-                    time_s=frame / fps,
-                    gripper_pos=pos,
-                )
-            )
+        )
     return events
+
+
+def detect_squeeze_segments(
+    state_gripper: np.ndarray,
+    action_gripper: np.ndarray,
+    *,
+    episode_index: int,
+    arm: str,
+    fps: float,
+    gap: float = 0.05,
+    min_duration_s: float = 0.2,
+) -> list[SqueezeSegment]:
+    """Identify contiguous active-squeeze intervals ``[start, end)``.
+
+    A frame belongs to a squeeze when ``action_gripper - state_gripper <= -gap``
+    (the commanded gripper position is significantly more closed than the
+    observed state, e.g. pinching an egg with tongs or gripping a rigid object).
+
+    Args:
+        state_gripper: 1D array of observed gripper positions.
+        action_gripper: 1D array of commanded gripper positions.
+        episode_index: Episode index recorded in emitted segments.
+        arm: Arm identifier recorded in emitted segments.
+        fps: Frame rate in Hz.
+        gap: Positive threshold for ``state_gripper - action_gripper >= gap``.
+        min_duration_s: Minimum segment duration in seconds.
+
+    Returns:
+        Chronologically ordered list of ``SqueezeSegment`` records.
+
+    Raises:
+        ValueError: If array shapes mismatch or parameters are non-positive.
+    """
+    if fps <= 0.0:
+        raise ValueError(f"fps must be positive, got {fps}")
+    if gap <= 0.0:
+        raise ValueError(f"gap must be positive, got {gap}")
+    if min_duration_s <= 0.0:
+        raise ValueError(f"min_duration_s must be positive, got {min_duration_s}")
+
+    state = np.asarray(state_gripper, dtype=np.float64)
+    action = np.asarray(action_gripper, dtype=np.float64)
+    if state.ndim != 1 or action.ndim != 1 or len(state) != len(action):
+        raise ValueError(
+            f"Expected matching 1D arrays for state and action gripper, "
+            f"got {state.shape} and {action.shape}"
+        )
+    if len(state) == 0:
+        return []
+
+    diff = action - state
+    is_squeezing = diff <= -gap
+    min_frames = max(1, round(min_duration_s * fps))
+
+    padded = np.concatenate(([False], is_squeezing, [False]))
+    transitions = np.diff(padded.astype(np.int8))
+    starts = np.flatnonzero(transitions == 1)
+    ends = np.flatnonzero(transitions == -1)
+
+    segments: list[SqueezeSegment] = []
+    for start_idx, end_idx in zip(starts, ends, strict=True):
+        start = int(start_idx)
+        end = int(end_idx)
+        if end - start < min_frames:
+            continue
+        seg_diff = diff[start:end]
+        segments.append(
+            SqueezeSegment(
+                episode_index=episode_index,
+                arm=arm,
+                start=start,
+                end=end,
+                start_time_s=start / fps,
+                end_time_s=end / fps,
+                min_gap=float(np.min(seg_diff)),
+                median_gap=float(np.median(seg_diff)),
+            )
+        )
+    return segments
 
 
 def compute_tcp_linear_speed(tcp_xyz: np.ndarray, fps: float) -> np.ndarray:
@@ -327,20 +561,22 @@ def propose_episode_from_arms(
     arms: Sequence[ArmState],
     config: ProposeConfig | None = None,
 ) -> EpisodeProposal:
-    """Compute candidate gripper events and low-speed segments from arm trajectories.
+    """Compute candidate gripper motions, squeezes, and low-speed segments.
 
     Args:
         episode_index: Zero-based episode index.
         length: Total frame count of the episode.
         fps: Frame rate in Hz.
-        arms: Per-arm state trajectories.
-        config: Optional detection thresholds; uses ``ProposeConfig()`` by default.
+        arms: Per-arm state (and optional action gripper) trajectories.
+        config: Optional detection parameters; uses ``ProposeConfig()`` by default.
 
     Returns:
-        ``EpisodeProposal`` containing sorted gripper events and low-speed segments.
+        ``EpisodeProposal`` containing sorted gripper events, squeeze intervals,
+        and low-speed segments.
     """
     cfg = config or ProposeConfig()
     gripper_events: list[GripperEvent] = []
+    squeeze_segments: list[SqueezeSegment] = []
     low_speed_segments: list[LowSpeedSegment] = []
 
     for arm_state in arms:
@@ -350,10 +586,21 @@ def propose_episode_from_arms(
                 episode_index=episode_index,
                 arm=arm_state.arm,
                 fps=fps,
-                close_threshold=cfg.close_threshold,
-                open_threshold=cfg.open_threshold,
+                delta=cfg.gripper_delta,
             )
         )
+        if arm_state.action_gripper is not None:
+            squeeze_segments.extend(
+                detect_squeeze_segments(
+                    arm_state.gripper,
+                    arm_state.action_gripper,
+                    episode_index=episode_index,
+                    arm=arm_state.arm,
+                    fps=fps,
+                    gap=cfg.squeeze_gap,
+                    min_duration_s=cfg.min_squeeze_s,
+                )
+            )
         speeds = compute_tcp_linear_speed(arm_state.tcp_xyz, fps)
         low_speed_segments.extend(
             detect_low_speed_segments(
@@ -367,6 +614,7 @@ def propose_episode_from_arms(
         )
 
     gripper_events.sort(key=lambda ev: (ev.frame, ev.arm, ev.kind))
+    squeeze_segments.sort(key=lambda seg: (seg.start, seg.arm, seg.end))
     low_speed_segments.sort(key=lambda seg: (seg.start, seg.arm, seg.end))
 
     return EpisodeProposal(
@@ -374,6 +622,7 @@ def propose_episode_from_arms(
         length=length,
         fps=fps,
         gripper_events=tuple(gripper_events),
+        squeeze_segments=tuple(squeeze_segments),
         low_speed_segments=tuple(low_speed_segments),
     )
 
@@ -388,7 +637,7 @@ def propose_episode(
     Args:
         dataset: Open ``DatasetView``.
         episode_index: Zero-based episode index.
-        config: Optional detection thresholds.
+        config: Optional detection parameters.
 
     Returns:
         ``EpisodeProposal`` for the requested episode.
@@ -419,9 +668,26 @@ def proposal_to_rows(proposal: EpisodeProposal) -> list[dict[str, str]]:
                     "arm": ev.arm,
                     "event_type": event_type,
                     "frame": str(ev.frame),
-                    "end_frame": "",
+                    "end_frame": str(ev.end_frame),
                     "time_s": f"{ev.time_s:.3f}",
-                    "value": f"{ev.gripper_pos:.4f}",
+                    "value": f"{ev.amplitude:+.4f}",
+                },
+            )
+        )
+    for squeeze in proposal.squeeze_segments:
+        rows.append(
+            (
+                squeeze.start,
+                squeeze.arm,
+                "squeeze",
+                {
+                    "episode_index": str(squeeze.episode_index),
+                    "arm": squeeze.arm,
+                    "event_type": "squeeze",
+                    "frame": str(squeeze.start),
+                    "end_frame": str(squeeze.end),
+                    "time_s": f"{squeeze.start_time_s:.3f}",
+                    "value": f"{squeeze.median_gap:+.4f}",
                 },
             )
         )
@@ -467,9 +733,9 @@ def load_proposal_event_frames(
     path: Path,
     episode_index: int,
     *,
-    event_types: Collection[str] = ("gripper_close", "gripper_open"),
+    event_types: Collection[str] = DEFAULT_RENDER_EVENT_TYPES,
 ) -> list[int]:
-    """Extract sorted unique event frames for ``episode_index`` from a proposals CSV.
+    """Extract sorted unique event start frames for ``episode_index`` from a proposals CSV.
 
     Args:
         path: Path to a CSV written by ``lerobot-check propose``.
