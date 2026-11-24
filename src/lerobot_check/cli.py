@@ -639,17 +639,24 @@ def _cmd_suggest(args: argparse.Namespace) -> int:
 
 
 def _cmd_calib_frames(args: argparse.Namespace) -> int:
+    if args.append is not None and args.overwrite:
+        print(
+            "[calib-frames] --append and --overwrite are mutually exclusive.",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         root = resolve_dataset_root(args.dataset_root, args.repo_id)
-        dataset = DatasetView(root, repo_id=args.repo_id, revision=args.revision)
     except (OSError, ValueError) as exc:
         print(f"[dataset] {exc}", file=sys.stderr)
         return 1
 
+    resolved_repo_id = args.repo_id or infer_repo_id(root)
     out_path = (
         args.output
         if args.output is not None
-        else default_calib_frames_path(root, repo_id=dataset.repo_id)
+        else default_calib_frames_path(root, repo_id=resolved_repo_id)
     )
 
     existing = None
@@ -665,6 +672,20 @@ def _cmd_calib_frames(args: argparse.Namespace) -> int:
         except (OSError, ValueError) as exc:
             print(f"[calib-frames] Failed to read {out_path}: {exc}", file=sys.stderr)
             return 1
+    elif out_path.exists() and not args.overwrite:
+        print(
+            f"[calib-frames] Refusing to overwrite existing frames file {out_path} "
+            "(regenerating restarts frame IDs and would orphan existing clicks). "
+            "Pass --append K to add frames or --overwrite to regenerate.",
+            file=sys.stderr,
+        )
+        return 1
+
+    try:
+        dataset = DatasetView(root, repo_id=args.repo_id, revision=args.revision)
+    except (OSError, ValueError) as exc:
+        print(f"[dataset] {exc}", file=sys.stderr)
+        return 1
 
     episodes = None
     if args.episodes:
@@ -731,6 +752,14 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
         out_path = default_calib_head_path(root, repo_id=repo_id)
     else:
         print("Provide -o/--output or one of --dataset-root / --repo-id.", file=sys.stderr)
+        return 1
+
+    if not intrinsics_path.is_file():
+        print(f"[intrinsics] intrinsics.json not found: {intrinsics_path}", file=sys.stderr)
+        return 1
+
+    if not points_path.is_file():
+        print(f"[calibrate] points.json not found: {points_path}", file=sys.stderr)
         return 1
 
     try:
@@ -1288,6 +1317,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Append K additional frames per arm to an existing frames.json, keeping existing IDs.",
+    )
+    calib_frames_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        default=False,
+        help="Allow overwriting an existing frames.json (restarts frame IDs).",
     )
     calib_frames_parser.add_argument(
         "--episodes",

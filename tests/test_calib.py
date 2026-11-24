@@ -309,3 +309,129 @@ def test_calibrate_cli_end_to_end(tmp_path) -> None:
     assert rc == 0
     saved = json.loads(out_path.read_text(encoding="utf-8"))
     assert saved["arms"]["right"]["rms_px"] < 1e-3
+
+
+def test_calib_frames_cli_refuses_existing_without_overwrite(tmp_path, capsys, monkeypatch) -> None:
+    import json
+
+    from lerobot_check import cli
+
+    lerobot_root = tmp_path / "lerobot"
+    ds_root = lerobot_root / "Xense" / "demo_ds"
+    ds_root.mkdir(parents=True)
+    frames_path = lerobot_root / ".xense-viewer" / "calib" / "Xense__demo_ds.frames.json"
+    frames_path.parent.mkdir(parents=True)
+    sentinel = {
+        "version": 1,
+        "repo_id": "Xense/demo_ds",
+        "revision": "local",
+        "camera": "observation.images.head",
+        "image_size": [640, 480],
+        "frames": [
+            {
+                "id": "left-000",
+                "arm": "left",
+                "episode_index": 0,
+                "frame_index": 0,
+                "tcp": [0.9, -0.1, -0.3, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            }
+        ],
+    }
+    frames_path.write_text(json.dumps(sentinel), encoding="utf-8")
+
+    # Without --append or --overwrite, calib-frames must refuse and preserve the file.
+    rc = cli.main(
+        [
+            "calib-frames",
+            "--dataset-root",
+            str(ds_root),
+            "--repo-id",
+            "Xense/demo_ds",
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "Refusing to overwrite" in err
+    assert "--overwrite" in err
+    assert json.loads(frames_path.read_text(encoding="utf-8")) == sentinel
+
+    # --append and --overwrite together are rejected.
+    rc_conflict = cli.main(
+        [
+            "calib-frames",
+            "--dataset-root",
+            str(ds_root),
+            "--repo-id",
+            "Xense/demo_ds",
+            "--append",
+            "2",
+            "--overwrite",
+        ]
+    )
+    assert rc_conflict == 1
+    assert "mutually exclusive" in capsys.readouterr().err
+
+    # With --overwrite, DatasetView is opened and frames.json is regenerated.
+    ep_idx = np.array([0, 0, 0], dtype=np.int64)
+    fr_idx = np.array([0, 1, 2], dtype=np.int64)
+    tcps = {
+        "left": np.array(
+            [
+                [0.90, -0.10, -0.30, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                [1.00, -0.10, -0.25, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                [1.10, -0.15, -0.20, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+            ],
+            dtype=np.float64,
+        )
+    }
+
+    class _FakeDatasetView:
+        def __init__(self, root, *, repo_id=None, revision=None) -> None:
+            self.repo_id = repo_id or "Xense/demo_ds"
+            self.revision = revision or "local"
+            self.total_episodes = 1
+
+        def camera_image_size(self, camera_key: str) -> tuple[int, int]:
+            return (640, 480)
+
+        def load_arm_tcp_table(self, episodes=None):
+            return ep_idx, fr_idx, tcps
+
+    monkeypatch.setattr(cli, "DatasetView", _FakeDatasetView)
+    rc_overwrite = cli.main(
+        [
+            "calib-frames",
+            "--dataset-root",
+            str(ds_root),
+            "--repo-id",
+            "Xense/demo_ds",
+            "-n",
+            "2",
+            "--overwrite",
+        ]
+    )
+    assert rc_overwrite == 0
+    regenerated = json.loads(frames_path.read_text(encoding="utf-8"))
+    assert len(regenerated["frames"]) == 2
+    assert [f["id"] for f in regenerated["frames"]] == ["left-000", "left-001"]
+
+
+def test_calibrate_cli_missing_points_json_reports_clean_error(tmp_path, capsys) -> None:
+    import json
+
+    from lerobot_check.cli import main
+
+    lerobot_root = tmp_path / "lerobot"
+    ds_root = lerobot_root / "Xense" / "demo_ds"
+    ds_root.mkdir(parents=True)
+    calib_dir = lerobot_root / ".xense-viewer" / "calib"
+    calib_dir.mkdir(parents=True)
+    (calib_dir / "Xense__demo_ds.intrinsics.json").write_text(
+        json.dumps(_make_intrinsics().raw), encoding="utf-8"
+    )
+
+    rc = main(["calibrate", "--dataset-root", str(ds_root), "--repo-id", "Xense/demo_ds"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "points.json not found" in err
+    assert "Xense__demo_ds.points.json" in err
