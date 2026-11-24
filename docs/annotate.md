@@ -2,7 +2,7 @@
 
 This guide describes the **coarse-to-fine visual workflow** for an annotating agent producing and validating subtask annotations on a LeRobot v3.0 dataset with `lerobot-check`.
 
-Gripper signals alone are not reliable enough to determine subtask boundaries or grasps (for example, a gripper may flip a lid with open jaws or hold a tool that blocks finger closure). Annotation is therefore **visual first**: inspect rendered frames at a coarse stride using the subtask's configured camera(s), stop scanning as soon as every required boundary/event is localized, then zoom in around each candidate event.
+Gripper signals alone are not reliable enough to determine subtask boundaries or grasps (for example, a gripper may flip a lid with open jaws or hold a tool that blocks finger closure). Annotation is therefore **visual first**: inspect rendered frames at a coarse stride using the subtask's configured camera(s), stop scanning as soon as every required boundary and `grasp` frame is localized, then zoom in around each candidate event.
 
 ## Shared Default Paths
 
@@ -10,7 +10,8 @@ When `--task-spec` or `--annotations` is omitted, `lerobot-check` reads and writ
 
 - Task spec: `<lerobot_root>/.xense-viewer/subtasks/<org>__<name>.task_spec.yaml`
 - Annotation CSV: `<lerobot_root>/.xense-viewer/subtasks/<org>__<name>@<revision>.csv`
-- Reports: `<lerobot_root>/.xense-viewer/reports/<org>__<name>@<revision>/`
+- Distribution JSON: `<lerobot_root>/.xense-viewer/distribution/<org>__<name>@<revision>.json`
+- Suggestions JSON: `<lerobot_root>/.xense-viewer/suggestions/<org>__<name>@<revision>.json`
 
 Explicit `--task-spec`, `--annotations`, and `-o` arguments remain supported and override defaults. Never write rendered PNGs, proposals, or annotation CSVs into the git repository.
 
@@ -43,7 +44,7 @@ uv run lerobot-check render \
   -o /tmp/lerobot-check/ep0000_coarse.png
 ```
 
-Inspect generated pages **in order** and **stop as soon as you have located every boundary, `contact`, and `grasp` you need**. Do not read trailing coarse-scan pages after the last target event is already localized (for example, when finding only the `open_carton` -> `place_eggs` boundary in a 2-subtask episode, stop on the page where the lid lies flat).
+Inspect generated pages **in order** and **stop as soon as you have located every boundary and `grasp` you need**. Do not read trailing coarse-scan pages after the last target event is already localized (for example, when finding only the `open_carton` -> `place_eggs` boundary in a 2-subtask episode, stop on the page where the lid lies flat).
 
 If a subtask configures multiple cameras in the task spec, omit `--columns` to render them side by side, or pass `--cameras <cam>` explicitly for a single-camera coarse grid.
 
@@ -78,7 +79,7 @@ uv run lerobot-check propose \
   -o /tmp/lerobot-check/proposals.csv
 ```
 
-Proposed rows (`gripper_close`, `gripper_open`, `squeeze`, `low_speed`) are heuristic candidates, not ground truth. Always confirm every boundary, `contact`, and `grasp` visually on the rendered frames.
+Proposed rows (`gripper_close`, `gripper_open`, `squeeze`, `low_speed`) are heuristic candidates, not ground truth. Always confirm every boundary and `grasp` visually on the rendered frames.
 
 ### 4. Write the Annotation Table
 
@@ -91,7 +92,8 @@ repo_id,revision,episode_index,subtask,start,end,contact,grasp,success,annotator
 - Set `revision` to the dataset's exact revision hash from `lerobot-check info`.
 - Set `annotator` to `agent` (human reviewers later review and adjust rows in `xense-lerobot-viewer`, which flips edited rows to `human`).
 - Set `success` to lowercase `true` or `false`.
-- Leave `contact`, `grasp`, or `note` empty when not applicable.
+- **Leave `contact` empty** (`contact` is no longer annotated; the column stays in the CSV schema for compatibility and empty is legal).
+- Annotate `grasp` whenever the subtask grasps an object whose initial pose is sampled at `event: grasp` in the task spec; leave `grasp` empty when the subtask does not grasp. Leave `note` empty when not applicable.
 
 ### 5. Validate Against Dataset Metadata
 
@@ -113,12 +115,11 @@ Exit code `0` means zero violations; fix all reported issues and re-run.
 - **Order and supplement episodes**: subtask names must come from the task spec and appear in task spec order as a contiguous subsequence. Single-stage or partial-stage supplement episodes are legal when they cover `[0, episode_length)`.
 - **Unannotated / bad episodes**: corrupted or unannotated episodes may be omitted from the table rather than fabricated.
 
-### Contact and Grasp (`contact`, `grasp`)
+### Grasp (`grasp`) and Legacy `contact` Column
 
-- **`contact`**: the first frame within `[start, end)` where a gripper finger (or held tool) visibly touches the target object.
-- **`grasp`**: the first frame within `[start, end)` where the object is securely held and begins moving with the gripper.
-- **Ordering invariant**: whenever present, `start <= contact <= grasp < end`.
-- **Nullable fields**: if a subtask completes without grasping (for example, pushing or flipping a lid with open jaws), leave `grasp` empty (and `contact` empty if contact cannot be judged reliably). Never invent frame numbers.
+- **`contact`**: no longer annotated; leave empty. (Existing rows containing a `contact` value remain valid as long as `start <= contact <= grasp < end`.)
+- **`grasp`**: required for any subtask that defines an `event: grasp` object in the task spec — record the first frame within `[start, end)` where the object is securely held and begins moving with the gripper. `distribution` reads the TCP pose at this frame as the object's initial pose.
+- **Nullable fields**: if a subtask completes without grasping (for example, pushing or flipping a lid with open jaws), leave `grasp` empty. Never invent frame numbers.
 
 ### Per-Subtask Outcome (`success`)
 

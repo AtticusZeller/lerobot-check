@@ -1,6 +1,6 @@
 # lerobot-check
 
-面向 LeRobot v3.0 数据集的 subtask 标注、校验、重标与数据分布分析工具。
+面向 LeRobot v3.0 数据集的 subtask 标注、校验、重标、分布计算与头部相机标定 CLI 工具。分析结果以结构化 JSON 输出，由 `xense-lerobot-viewer` 原生渲染。
 
 ## 功能概览
 
@@ -9,13 +9,14 @@ CLI 入口为 `lerobot-check`，提供以下子命令：
 - `info`：打印数据集的 `repo_id`、`revision`、`fps`、相机列表、episode 数、每个 episode 帧数以及默认 `.xense-viewer/` 路径。
 - `propose`：基于相对幅度迟滞检测各臂夹爪开合运动、基于 `action - state` 差值检测夹紧区间（`squeeze`），并计算 TCP 低速段，输出候选事件 CSV（可选辅助提示）。
 - `render`：低内存解码并输出带帧号与时间戳的 PNG 拼图。支持按 `--subtask` 使用 task spec 配置的相机、`--frames a:b:s` 半开区间 `[a, b)`、单相机网格粗扫（`--columns N`）以及自定义多路拼接（`--cameras`）。
-- `validate`：对照数据集元数据中的 episode 长度、数据集 revision 与 task spec 校验标注表，逐条输出违规并以非零状态码退出。
+- `validate`：对照数据集元数据中的 episode 长度、数据集 revision 与 task spec 校验标注表，逐条输出违规并以非零状态码退出。标注表中 `contact` 不再要求标注（留空合法），`grasp` 仍用于提取 `event: grasp` 物体的初始位姿。
 - `relabel` / `verify-relabel`：按标注表与 task spec 逐帧重标 N 个 subtask 的 `task_index`（视频硬链接不重编码），并校验除 task 相关字段外与源数据零差异。
-- `report`：生成离线中文 HTML 数据分布报告（`index.html`）与机读摘要（`summary.json`），支持页首标注来源统计与未复核 `agent` 警告、单数据集按 episode 分组着色（`--group`），以及嵌入 Agent 补采建议（`--advice`）。
-- `mix`：计算多份数据集按重复次数加权混合后的各 subtask 与精细窗口帧占比（不写数据集）。
-- `suggest`：从覆盖网格的稀疏格子中为每个物体独立抽样，输出下一批 N 条的摆放建议（未检查物体间碰撞）。
+- `distribution`：输出机读 `distribution.json`（含标注来源统计、各 subtask 帧占比、物体初始位姿与覆盖网格、各 subtask 参与臂的起终点与 0→1 进度重采样轨迹、起终点覆盖与轨迹离散度指标），支持 `--episodes` 过滤。
+- `suggest`：读取 `distribution.json`、头部图像像素空间目标多边形（`targets/*.json`）与头部相机外参（`calib/*.head.json`），将多边形反投到各物体所在平面（`z` 取事件帧 TCP `z` 中位数），在多边形内按空白优先、稀疏其次、yaw 分箱均衡的原则抽样 N 个补采摆放，并生成 `dense` / `edge` / `empty` 三类测试点（附带头部像素坐标与朝向箭头端点）；写出 `suggestions/*.json`，可选导出 CSV。未提供目标多边形时默认使用数据包围盒外扩 5 cm。
+- `calib-frames`：跨全部 episode 对每条臂的 TCP 位置与姿态执行最远点采样（默认每臂 15 帧），写出 `calib/*.frames.json`；支持 `--append K` 保留已有条目与 ID 追加采样。
+- `calibrate`：读取 `calib/*.points.json` 与 `calib/*.intrinsics.json`，按臂独立执行 `solvePnP` 初始化与外参 + 工具偏移 `tool_offset` 联合最小二乘求解，输出 `calib/*.head.json`（含每点残差、RMS 与留一误差）。
 
-面向标注 agent 的操作规范见 [docs/annotate.md](docs/annotate.md)，面向补采建议 agent 的规范及 `summary.json` 字段说明见 [docs/advise.md](docs/advise.md)。
+面向标注 agent 的操作规范见 [docs/annotate.md](docs/annotate.md)，`distribution.json`、`suggestions.json` 与标定文件的完整字段与指标公式见 [docs/distribution.md](docs/distribution.md)。
 
 ## 默认路径约定（与 xense-lerobot-viewer 共用）
 
@@ -23,9 +24,12 @@ CLI 入口为 `lerobot-check`，提供以下子命令：
 
 - task spec：`<lerobot_root>/.xense-viewer/subtasks/<org>__<name>.task_spec.yaml`
 - 标注表：`<lerobot_root>/.xense-viewer/subtasks/<org>__<name>@<revision>.csv`
-- 分析报告与摘要：`<lerobot_root>/.xense-viewer/reports/<org>__<name>@<revision>/`（含 `index.html`、`summary.json`）
+- 分布分析 JSON：`<lerobot_root>/.xense-viewer/distribution/<org>__<name>@<revision>.json`
+- 目标多边形 JSON：`<lerobot_root>/.xense-viewer/targets/<org>__<name>.json`
+- 补采与测试点 JSON：`<lerobot_root>/.xense-viewer/suggestions/<org>__<name>@<revision>.json`
+- 头部相机标定文件：`<lerobot_root>/.xense-viewer/calib/<org>__<name>.{intrinsics,frames,points,head}.json`
 
-不传 `--task-spec`、`--annotations` 或 `report -o` 时自动读写上述默认路径；显式传参仍会覆盖默认路径。
+不传显式路径参数时自动读写上述默认路径；显式传参仍会覆盖默认路径。
 
 ## 安装与环境
 
@@ -45,7 +49,7 @@ uv run lerobot-check info --dataset-root /path/to/dataset
 uv run lerobot-check render \
   --dataset-root /path/to/dataset \
   --episode 0 \
-  --subtask open_carton \
+  --subtask place_insert \
   --frames ::30 \
   --columns 6 \
   -o /tmp/lerobot-check/ep0000_coarse.png
@@ -53,15 +57,21 @@ uv run lerobot-check render \
 # 3. 校验标注表（默认读写 .xense-viewer/ 路径）
 uv run lerobot-check validate --dataset-root /path/to/dataset
 
-# 4. 生成中文离线报告与 summary.json（支持按 episode 分组着色与嵌入建议）
-uv run lerobot-check report \
-  --dataset-root /path/to/dataset \
-  --advice /tmp/lerobot-check/advice.md
+# 4. 生成 distribution.json（可加 --episodes 0,30,60 过滤）
+uv run lerobot-check distribution --dataset-root /path/to/dataset
+
+# 5. 选取头部相机标定帧并求解外参
+uv run lerobot-check calib-frames --dataset-root /path/to/dataset
+# （在 viewer 中点选指尖中点保存 points.json 后）
+uv run lerobot-check calibrate --dataset-root /path/to/dataset
+
+# 6. 生成补采摆放与三类测试点
+uv run lerobot-check suggest --dataset-root /path/to/dataset -n 10
 ```
 
 ## 鸡蛋盒示例
 
-[examples/egg_carton/](examples/egg_carton/) 包含鸡蛋盒两阶段任务的 task spec（含按 subtask 配置的相机列表）与旧 `cuts.csv` 转换脚本：
+[examples/egg_carton/](examples/egg_carton/) 包含鸡蛋盒两阶段任务的 task spec 与旧 `cuts.csv` 转换脚本：
 
 ```bash
 uv run python examples/egg_carton/convert_cuts.py \
@@ -81,4 +91,4 @@ uv run ty check src/
 
 ## 数据边界说明
 
-本仓库为公开仓库，数据集、标注 CSV、渲染 PNG 与分析报告均属于数据产物，不得提交到仓库中。请通过默认 `.xense-viewer/` 路径、仓库外路径或 `.gitignore` 忽略的目录输出产物。
+本仓库为公开仓库，数据集、标注 CSV、渲染 PNG、标定文件与分布/补采 JSON 均属于数据产物，不得提交到仓库中。请通过默认 `.xense-viewer/` 路径、仓库外路径或 `.gitignore` 忽略的目录输出产物。
