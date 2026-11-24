@@ -48,8 +48,8 @@ def test_build_annotations_from_cuts_skips_108_and_uses_task_spec_arm() -> None:
             length=2000,
             fps=30.0,
             gripper_events=(
-                # Right-arm close before left-arm close must be ignored because
-                # egg_carton task_spec objects specify arm="left".
+                # open_carton takes its arm from the egg_carton object (right arm),
+                # so the right-arm close wins over the earlier-listed left-arm ones.
                 _close_ev(0, "right", 100, 110),
                 _close_ev(0, "left", 277, 285),
                 _close_ev(0, "left", 737, 745),
@@ -84,7 +84,7 @@ def test_build_annotations_from_cuts_skips_108_and_uses_task_spec_arm() -> None:
         "open_carton",
         0,
         900,
-        277,
+        100,
     )
     assert (rows[1].subtask, rows[1].start, rows[1].end, rows[1].grasp) == (
         "place_eggs",

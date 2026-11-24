@@ -8,7 +8,7 @@ objects:
   - name: egg_carton
     subtask: open_carton
     event: release
-    arm: left
+    arm: right
     yaw_symmetry_deg: 180.0
   - name: egg
     subtask: place_eggs
