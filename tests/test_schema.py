@@ -6,6 +6,12 @@ from pathlib import Path
 
 import pytest
 
+from lerobot_check.dataset import (
+    dataset_lerobot_root,
+    default_annotations_path,
+    default_report_dir,
+    default_task_spec_path,
+)
 from lerobot_check.schema import (
     AnnotationRow,
     CoverageSpec,
@@ -30,6 +36,8 @@ def test_egg_carton_task_spec_has_verbatim_prompts() -> None:
         spec.prompt_for("place_eggs")
         == "Take out the eggs one by one and place them in the egg tray."
     )
+    assert spec.cameras_for("open_carton") == ("observation.images.right_wrist",)
+    assert spec.cameras_for("place_eggs") == ("observation.images.left_wrist",)
     assert spec.fine_window_s == pytest.approx(1.0)
     assert spec.coverage.xy_bin_m == pytest.approx(0.05)
     assert spec.coverage.yaw_bin_deg == pytest.approx(30.0)
@@ -149,3 +157,83 @@ def test_load_annotations_rejects_invalid_annotator(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="annotator"):
         load_annotations(bad_csv)
+
+
+def test_task_spec_per_subtask_cameras_round_trip_and_backward_compat(tmp_path: Path) -> None:
+    # Backward compatibility: spec without `cameras` loads with empty tuples.
+    legacy_spec = parse_task_spec(
+        {
+            "name": "legacy",
+            "subtasks": [
+                {"name": "stage_a", "prompt": "Do A."},
+                {"name": "stage_b", "prompt": "Do B."},
+            ],
+        }
+    )
+    assert legacy_spec.cameras_for("stage_a") == ()
+    assert legacy_spec.cameras_for("stage_b") == ()
+
+    # Spec with per-subtask cameras round-trips cleanly.
+    spec = TaskSpec(
+        name="with_cameras",
+        subtasks=(
+            SubtaskSpec(
+                name="open_carton",
+                prompt="Open the egg carton.",
+                cameras=("observation.images.right_wrist",),
+            ),
+            SubtaskSpec(
+                name="place_eggs",
+                prompt="Place eggs.",
+                cameras=("observation.images.left_wrist", "observation.images.head"),
+            ),
+        ),
+    )
+    out = tmp_path / "with_cams.yaml"
+    save_task_spec(spec, out)
+    loaded = load_task_spec(out)
+    assert loaded == spec
+    assert loaded.cameras_for("open_carton") == ("observation.images.right_wrist",)
+    assert loaded.cameras_for("place_eggs") == (
+        "observation.images.left_wrist",
+        "observation.images.head",
+    )
+
+    with pytest.raises(ValueError, match="must be a list"):
+        parse_task_spec(
+            {
+                "subtasks": [
+                    {"name": "a", "prompt": "p", "cameras": "observation.images.head"},
+                ]
+            }
+        )
+    with pytest.raises(ValueError, match="duplicate camera"):
+        parse_task_spec(
+            {
+                "subtasks": [
+                    {
+                        "name": "a",
+                        "prompt": "p",
+                        "cameras": ["observation.images.head", "observation.images.head"],
+                    },
+                ]
+            }
+        )
+
+
+def test_default_xense_viewer_paths(tmp_path: Path) -> None:
+    lerobot_root = tmp_path / "lerobot"
+    ds_root = lerobot_root / "Xense" / "my_dataset"
+    sha = "fd0f68ff3e923887f23b153412cd3faa8c441717"
+    trees_dir = ds_root / ".cache" / "huggingface" / "trees"
+    trees_dir.mkdir(parents=True)
+    (trees_dir / f"{sha}.json").write_text("{}", encoding="utf-8")
+
+    assert dataset_lerobot_root(ds_root) == lerobot_root.resolve()
+    subtasks_dir = lerobot_root.resolve() / ".xense-viewer" / "subtasks"
+    assert default_task_spec_path(ds_root) == subtasks_dir / "Xense__my_dataset.task_spec.yaml"
+    assert default_annotations_path(ds_root) == subtasks_dir / f"Xense__my_dataset@{sha}.csv"
+    assert (
+        default_report_dir(ds_root)
+        == lerobot_root.resolve() / ".xense-viewer" / "reports" / f"Xense__my_dataset@{sha}"
+    )

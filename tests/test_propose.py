@@ -309,3 +309,38 @@ def test_parse_arm_and_action_feature_indices_bimanual() -> None:
     assert parsed["right"].xyz == (10, 11, 12)
     assert parsed["right"].gripper == 19
     assert parse_action_gripper_indices(names) == {"left": 9, "right": 19}
+
+
+def test_parse_arm_and_action_feature_indices_flexiv_order() -> None:
+    """bi_flexiv_rizon4_rt places both TCP poses before both gripper positions."""
+    names = [
+        "left_tcp.x",
+        "left_tcp.y",
+        "left_tcp.z",
+        "left_tcp.r1",
+        "left_tcp.r2",
+        "left_tcp.r3",
+        "left_tcp.r4",
+        "left_tcp.r5",
+        "left_tcp.r6",
+        "right_tcp.x",
+        "right_tcp.y",
+        "right_tcp.z",
+        "right_tcp.r1",
+        "right_tcp.r2",
+        "right_tcp.r3",
+        "right_tcp.r4",
+        "right_tcp.r5",
+        "right_tcp.r6",
+        "left_gripper.pos",
+        "right_gripper.pos",
+    ]
+    parsed = parse_arm_feature_indices(names)
+    assert set(parsed) == {"left", "right"}
+    assert parsed["left"].xyz == (0, 1, 2)
+    assert parsed["left"].rot6d == (3, 4, 5, 6, 7, 8)
+    assert parsed["left"].gripper == 18
+    assert parsed["right"].xyz == (9, 10, 11)
+    assert parsed["right"].rot6d == (12, 13, 14, 15, 16, 17)
+    assert parsed["right"].gripper == 19
+    assert parse_action_gripper_indices(names) == {"left": 18, "right": 19}

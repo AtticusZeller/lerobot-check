@@ -13,11 +13,22 @@ from lerobot_check.analysis import (
     DEFAULT_SPEED_RATIO_THRESHOLD,
     MixEntry,
     analyze_dataset,
+    analyze_dataset_groups,
     compute_all_coverages,
     compute_mix,
+    parse_episode_groups,
     suggest_placements,
 )
-from lerobot_check.dataset import DatasetView, detect_dataset_revision, resolve_dataset_root
+from lerobot_check.dataset import (
+    DatasetView,
+    default_annotations_path,
+    default_report_dir,
+    default_task_spec_path,
+    detect_dataset_revision,
+    format_dataset_info,
+    infer_repo_id,
+    resolve_dataset_root,
+)
 from lerobot_check.propose import (
     DEFAULT_RENDER_EVENT_TYPES,
     ProposeConfig,
@@ -26,21 +37,30 @@ from lerobot_check.propose import (
     propose_episode,
     write_proposals_csv,
 )
-from lerobot_check.relabel import RelabelValidationError, relabel_dataset, verify_relabel
+from lerobot_check.relabel import (
+    RelabelValidationError,
+    relabel_dataset,
+    verify_relabel,
+)
 from lerobot_check.render import (
-    DEFAULT_CAMERAS,
     parse_frame_spec,
     render_episode_sheets,
+    resolve_render_cameras,
     select_frames_around_events,
 )
 from lerobot_check.report import (
     format_frame_share_table,
     format_mix_report,
     format_suggestions_table,
-    write_html_report,
+    write_report_bundle,
     write_suggestions_csv,
 )
-from lerobot_check.schema import AnnotationRow, TaskSpec, load_annotations, load_task_spec
+from lerobot_check.schema import (
+    AnnotationRow,
+    TaskSpec,
+    load_annotations,
+    load_task_spec,
+)
 from lerobot_check.validate import validate_annotations
 
 
@@ -90,6 +110,17 @@ def _add_dataset_args(parser: argparse.ArgumentParser) -> None:
     )
 
 
+def _cmd_info(args: argparse.Namespace) -> int:
+    try:
+        root = resolve_dataset_root(args.dataset_root, args.repo_id)
+        dataset = DatasetView(root, repo_id=args.repo_id, revision=args.revision)
+    except (OSError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+    print(format_dataset_info(dataset))
+    return 0
+
+
 def _cmd_propose(args: argparse.Namespace) -> int:
     root = resolve_dataset_root(args.dataset_root, args.repo_id)
     dataset = DatasetView(root, repo_id=args.repo_id)
@@ -121,6 +152,30 @@ def _cmd_render(args: argparse.Namespace) -> int:
     root = resolve_dataset_root(args.dataset_root, args.repo_id)
     dataset = DatasetView(root, repo_id=args.repo_id)
     record = dataset.get_episode(args.episode)
+
+    task_spec: TaskSpec | None = None
+    if args.subtask is not None and not args.cameras:
+        spec_path = (
+            args.task_spec
+            if args.task_spec is not None
+            else default_task_spec_path(root, repo_id=dataset.repo_id)
+        )
+        try:
+            task_spec = load_task_spec(spec_path)
+        except (OSError, ValueError) as exc:
+            print(f"[task-spec] {exc}", file=sys.stderr)
+            return 1
+
+    try:
+        cameras = resolve_render_cameras(
+            explicit_cameras=args.cameras,
+            subtask=args.subtask,
+            task_spec=task_spec,
+            columns=args.columns,
+        )
+    except (KeyError, ValueError) as exc:
+        print(f"[cameras] {exc}", file=sys.stderr)
+        return 1
 
     highlight_frames: list[int] = []
     if args.frames is not None:
@@ -172,13 +227,6 @@ def _cmd_render(args: argparse.Namespace) -> int:
             stride=args.stride,
         )
 
-    if args.cameras:
-        cameras = tuple(args.cameras)
-    elif args.columns is not None:
-        cameras = (DEFAULT_CAMERAS[0],)
-    else:
-        cameras = DEFAULT_CAMERAS
-
     if args.max_frames_per_image is not None:
         max_frames_per_image = args.max_frames_per_image
     elif args.columns is not None:
@@ -205,19 +253,34 @@ def _cmd_render(args: argparse.Namespace) -> int:
 
 def _cmd_validate(args: argparse.Namespace) -> int:
     try:
-        task_spec = load_task_spec(args.task_spec)
+        root = resolve_dataset_root(args.dataset_root, args.repo_id)
+        dataset = DatasetView(root, repo_id=args.repo_id, revision=args.revision)
+    except (OSError, ValueError) as exc:
+        print(f"[dataset] {exc}", file=sys.stderr)
+        return 1
+
+    spec_path = (
+        args.task_spec
+        if args.task_spec is not None
+        else default_task_spec_path(root, repo_id=dataset.repo_id)
+    )
+    ann_path = (
+        args.annotations
+        if args.annotations is not None
+        else default_annotations_path(root, repo_id=dataset.repo_id, revision=dataset.revision)
+    )
+
+    try:
+        task_spec = load_task_spec(spec_path)
     except (OSError, ValueError) as exc:
         print(f"[task-spec] {exc}", file=sys.stderr)
         return 1
 
     try:
-        rows = load_annotations(args.annotations)
+        rows = load_annotations(ann_path)
     except (OSError, ValueError) as exc:
         print(f"[annotations] {exc}", file=sys.stderr)
         return 1
-
-    root = resolve_dataset_root(args.dataset_root, args.repo_id)
-    dataset = DatasetView(root, repo_id=args.repo_id, revision=args.revision)
 
     expected_revision: str | None = None
     if dataset.revision == "local":
@@ -267,21 +330,34 @@ def _resolve_expected_revision(src_root: Path, explicit_revision: str | None) ->
 
 def _cmd_relabel(args: argparse.Namespace) -> int:
     try:
-        task_spec = load_task_spec(args.task_spec)
+        src_root = resolve_dataset_root(args.src, args.repo_id)
+    except (OSError, ValueError) as exc:
+        print(f"[src] {exc}", file=sys.stderr)
+        return 1
+
+    resolved_repo_id = args.repo_id or infer_repo_id(src_root)
+    resolved_rev = args.revision or detect_dataset_revision(src_root)
+    spec_path = (
+        args.task_spec
+        if args.task_spec is not None
+        else default_task_spec_path(src_root, repo_id=resolved_repo_id)
+    )
+    ann_path = (
+        args.annotations
+        if args.annotations is not None
+        else default_annotations_path(src_root, repo_id=resolved_repo_id, revision=resolved_rev)
+    )
+
+    try:
+        task_spec = load_task_spec(spec_path)
     except (OSError, ValueError) as exc:
         print(f"[task-spec] {exc}", file=sys.stderr)
         return 1
 
     try:
-        rows = load_annotations(args.annotations)
+        rows = load_annotations(ann_path)
     except (OSError, ValueError) as exc:
         print(f"[annotations] {exc}", file=sys.stderr)
-        return 1
-
-    try:
-        src_root = resolve_dataset_root(args.src, args.repo_id)
-    except (OSError, ValueError) as exc:
-        print(f"[src] {exc}", file=sys.stderr)
         return 1
 
     expected_revision = _resolve_expected_revision(src_root, args.revision)
@@ -316,21 +392,34 @@ def _cmd_relabel(args: argparse.Namespace) -> int:
 
 def _cmd_verify_relabel(args: argparse.Namespace) -> int:
     try:
-        task_spec = load_task_spec(args.task_spec)
+        src_root = resolve_dataset_root(args.src, args.repo_id)
+    except (OSError, ValueError) as exc:
+        print(f"[src] {exc}", file=sys.stderr)
+        return 1
+
+    resolved_repo_id = args.repo_id or infer_repo_id(src_root)
+    resolved_rev = args.revision or detect_dataset_revision(src_root)
+    spec_path = (
+        args.task_spec
+        if args.task_spec is not None
+        else default_task_spec_path(src_root, repo_id=resolved_repo_id)
+    )
+    ann_path = (
+        args.annotations
+        if args.annotations is not None
+        else default_annotations_path(src_root, repo_id=resolved_repo_id, revision=resolved_rev)
+    )
+
+    try:
+        task_spec = load_task_spec(spec_path)
     except (OSError, ValueError) as exc:
         print(f"[task-spec] {exc}", file=sys.stderr)
         return 1
 
     try:
-        rows = load_annotations(args.annotations)
+        rows = load_annotations(ann_path)
     except (OSError, ValueError) as exc:
         print(f"[annotations] {exc}", file=sys.stderr)
-        return 1
-
-    try:
-        src_root = resolve_dataset_root(args.src, args.repo_id)
-    except (OSError, ValueError) as exc:
-        print(f"[src] {exc}", file=sys.stderr)
         return 1
 
     expected_revision = _resolve_expected_revision(src_root, args.revision)
@@ -360,72 +449,102 @@ def _cmd_verify_relabel(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
+def _resolve_multi_dataset_roots(
+    *,
+    dataset_roots: Sequence[Path] | None,
+    repo_ids: Sequence[str] | None,
+    annotation_paths: Sequence[Path] | None,
+) -> list[tuple[Path | None, str | None]] | None:
+    pairs: list[tuple[Path | None, str | None]]
+    if dataset_roots and repo_ids:
+        if len(dataset_roots) != len(repo_ids):
+            print(
+                f"Expected equal counts for --dataset-root ({len(dataset_roots)}) "
+                f"and --repo-id ({len(repo_ids)}).",
+                file=sys.stderr,
+            )
+            return None
+        pairs = list(zip(dataset_roots, repo_ids, strict=True))
+    elif dataset_roots:
+        pairs = [(p, None) for p in dataset_roots]
+    elif repo_ids:
+        pairs = [(None, r) for r in repo_ids]
+    else:
+        print("Provide at least one --dataset-root or --repo-id.", file=sys.stderr)
+        return None
+
+    if annotation_paths is not None and len(annotation_paths) != len(pairs):
+        print(
+            f"Expected one --annotations per dataset "
+            f"(got {len(annotation_paths)} vs {len(pairs)}).",
+            file=sys.stderr,
+        )
+        return None
+    return pairs
+
+
 def _load_validated_inputs(
     *,
     dataset_roots: Sequence[Path] | None,
     repo_ids: Sequence[str] | None,
-    annotation_paths: Sequence[Path],
+    annotation_paths: Sequence[Path] | None,
     labels: Sequence[str] | None,
-    task_spec: TaskSpec,
-) -> list[tuple[DatasetView, list[AnnotationRow], str]] | None:
+    task_spec_path: Path | None,
+) -> tuple[TaskSpec, list[tuple[DatasetView, list[AnnotationRow], str]]] | None:
     """Resolve, open, and validate one or more ``(dataset, annotations)`` inputs."""
-    n = len(annotation_paths)
-    roots_list: list[Path | None]
-    repos_list: list[str | None]
+    pairs = _resolve_multi_dataset_roots(
+        dataset_roots=dataset_roots,
+        repo_ids=repo_ids,
+        annotation_paths=annotation_paths,
+    )
+    if pairs is None:
+        return None
 
-    if dataset_roots and repo_ids:
-        if len(dataset_roots) != n or len(repo_ids) != n:
-            print(
-                f"Expected equal counts for --dataset-root ({len(dataset_roots)}), "
-                f"--repo-id ({len(repo_ids)}), and --annotations ({n}).",
-                file=sys.stderr,
-            )
-            return None
-        roots_list = list(dataset_roots)
-        repos_list = list(repo_ids)
-    elif dataset_roots:
-        if len(dataset_roots) != n:
-            print(
-                f"Expected one --dataset-root per --annotations (got {len(dataset_roots)} vs {n}).",
-                file=sys.stderr,
-            )
-            return None
-        roots_list = list(dataset_roots)
-        repos_list = [None] * n
-    elif repo_ids:
-        if len(repo_ids) != n:
-            print(
-                f"Expected one --repo-id per --annotations (got {len(repo_ids)} vs {n}).",
-                file=sys.stderr,
-            )
-            return None
-        roots_list = [None] * n
-        repos_list = list(repo_ids)
-    else:
+    n = len(pairs)
+    if labels is not None and len(labels) != n:
         print(
-            "Provide at least one --dataset-root or --repo-id matching each --annotations.",
+            f"Expected one --label per dataset (got {len(labels)} vs {n}).",
             file=sys.stderr,
         )
         return None
 
-    if labels is not None and len(labels) != n:
-        print(
-            f"Expected one --label per --annotations (got {len(labels)} vs {n}).",
-            file=sys.stderr,
-        )
+    datasets: list[tuple[DatasetView, str | None]] = []
+    for idx, (root_arg, repo_arg) in enumerate(pairs):
+        try:
+            root = resolve_dataset_root(root_arg, repo_arg)
+            dataset = DatasetView(root, repo_id=repo_arg)
+        except (OSError, ValueError) as exc:
+            print(f"[dataset #{idx + 1}] {exc}", file=sys.stderr)
+            return None
+        datasets.append((dataset, repo_arg))
+
+    first_dataset = datasets[0][0]
+    resolved_spec_path = (
+        task_spec_path
+        if task_spec_path is not None
+        else default_task_spec_path(first_dataset.root, repo_id=first_dataset.repo_id)
+    )
+    try:
+        task_spec = load_task_spec(resolved_spec_path)
+    except (OSError, ValueError) as exc:
+        print(f"[task-spec] {exc}", file=sys.stderr)
         return None
 
     raw_labels: list[str] = []
     loaded: list[tuple[DatasetView, list[AnnotationRow]]] = []
-    for idx in range(n):
+    for idx, (dataset, explicit_repo) in enumerate(datasets):
+        ann_path = (
+            annotation_paths[idx]
+            if annotation_paths is not None
+            else default_annotations_path(
+                dataset.root, repo_id=dataset.repo_id, revision=dataset.revision
+            )
+        )
         try:
-            rows = load_annotations(annotation_paths[idx])
+            rows = load_annotations(ann_path)
         except (OSError, ValueError) as exc:
             print(f"[annotations #{idx + 1}] {exc}", file=sys.stderr)
             return None
-
-        root = resolve_dataset_root(roots_list[idx], repos_list[idx])
-        dataset = DatasetView(root, repo_id=repos_list[idx])
 
         expected_revision: str | None = None
         if dataset.revision == "local":
@@ -441,15 +560,14 @@ def _load_validated_inputs(
             rows,
             task_spec,
             dataset.episode_lengths,
-            expected_repo_id=repos_list[idx],
+            expected_repo_id=explicit_repo,
             expected_revision=expected_revision,
         )
         if violations:
             for violation in violations:
                 print(violation, file=sys.stderr)
             print(
-                f"Validation failed for {annotation_paths[idx]} with "
-                f"{len(violations)} violation(s).",
+                f"Validation failed for {ann_path} with {len(violations)} violation(s).",
                 file=sys.stderr,
             )
             return None
@@ -470,15 +588,18 @@ def _load_validated_inputs(
         else:
             final_label = lbl
         result.append((dataset, rows, final_label))
-    return result
+    return task_spec, result
 
 
 def _add_multi_dataset_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--task-spec",
         type=Path,
-        required=True,
-        help="Path to the YAML task spec file.",
+        default=None,
+        help=(
+            "Path to the YAML task spec file "
+            "(default: <lerobot_root>/.xense-viewer/subtasks/<org>__<name>.task_spec.yaml)."
+        ),
     )
     parser.add_argument(
         "--dataset-root",
@@ -498,55 +619,95 @@ def _add_multi_dataset_args(parser: argparse.ArgumentParser) -> None:
         "--annotations",
         type=Path,
         action="append",
-        required=True,
-        help="Annotation CSV path paired with each --dataset-root / --repo-id.",
+        default=None,
+        help=(
+            "Annotation CSV path paired with each dataset "
+            "(default: <lerobot_root>/.xense-viewer/subtasks/<org>__<name>@<revision>.csv)."
+        ),
     )
     parser.add_argument(
         "--label",
         type=str,
         action="append",
         default=None,
-        help="Optional display label for each input dataset (repeat to match --annotations).",
+        help="Optional display label for each input dataset (repeat to match datasets).",
     )
 
 
 def _cmd_report(args: argparse.Namespace) -> int:
-    try:
-        task_spec = load_task_spec(args.task_spec)
-    except (OSError, ValueError) as exc:
-        print(f"[task-spec] {exc}", file=sys.stderr)
-        return 1
-
-    inputs = _load_validated_inputs(
+    loaded = _load_validated_inputs(
         dataset_roots=args.dataset_root,
         repo_ids=args.repo_id,
         annotation_paths=args.annotations,
         labels=args.label,
-        task_spec=task_spec,
+        task_spec_path=args.task_spec,
     )
-    if inputs is None:
+    if loaded is None:
         return 1
+    task_spec, inputs = loaded
 
-    analyses = [
-        analyze_dataset(
+    advice_markdown: str | None = None
+    if args.advice is not None:
+        try:
+            advice_markdown = args.advice.read_text(encoding="utf-8")
+        except OSError as exc:
+            print(f"[advice] {exc}", file=sys.stderr)
+            return 1
+
+    if args.group:
+        if len(inputs) != 1:
+            print(
+                "--group only applies when analyzing a single dataset input.",
+                file=sys.stderr,
+            )
+            return 1
+        dataset, rows, _ = inputs[0]
+        try:
+            groups = parse_episode_groups(args.group, dataset.total_episodes)
+        except ValueError as exc:
+            print(f"[group] {exc}", file=sys.stderr)
+            return 1
+        analyses = analyze_dataset_groups(
             dataset,
             rows,
             task_spec,
-            label=label,
+            groups,
             speed_ratio_threshold=args.speed_ratio_threshold,
             min_rest_speed_mps=args.min_rest_speed,
             max_traj_points=args.max_traj_points,
         )
-        for dataset, rows, label in inputs
-    ]
+    else:
+        analyses = [
+            analyze_dataset(
+                dataset,
+                rows,
+                task_spec,
+                label=label,
+                speed_ratio_threshold=args.speed_ratio_threshold,
+                min_rest_speed_mps=args.min_rest_speed,
+                max_traj_points=args.max_traj_points,
+            )
+            for dataset, rows, label in inputs
+        ]
 
-    output_path = write_html_report(
+    first_dataset = inputs[0][0]
+    output_target = (
+        args.output
+        if args.output is not None
+        else default_report_dir(
+            first_dataset.root,
+            repo_id=first_dataset.repo_id,
+            revision=first_dataset.revision,
+        )
+    )
+    html_path, summary_path, _ = write_report_bundle(
         analyses,
         task_spec,
-        args.output,
+        output_target,
         speed_ratio_threshold=args.speed_ratio_threshold,
         min_rest_speed_mps=args.min_rest_speed,
         title=args.title,
+        advice_markdown=advice_markdown,
     )
 
     for analysis in analyses:
@@ -564,33 +725,29 @@ def _cmd_report(args: argparse.Namespace) -> int:
             print(f"Skipped object events: {len(analysis.skipped_objects)} (listed in report).")
         print()
 
-    print(f"Wrote offline HTML report: {output_path}")
+    print(f"Wrote offline HTML report: {html_path}")
+    print(f"Wrote summary JSON: {summary_path}")
     return 0
 
 
 def _cmd_mix(args: argparse.Namespace) -> int:
-    try:
-        task_spec = load_task_spec(args.task_spec)
-    except (OSError, ValueError) as exc:
-        print(f"[task-spec] {exc}", file=sys.stderr)
-        return 1
-
-    inputs = _load_validated_inputs(
+    loaded = _load_validated_inputs(
         dataset_roots=args.dataset_root,
         repo_ids=args.repo_id,
         annotation_paths=args.annotations,
         labels=args.label,
-        task_spec=task_spec,
+        task_spec_path=args.task_spec,
     )
-    if inputs is None:
+    if loaded is None:
         return 1
+    task_spec, inputs = loaded
 
     n = len(inputs)
     if args.repeat is None:
         repeats = [1] * n
     elif len(args.repeat) != n:
         print(
-            f"Expected one --repeat per --annotations (got {len(args.repeat)} vs {n}).",
+            f"Expected one --repeat per dataset (got {len(args.repeat)} vs {n}).",
             file=sys.stderr,
         )
         return 1
@@ -618,25 +775,20 @@ def _cmd_mix(args: argparse.Namespace) -> int:
 
 
 def _cmd_suggest(args: argparse.Namespace) -> int:
-    try:
-        task_spec = load_task_spec(args.task_spec)
-    except (OSError, ValueError) as exc:
-        print(f"[task-spec] {exc}", file=sys.stderr)
-        return 1
-
     if args.count < 1:
         print(f"--count / -n must be >= 1, got {args.count}.", file=sys.stderr)
         return 1
 
-    inputs = _load_validated_inputs(
+    loaded = _load_validated_inputs(
         dataset_roots=args.dataset_root,
         repo_ids=args.repo_id,
         annotation_paths=args.annotations,
         labels=args.label,
-        task_spec=task_spec,
+        task_spec_path=args.task_spec,
     )
-    if inputs is None:
+    if loaded is None:
         return 1
+    task_spec, inputs = loaded
 
     analyses = [
         analyze_dataset(
@@ -671,10 +823,23 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lerobot-check",
         description=(
-            "Subtask annotation proposal, frame rendering, and validation for LeRobot v3.0."
+            "Subtask annotation, validation, relabeling, and analysis CLI for LeRobot v3.0."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    info_parser = subparsers.add_parser(
+        "info",
+        help="Print dataset repo_id, revision, fps, cameras, episode count, and episode lengths.",
+    )
+    _add_dataset_args(info_parser)
+    info_parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        help="Override detected dataset revision.",
+    )
+    info_parser.set_defaults(func=_cmd_info)
 
     propose_parser = subparsers.add_parser(
         "propose",
@@ -728,7 +893,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     render_parser = subparsers.add_parser(
         "render",
-        help="Render tiled multi-camera contact sheets with frame numbers to PNG.",
+        help="Render tiled camera contact sheets with frame numbers to PNG.",
     )
     _add_dataset_args(render_parser)
     render_parser.add_argument(
@@ -741,7 +906,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--frames",
         type=str,
         default=None,
-        help="Explicit frames or start:end[:step] ranges, e.g. '250,283,310' or '600:900:30'.",
+        help=(
+            "Explicit frames or half-open start:end[:step] ranges [start, end), "
+            "e.g. '250,283,310' or '600:900:30'."
+        ),
     )
     render_parser.add_argument(
         "--events",
@@ -801,12 +969,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="Minimum squeeze duration (s) used if auto-proposing events (default: 0.2).",
     )
     render_parser.add_argument(
+        "--subtask",
+        type=str,
+        default=None,
+        help="Subtask name whose configured task-spec cameras are used by default.",
+    )
+    render_parser.add_argument(
+        "--task-spec",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the YAML task spec file used with --subtask "
+            "(default: <lerobot_root>/.xense-viewer/subtasks/<org>__<name>.task_spec.yaml)."
+        ),
+    )
+    render_parser.add_argument(
         "--cameras",
         nargs="+",
         default=None,
         help=(
-            "Camera keys or short names (default: head, left_wrist, right_wrist; "
-            "or head alone when --columns is set)."
+            "Explicit camera keys or short names (overrides --subtask; default without "
+            "--subtask is head, left_wrist, right_wrist, or head alone with --columns)."
         ),
     )
     render_parser.add_argument(
@@ -862,14 +1045,20 @@ def build_parser() -> argparse.ArgumentParser:
     validate_parser.add_argument(
         "--annotations",
         type=Path,
-        required=True,
-        help="Path to the annotation CSV file.",
+        default=None,
+        help=(
+            "Path to the annotation CSV file "
+            "(default: <lerobot_root>/.xense-viewer/subtasks/<org>__<name>@<revision>.csv)."
+        ),
     )
     validate_parser.add_argument(
         "--task-spec",
         type=Path,
-        required=True,
-        help="Path to the YAML task spec file.",
+        default=None,
+        help=(
+            "Path to the YAML task spec file "
+            "(default: <lerobot_root>/.xense-viewer/subtasks/<org>__<name>.task_spec.yaml)."
+        ),
     )
     validate_parser.set_defaults(func=_cmd_validate)
 
@@ -909,14 +1098,20 @@ def build_parser() -> argparse.ArgumentParser:
     relabel_parser.add_argument(
         "--annotations",
         type=Path,
-        required=True,
-        help="Path to the annotation CSV file.",
+        default=None,
+        help=(
+            "Path to the annotation CSV file "
+            "(default: <lerobot_root>/.xense-viewer/subtasks/<org>__<name>@<revision>.csv)."
+        ),
     )
     relabel_parser.add_argument(
         "--task-spec",
         type=Path,
-        required=True,
-        help="Path to the YAML task spec file.",
+        default=None,
+        help=(
+            "Path to the YAML task spec file "
+            "(default: <lerobot_root>/.xense-viewer/subtasks/<org>__<name>.task_spec.yaml)."
+        ),
     )
     relabel_parser.set_defaults(func=_cmd_relabel)
 
@@ -956,22 +1151,45 @@ def build_parser() -> argparse.ArgumentParser:
     verify_parser.add_argument(
         "--annotations",
         type=Path,
-        required=True,
-        help="Path to the annotation CSV file.",
+        default=None,
+        help=(
+            "Path to the annotation CSV file "
+            "(default: <lerobot_root>/.xense-viewer/subtasks/<org>__<name>@<revision>.csv)."
+        ),
     )
     verify_parser.add_argument(
         "--task-spec",
         type=Path,
-        required=True,
-        help="Path to the YAML task spec file.",
+        default=None,
+        help=(
+            "Path to the YAML task spec file "
+            "(default: <lerobot_root>/.xense-viewer/subtasks/<org>__<name>.task_spec.yaml)."
+        ),
     )
     verify_parser.set_defaults(func=_cmd_verify_relabel)
 
     report_parser = subparsers.add_parser(
         "report",
-        help="Generate an offline static HTML analysis report for one or more datasets.",
+        help="Generate an offline Chinese HTML analysis report and summary.json.",
     )
     _add_multi_dataset_args(report_parser)
+    report_parser.add_argument(
+        "--group",
+        type=str,
+        action="append",
+        default=None,
+        metavar="NAME=EPISODES",
+        help=(
+            "Partition a single dataset into colored episode groups "
+            "(e.g. --group 原数据=0-120 --group 补录=121-173 or 0:121 / 121:174)."
+        ),
+    )
+    report_parser.add_argument(
+        "--advice",
+        type=Path,
+        default=None,
+        help="Optional Markdown file (e.g. advice.md) to embed as the 'Agent 建议' section.",
+    )
     report_parser.add_argument(
         "--speed-ratio-threshold",
         type=float,
@@ -1009,8 +1227,11 @@ def build_parser() -> argparse.ArgumentParser:
         "-o",
         "--output",
         type=Path,
-        required=True,
-        help="Output HTML file path (outside the repository).",
+        default=None,
+        help=(
+            "Output report directory or .html path "
+            "(default: <lerobot_root>/.xense-viewer/reports/<org>__<name>@<revision>/)."
+        ),
     )
     report_parser.set_defaults(func=_cmd_report)
 

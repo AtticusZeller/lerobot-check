@@ -2,8 +2,12 @@ name: egg_carton_to_tray
 subtasks:
   - name: open_carton
     prompt: "Open the egg carton."
+    cameras:
+      - observation.images.right_wrist
   - name: place_eggs
     prompt: "Take out the eggs one by one and place them in the egg tray."
+    cameras:
+      - observation.images.left_wrist
 objects:
   - name: egg_carton
     subtask: open_carton

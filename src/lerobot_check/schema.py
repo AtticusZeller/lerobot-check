@@ -40,10 +40,13 @@ class SubtaskSpec:
     Attributes:
         name: Short identifier referenced by annotation tables and object specs.
         prompt: Verbatim language instruction used by training and robot clients.
+        cameras: Optional ordered camera feature keys (or short names) preferred when
+            visually inspecting or annotating this subtask. Empty when unspecified.
     """
 
     name: str
     prompt: str
+    cameras: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -127,6 +130,23 @@ class TaskSpec:
                 return item.prompt
         raise KeyError(f"Unknown subtask: {subtask!r}")
 
+    def cameras_for(self, subtask: str) -> tuple[str, ...]:
+        """Return configured camera keys for ``subtask`` (empty tuple if unspecified).
+
+        Args:
+            subtask: Name of the subtask to look up.
+
+        Returns:
+            Ordered tuple of camera feature keys for ``subtask``.
+
+        Raises:
+            KeyError: If ``subtask`` is not present in this task spec.
+        """
+        for item in self.subtasks:
+            if item.name == subtask:
+                return item.cameras
+        raise KeyError(f"Unknown subtask: {subtask!r}")
+
 
 @dataclass(frozen=True)
 class AnnotationRow:
@@ -208,10 +228,29 @@ def parse_task_spec(raw: Any) -> TaskSpec:
             raise ValueError(f"subtasks[{idx}] must be a mapping")
         subtask_name = _require_non_empty_str(entry.get("name"), f"subtasks[{idx}].name")
         prompt = _require_non_empty_str(entry.get("prompt"), f"subtasks[{idx}].prompt")
+        raw_cameras = entry.get("cameras")
+        cameras: list[str] = []
+        if raw_cameras is not None:
+            if not isinstance(raw_cameras, list):
+                raise ValueError(
+                    f"subtasks[{idx}].cameras must be a list of camera keys, "
+                    f"got {type(raw_cameras).__name__}"
+                )
+            seen_cams: set[str] = set()
+            for cam_idx, cam_val in enumerate(raw_cameras):
+                cam_key = _require_non_empty_str(
+                    cam_val, f"subtasks[{idx}].cameras[{cam_idx}]"
+                ).strip()
+                if cam_key in seen_cams:
+                    raise ValueError(
+                        f"subtasks[{idx}].cameras contains duplicate camera {cam_key!r}"
+                    )
+                seen_cams.add(cam_key)
+                cameras.append(cam_key)
         if subtask_name in seen_subtasks:
             raise ValueError(f"Duplicate subtask name: {subtask_name!r}")
         seen_subtasks.add(subtask_name)
-        subtasks.append(SubtaskSpec(name=subtask_name, prompt=prompt))
+        subtasks.append(SubtaskSpec(name=subtask_name, prompt=prompt, cameras=tuple(cameras)))
 
     raw_objects = raw.get("objects", [])
     if raw_objects is None:
@@ -306,9 +345,16 @@ def save_task_spec(spec: TaskSpec, path: Path) -> None:
         spec: Task specification to serialize.
         path: Destination YAML path.
     """
+    subtask_payloads: list[dict[str, Any]] = []
+    for s in spec.subtasks:
+        entry: dict[str, Any] = {"name": s.name, "prompt": s.prompt}
+        if s.cameras:
+            entry["cameras"] = list(s.cameras)
+        subtask_payloads.append(entry)
+
     payload: dict[str, Any] = {
         "name": spec.name,
-        "subtasks": [{"name": s.name, "prompt": s.prompt} for s in spec.subtasks],
+        "subtasks": subtask_payloads,
         "objects": [
             {
                 "name": o.name,

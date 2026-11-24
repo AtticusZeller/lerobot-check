@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass, field
 from itertools import combinations
 
 import numpy as np
@@ -315,11 +315,151 @@ class PlacementSuggestion:
 
 
 @dataclass(frozen=True)
-class DatasetAnalysis:
-    """Complete analysis output for a single ``(dataset, annotations)`` input.
+class ProvenanceCounts:
+    """Annotation row counts broken down by ``annotator`` provenance.
 
     Attributes:
-        label: Human-readable dataset label used in legends and tables.
+        agent: Rows written by an agent and not yet reviewed by a human.
+        human: Rows written or reviewed by a human.
+        converted: Rows converted or exported automatically from another format.
+    """
+
+    agent: int = 0
+    human: int = 0
+    converted: int = 0
+
+    @property
+    def total(self) -> int:
+        """Total number of annotation rows across all provenance categories."""
+        return self.agent + self.human + self.converted
+
+    @property
+    def has_unreviewed_agent(self) -> bool:
+        """Return ``True`` when at least one unreviewed ``agent`` row is present."""
+        return self.agent > 0
+
+
+@dataclass(frozen=True)
+class EpisodeGroup:
+    """Named subset of episode indices used to color groups inside a single dataset.
+
+    Attributes:
+        name: Human-readable display label (e.g. ``"原数据"`` or ``"补录"``).
+        episodes: Sorted tuple of zero-based episode indices belonging to this group.
+    """
+
+    name: str
+    episodes: tuple[int, ...]
+
+
+def count_annotators(rows: Sequence[AnnotationRow]) -> ProvenanceCounts:
+    """Count annotation rows per ``annotator`` category."""
+    agent = 0
+    human = 0
+    converted = 0
+    for row in rows:
+        if row.annotator == "agent":
+            agent += 1
+        elif row.annotator == "human":
+            human += 1
+        elif row.annotator == "converted":
+            converted += 1
+    return ProvenanceCounts(agent=agent, human=human, converted=converted)
+
+
+def parse_episode_group_spec(spec: str, total_episodes: int) -> EpisodeGroup:
+    """Parse ``NAME=SPEC`` into an ``EpisodeGroup``.
+
+    ``SPEC`` is a comma-separated list of single episode indices (``"5"``),
+    half-open colon ranges (``"0:121"`` -> ``0..120``), or inclusive hyphen
+    ranges (``"0-120"`` -> ``0..120``).
+
+    Args:
+        spec: Group specification string, e.g. ``"原数据=0-120"`` or ``"补录=121:174"``.
+        total_episodes: Total episode count in dataset metadata for bounds checks.
+
+    Returns:
+        Validated ``EpisodeGroup``.
+
+    Raises:
+        ValueError: If syntax is invalid, empty, or references out-of-range episodes.
+    """
+    if "=" not in spec:
+        raise ValueError(f"Group spec must have format 'NAME=EPISODES', got {spec!r}")
+    name, raw_range = spec.split("=", 1)
+    name = name.strip()
+    raw_range = raw_range.strip()
+    if not name:
+        raise ValueError(f"Group name must be non-empty in {spec!r}")
+    if not raw_range:
+        raise ValueError(f"Group episode range must be non-empty in {spec!r}")
+
+    episodes: set[int] = set()
+    for token in (part.strip() for part in raw_range.split(",")):
+        if not token:
+            continue
+        if ":" in token:
+            parts = token.split(":")
+            if len(parts) != 2:
+                raise ValueError(f"Invalid half-open episode range {token!r} in group {name!r}")
+            start = int(parts[0]) if parts[0] else 0
+            end = int(parts[1]) if parts[1] else total_episodes
+            if start < 0 or end > total_episodes or start >= end:
+                raise ValueError(
+                    f"Episode range {token!r} in group {name!r} is empty or outside "
+                    f"[0, {total_episodes})"
+                )
+            episodes.update(range(start, end))
+        elif "-" in token:
+            parts = token.split("-")
+            if len(parts) != 2 or not parts[0] or not parts[1]:
+                raise ValueError(f"Invalid inclusive episode range {token!r} in group {name!r}")
+            start, end_incl = int(parts[0]), int(parts[1])
+            if start < 0 or end_incl >= total_episodes or start > end_incl:
+                raise ValueError(
+                    f"Episode range {token!r} in group {name!r} is empty or outside "
+                    f"[0, {total_episodes - 1}]"
+                )
+            episodes.update(range(start, end_incl + 1))
+        else:
+            ep = int(token)
+            if not 0 <= ep < total_episodes:
+                raise ValueError(
+                    f"Episode {ep} in group {name!r} is outside [0, {total_episodes - 1}]"
+                )
+            episodes.add(ep)
+
+    if not episodes:
+        raise ValueError(f"Group {name!r} matched no episodes")
+    return EpisodeGroup(name=name, episodes=tuple(sorted(episodes)))
+
+
+def parse_episode_groups(specs: Sequence[str], total_episodes: int) -> list[EpisodeGroup]:
+    """Parse and validate a sequence of non-overlapping ``NAME=SPEC`` episode groups."""
+    groups: list[EpisodeGroup] = []
+    seen_names: set[str] = set()
+    assigned: dict[int, str] = {}
+    for raw in specs:
+        group = parse_episode_group_spec(raw, total_episodes)
+        if group.name in seen_names:
+            raise ValueError(f"Duplicate episode group name: {group.name!r}")
+        seen_names.add(group.name)
+        for ep in group.episodes:
+            if ep in assigned:
+                raise ValueError(
+                    f"Episode {ep} belongs to multiple groups: {assigned[ep]!r} and {group.name!r}"
+                )
+            assigned[ep] = group.name
+        groups.append(group)
+    return groups
+
+
+@dataclass(frozen=True)
+class DatasetAnalysis:
+    """Complete analysis output for a single ``(dataset, annotations)`` input or episode group.
+
+    Attributes:
+        label: Human-readable dataset or group label used in legends and tables.
         repo_id: Dataset repository ID.
         revision: Dataset revision string.
         fps: Dataset frame rate in Hz.
@@ -330,6 +470,7 @@ class DatasetAnalysis:
         skipped_objects: Object events skipped due to missing frame or absent subtask.
         pairwise_offsets: Same-arm pairwise relative object displacements.
         trajectories: Downsampled per-subtask, per-arm 3D trajectory segments.
+        provenance: Annotation row provenance counts for this dataset or group.
     """
 
     label: str
@@ -343,6 +484,7 @@ class DatasetAnalysis:
     skipped_objects: tuple[SkippedObjectEvent, ...]
     pairwise_offsets: tuple[PairwiseRelativeOffset, ...]
     trajectories: tuple[TrajectorySegment, ...]
+    provenance: ProvenanceCounts = field(default_factory=ProvenanceCounts)
 
 
 def fine_window_intervals(row: AnnotationRow, delta_frames: int) -> tuple[tuple[int, int], ...]:
@@ -1124,12 +1266,13 @@ def analyze_dataset(
     task_spec: TaskSpec,
     *,
     label: str | None = None,
+    episode_subset: Collection[int] | None = None,
     speed_ratio_threshold: float = DEFAULT_SPEED_RATIO_THRESHOLD,
     min_rest_speed_mps: float = DEFAULT_MIN_REST_SPEED_MPS,
     max_traj_points: int = DEFAULT_MAX_TRAJ_POINTS,
     include_trajectories: bool = True,
 ) -> DatasetAnalysis:
-    """Run all T3 analyses over a single validated ``(dataset, rows)`` pair.
+    """Run all analyses over a single validated ``(dataset, rows)`` pair or episode subset.
 
     Loads each annotated episode's parquet state once and computes speed checks,
     object initial poses, pairwise offsets, and 3D trajectories in a single pass.
@@ -1139,6 +1282,8 @@ def analyze_dataset(
         rows: Validated annotation rows belonging to ``dataset``.
         task_spec: Task specification.
         label: Optional human-readable label (defaults to ``dataset.repo_id``).
+        episode_subset: Optional collection of episode indices to restrict the
+            analysis to (used when splitting one dataset into labeled groups).
         speed_ratio_threshold: Ratio threshold above which an episode is flagged
             as "not slowed down".
         min_rest_speed_mps: Non-fine median speed below which an arm is treated
@@ -1151,16 +1296,27 @@ def analyze_dataset(
         Populated ``DatasetAnalysis`` record.
     """
     ds_label = label or dataset.repo_id
+    if episode_subset is not None:
+        subset_set = set(episode_subset)
+        filtered_rows = [row for row in rows if row.episode_index in subset_set]
+        ep_lengths = {
+            ep: length for ep, length in dataset.episode_lengths.items() if ep in subset_set
+        }
+    else:
+        filtered_rows = list(rows)
+        ep_lengths = dataset.episode_lengths
+
+    provenance = count_annotators(filtered_rows)
     frame_shares = compute_frame_shares(
-        rows,
+        filtered_rows,
         task_spec,
         fps=dataset.fps,
-        episode_lengths=dataset.episode_lengths,
+        episode_lengths=ep_lengths,
         label=ds_label,
     )
 
     by_episode: dict[int, list[AnnotationRow]] = defaultdict(list)
-    for row in rows:
+    for row in filtered_rows:
         by_episode[row.episode_index].append(row)
 
     speed_metrics: list[EpisodeSpeedMetric] = []
@@ -1221,4 +1377,55 @@ def analyze_dataset(
         skipped_objects=tuple(skipped_objects),
         pairwise_offsets=tuple(pairwise_offsets),
         trajectories=tuple(trajectories),
+        provenance=provenance,
     )
+
+
+def analyze_dataset_groups(
+    dataset: DatasetView,
+    rows: Sequence[AnnotationRow],
+    task_spec: TaskSpec,
+    groups: Sequence[EpisodeGroup],
+    *,
+    speed_ratio_threshold: float = DEFAULT_SPEED_RATIO_THRESHOLD,
+    min_rest_speed_mps: float = DEFAULT_MIN_REST_SPEED_MPS,
+    max_traj_points: int = DEFAULT_MAX_TRAJ_POINTS,
+    include_trajectories: bool = True,
+) -> list[DatasetAnalysis]:
+    """Analyze one dataset partitioned into explicitly specified episode groups.
+
+    If annotated episodes exist outside all specified ``groups``, an additional
+    ``"未分组"`` group is appended so total counts remain consistent.
+    """
+    analyses = [
+        analyze_dataset(
+            dataset,
+            rows,
+            task_spec,
+            label=group.name,
+            episode_subset=group.episodes,
+            speed_ratio_threshold=speed_ratio_threshold,
+            min_rest_speed_mps=min_rest_speed_mps,
+            max_traj_points=max_traj_points,
+            include_trajectories=include_trajectories,
+        )
+        for group in groups
+    ]
+    grouped_eps = {ep for group in groups for ep in group.episodes}
+    remaining = sorted(set(dataset.episode_lengths) - grouped_eps)
+    annotated_remaining = [ep for ep in remaining if any(r.episode_index == ep for r in rows)]
+    if annotated_remaining:
+        analyses.append(
+            analyze_dataset(
+                dataset,
+                rows,
+                task_spec,
+                label="未分组",
+                episode_subset=remaining,
+                speed_ratio_threshold=speed_ratio_threshold,
+                min_rest_speed_mps=min_rest_speed_mps,
+                max_traj_points=max_traj_points,
+                include_trajectories=include_trajectories,
+            )
+        )
+    return analyses

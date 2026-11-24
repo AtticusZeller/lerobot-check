@@ -18,6 +18,7 @@ from lerobot.datasets.io_utils import serialize_dict, write_info, write_json, wr
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata
 
 from lerobot_check import cli
+from lerobot_check.dataset import default_annotations_path, default_task_spec_path
 from lerobot_check.relabel import RelabelValidationError, relabel_dataset, verify_relabel
 from lerobot_check.schema import (
     AnnotationRow,
@@ -581,6 +582,64 @@ def test_cli_relabel_and_verify_relabel_roundtrip_and_errors(
             str(spec_path),
         ]
     )
+    captured = capsys.readouterr()
+    assert code == 0, captured.out + captured.err
+    assert "OK" in captured.out
+
+
+def test_cli_relabel_uses_default_xense_viewer_paths(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    sha = "c" * 40
+    lerobot_root = tmp_path / "lerobot"
+    src = _build_synthetic_v3_dataset(
+        lerobot_root / "Xense" / "raw_ds",
+        episode_lengths=[10, 6],
+        revision_sha=sha,
+    )
+    dst = tmp_path / "relabeled_ds"
+    spec = _make_spec(
+        [
+            ("stage_a", "Do stage A."),
+            ("stage_b", "Do stage B."),
+        ]
+    )
+    rows = [
+        _row(
+            episode_index=0,
+            subtask="stage_a",
+            start=0,
+            end=4,
+            repo_id="Xense/raw_ds",
+            revision=sha,
+        ),
+        _row(
+            episode_index=0,
+            subtask="stage_b",
+            start=4,
+            end=10,
+            repo_id="Xense/raw_ds",
+            revision=sha,
+        ),
+        _row(
+            episode_index=1,
+            subtask="stage_a",
+            start=0,
+            end=6,
+            repo_id="Xense/raw_ds",
+            revision=sha,
+        ),
+    ]
+    save_task_spec(spec, default_task_spec_path(src))
+    save_annotations(rows, default_annotations_path(src))
+
+    code = cli.main(["relabel", "--src", str(src), "--dst", str(dst)])
+    captured = capsys.readouterr()
+    assert code == 0, captured.err
+    assert "Wrote" in captured.out
+
+    code = cli.main(["verify-relabel", "--src", str(src), "--dst", str(dst)])
     captured = capsys.readouterr()
     assert code == 0, captured.out + captured.err
     assert "OK" in captured.out

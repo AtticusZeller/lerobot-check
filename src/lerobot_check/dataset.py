@@ -2,9 +2,14 @@
 
 6D Rotation Convention (confirmed from ``lerobot-xense``):
     Confirmed in ``lerobot-xense/src/lerobot/utils/robot_utils.py``
-    (``quaternion_to_rotation_6d`` and ``rotation_6d_to_quaternion``) and used by
-    ``BiEliteCS66RT._tcp_rotvec_to_feature_values`` in
-    ``lerobot-xense/src/lerobot/robots/bi_elite_cs66_rt/bi_elite_cs66_rt.py``.
+    (``quaternion_to_rotation_6d`` and ``rotation_6d_to_quaternion``), used by both:
+
+    - ``BiEliteCS66RT._tcp_rotvec_to_feature_values`` in
+      ``lerobot-xense/src/lerobot/robots/bi_elite_cs66_rt/bi_elite_cs66_rt.py``
+    - ``BiFlexivRizon4RT._read_arm_observation`` in
+      ``lerobot-xense/src/lerobot/robots/bi_flexiv_rizon4_rt/bi_flexiv_rizon4_rt.py``
+      (converting Flexiv SDK ``tcp_pose`` ``[x, y, z, qw, qx, qy, qz]`` via the
+      same ``quaternion_to_rotation_6d`` helper).
 
     Each arm's 6D rotation ``[r1, r2, r3, r4, r5, r6]`` stores the first two
     columns of the 3x3 rotation matrix ``R`` in the arm's gravity-aligned base
@@ -211,6 +216,102 @@ def infer_repo_id(dataset_root: Path) -> str:
     if len(parts) >= 2:
         return f"{parts[-2]}/{parts[-1]}"
     return dataset_root.name
+
+
+def dataset_lerobot_root(dataset_root: Path) -> Path:
+    """Return ``<lerobot_root>`` (the grandparent of ``dataset_root``).
+
+    For a dataset at ``~/.cache/huggingface/lerobot/<org>/<name>``, this returns
+    ``~/.cache/huggingface/lerobot``.
+    """
+    return dataset_root.expanduser().resolve().parent.parent
+
+
+def dataset_slug(repo_id: str) -> str:
+    """Format ``<org>/<name>`` as ``<org>__<name>`` for ``.xense-viewer`` paths."""
+    cleaned = repo_id.strip("/")
+    if not cleaned:
+        raise ValueError(f"repo_id must be non-empty, got {repo_id!r}")
+    return cleaned.replace("/", "__")
+
+
+def default_annotations_path(
+    dataset_root: Path,
+    *,
+    repo_id: str | None = None,
+    revision: str | None = None,
+) -> Path:
+    """Return the shared default annotation CSV path under ``.xense-viewer/subtasks``."""
+    resolved = dataset_root.expanduser().resolve()
+    rid = repo_id or infer_repo_id(resolved)
+    rev = revision or detect_dataset_revision(resolved)
+    return (
+        dataset_lerobot_root(resolved)
+        / ".xense-viewer"
+        / "subtasks"
+        / f"{dataset_slug(rid)}@{rev}.csv"
+    )
+
+
+def default_task_spec_path(
+    dataset_root: Path,
+    *,
+    repo_id: str | None = None,
+) -> Path:
+    """Return the shared default task spec YAML path under ``.xense-viewer/subtasks``."""
+    resolved = dataset_root.expanduser().resolve()
+    rid = repo_id or infer_repo_id(resolved)
+    return (
+        dataset_lerobot_root(resolved)
+        / ".xense-viewer"
+        / "subtasks"
+        / f"{dataset_slug(rid)}.task_spec.yaml"
+    )
+
+
+def default_report_dir(
+    dataset_root: Path,
+    *,
+    repo_id: str | None = None,
+    revision: str | None = None,
+) -> Path:
+    """Return the shared default report directory under ``.xense-viewer/reports``."""
+    resolved = dataset_root.expanduser().resolve()
+    rid = repo_id or infer_repo_id(resolved)
+    rev = revision or detect_dataset_revision(resolved)
+    return (
+        dataset_lerobot_root(resolved) / ".xense-viewer" / "reports" / f"{dataset_slug(rid)}@{rev}"
+    )
+
+
+def format_dataset_info(dataset: DatasetView) -> str:
+    """Format dataset metadata and per-episode frame lengths for the ``info`` CLI."""
+    lengths = dataset.episode_lengths
+    total_frames = sum(lengths.values())
+    ann_path = default_annotations_path(
+        dataset.root, repo_id=dataset.repo_id, revision=dataset.revision
+    )
+    report_path = default_report_dir(
+        dataset.root, repo_id=dataset.repo_id, revision=dataset.revision
+    )
+    lines = [
+        f"repo_id: {dataset.repo_id}",
+        f"revision: {dataset.revision}",
+        f"root: {dataset.root}",
+        f"fps: {dataset.fps:g}",
+        f"episodes: {dataset.total_episodes}",
+        f"total_frames: {total_frames}",
+        f"cameras: {', '.join(dataset.camera_keys) if dataset.camera_keys else '(none)'}",
+        f"default_task_spec: {default_task_spec_path(dataset.root, repo_id=dataset.repo_id)}",
+        f"default_annotations: {ann_path}",
+        f"default_report_dir: {report_path}",
+        "",
+        "episode_index\tlength\tduration_s",
+    ]
+    for ep_idx in sorted(lengths):
+        ep_len = lengths[ep_idx]
+        lines.append(f"{ep_idx}\t{ep_len}\t{ep_len / dataset.fps:.2f}")
+    return "\n".join(lines)
 
 
 def parse_arm_feature_indices(state_names: Sequence[str]) -> dict[str, ArmFeatureIndices]:

@@ -10,6 +10,7 @@ import av
 from PIL import Image, ImageDraw, ImageFont
 
 from lerobot_check.dataset import DatasetView, EpisodeRecord
+from lerobot_check.schema import TaskSpec
 
 DEFAULT_CAMERAS: tuple[str, ...] = (
     "observation.images.head",
@@ -30,21 +31,22 @@ _TEXT_COLOR = (255, 255, 255)
 def parse_frame_spec(spec: str, episode_length: int) -> list[int]:
     """Parse a comma-separated frame specification into sorted unique frame indices.
 
-    Supports single frames (``"120"``) and inclusive-end slices
+    Supports single frames (``"120"``) and half-open slices ``[start, end)``
     (``"start:end"``, ``"start:end:step"``, or open-ended slices such as
     ``"::30"`` / ``"0::30"`` where empty start defaults to ``0`` and empty end
-    defaults to ``episode_length - 1``).
+    defaults to ``episode_length``), matching annotation table intervals.
 
     Args:
-        spec: Comma-separated frame numbers or slices, e.g. ``"100,200,300:360:15"``
-            or ``"::30"``.
+        spec: Comma-separated frame numbers or half-open slices, e.g.
+            ``"100,200,300:360:15"`` or ``"::30"``.
         episode_length: Total frame count of the episode.
 
     Returns:
-        Sorted list of unique frame indices within ``[0, episode_length - 1]``.
+        Sorted list of unique frame indices within ``[0, episode_length)``.
 
     Raises:
-        ValueError: If syntax is invalid, step <= 0, or any frame is out of bounds.
+        ValueError: If syntax is invalid, step <= 0, a range is empty, or any
+            frame is out of bounds.
     """
     if episode_length <= 0:
         raise ValueError(f"episode_length must be positive, got {episode_length}")
@@ -58,13 +60,13 @@ def parse_frame_spec(spec: str, episode_length: int) -> list[int]:
             if len(parts) not in (2, 3):
                 raise ValueError(f"Invalid frame range token: {token!r}")
             start = int(parts[0]) if parts[0] else 0
-            end = int(parts[1]) if parts[1] else episode_length - 1
+            end = int(parts[1]) if parts[1] else episode_length
             step = int(parts[2]) if (len(parts) == 3 and parts[2]) else 1
             if step <= 0:
                 raise ValueError(f"Frame range step must be positive in {token!r}")
-            if start < 0 or end >= episode_length or start > end:
-                raise ValueError(f"Frame range {token!r} is outside [0, {episode_length - 1}]")
-            frames.update(range(start, end + 1, step))
+            if start < 0 or end > episode_length or start >= end:
+                raise ValueError(f"Frame range {token!r} is empty or outside [0, {episode_length})")
+            frames.update(range(start, end, step))
         else:
             idx = int(token)
             if not 0 <= idx < episode_length:
@@ -74,6 +76,48 @@ def parse_frame_spec(spec: str, episode_length: int) -> list[int]:
     if not frames:
         raise ValueError("Frame specification produced no frames")
     return sorted(frames)
+
+
+def resolve_render_cameras(
+    *,
+    explicit_cameras: Sequence[str] | None = None,
+    subtask: str | None = None,
+    task_spec: TaskSpec | None = None,
+    columns: int | None = None,
+) -> tuple[str, ...]:
+    """Select cameras for rendering based on CLI overrides and subtask spec.
+
+    Priority:
+    1. Explicit ``--cameras`` always wins.
+    2. When ``--subtask`` is provided and the task spec defines ``cameras`` for
+       that subtask, use them.
+    3. Otherwise fall back to ``(DEFAULT_CAMERAS[0],)`` in single-camera grid
+       mode (``columns`` set) or ``DEFAULT_CAMERAS`` in multi-camera strip mode.
+
+    Args:
+        explicit_cameras: Explicit camera keys/names from ``--cameras``.
+        subtask: Optional subtask name from ``--subtask``.
+        task_spec: Task spec used to look up per-subtask cameras.
+        columns: Optional grid column count from ``--columns``.
+
+    Returns:
+        Ordered tuple of camera keys or short names.
+
+    Raises:
+        ValueError: If ``subtask`` is given without ``task_spec``.
+        KeyError: If ``subtask`` is not defined in ``task_spec``.
+    """
+    if explicit_cameras:
+        return tuple(explicit_cameras)
+    if subtask is not None:
+        if task_spec is None:
+            raise ValueError("--subtask requires a task spec (--task-spec or default task spec)")
+        subtask_cams = task_spec.cameras_for(subtask)
+        if subtask_cams:
+            return subtask_cams
+    if columns is not None:
+        return (DEFAULT_CAMERAS[0],)
+    return DEFAULT_CAMERAS
 
 
 def select_frames_around_events(

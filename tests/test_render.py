@@ -10,19 +10,76 @@ from lerobot_check.render import (
     DEFAULT_CAMERAS,
     parse_frame_spec,
     render_contact_sheet,
+    resolve_render_cameras,
     select_frames_around_events,
 )
+from lerobot_check.schema import SubtaskSpec, TaskSpec
 
 
-def test_parse_frame_spec_handles_points_ranges_and_open_slices() -> None:
-    assert parse_frame_spec("10, 5, 20:30:5, 10", episode_length=100) == [5, 10, 20, 25, 30]
+def test_parse_frame_spec_half_open_semantics() -> None:
+    # Half-open [start, end): 20:30:5 excludes 30; :60:30 excludes 60.
+    assert parse_frame_spec("10, 5, 20:30:5, 10", episode_length=100) == [5, 10, 20, 25]
     assert parse_frame_spec("::30", episode_length=100) == [0, 30, 60, 90]
     assert parse_frame_spec("0::30", episode_length=100) == [0, 30, 60, 90]
-    assert parse_frame_spec(":60:30", episode_length=100) == [0, 30, 60]
+    assert parse_frame_spec(":60:30", episode_length=100) == [0, 30]
+    # Exact episode_length is legal as the exclusive upper bound.
+    assert parse_frame_spec("90:100:3", episode_length=100) == [90, 93, 96, 99]
+    assert parse_frame_spec("0:100:25", episode_length=100) == [0, 25, 50, 75]
+    # Empty half-open range and out-of-bounds endpoints are rejected.
+    with pytest.raises(ValueError, match="empty or outside"):
+        parse_frame_spec("10:10", episode_length=100)
+    with pytest.raises(ValueError, match="empty or outside"):
+        parse_frame_spec("0:101", episode_length=100)
     with pytest.raises(ValueError, match="outside"):
         parse_frame_spec("100", episode_length=100)
     with pytest.raises(ValueError, match="step"):
         parse_frame_spec("10:20:0", episode_length=100)
+
+
+def test_resolve_render_cameras_per_subtask_and_overrides() -> None:
+    spec = TaskSpec(
+        name="egg_task",
+        subtasks=(
+            SubtaskSpec(
+                name="open_carton",
+                prompt="Open.",
+                cameras=("observation.images.right_wrist",),
+            ),
+            SubtaskSpec(
+                name="place_eggs",
+                prompt="Place.",
+                cameras=("observation.images.left_wrist", "observation.images.head"),
+            ),
+            SubtaskSpec(name="legacy_stage", prompt="Legacy."),
+        ),
+    )
+
+    assert resolve_render_cameras(subtask="open_carton", task_spec=spec) == (
+        "observation.images.right_wrist",
+    )
+    assert resolve_render_cameras(subtask="open_carton", task_spec=spec, columns=6) == (
+        "observation.images.right_wrist",
+    )
+    assert resolve_render_cameras(subtask="place_eggs", task_spec=spec) == (
+        "observation.images.left_wrist",
+        "observation.images.head",
+    )
+    # Backward compatibility: subtask without configured cameras falls back to defaults.
+    assert resolve_render_cameras(subtask="legacy_stage", task_spec=spec) == DEFAULT_CAMERAS
+    assert resolve_render_cameras(subtask="legacy_stage", task_spec=spec, columns=4) == (
+        DEFAULT_CAMERAS[0],
+    )
+    # Explicit --cameras always wins over --subtask.
+    assert resolve_render_cameras(
+        explicit_cameras=("head", "left_wrist", "right_wrist"),
+        subtask="open_carton",
+        task_spec=spec,
+    ) == ("head", "left_wrist", "right_wrist")
+
+    with pytest.raises(ValueError, match="--subtask requires"):
+        resolve_render_cameras(subtask="open_carton", task_spec=None)
+    with pytest.raises(KeyError):
+        resolve_render_cameras(subtask="missing_subtask", task_spec=spec)
 
 
 def test_select_frames_around_events_clamps_and_includes_center() -> None:
