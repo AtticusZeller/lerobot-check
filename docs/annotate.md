@@ -107,9 +107,8 @@ Exit code `0` means zero violations; fix all reported issues and re-run.
 
 ### Subtask Boundary (`start`, `end`)
 
-- **Split at object release and settle**: pick and place of one object belong to the **same** subtask. Place the boundary between subtask $k$ and subtask $k+1$ (`end` of subtask $k$, `start` of subtask $k+1$) at the **exact frame where the subtask's target object is released and rests stably in its completed state** (for `open_carton`, the moment the lid lies flat on the table).
-- **Retraction belongs to the next subtask**: arm retraction or repositioning after the object is released and settled belongs to subtask $k+1$, **not** subtask $k$.
-- **Bimanual rule**: judge the boundary by the active arm executing the current subtask's object release (for example, the right arm flipping the lid in `open_carton`), not an idle or preparing support arm.
+- **Split at object release and settle (last arm in contact)**: pick and place of one object belong to the **same** subtask. A subtask ends at the **exact frame where its target object is placed and stable and the last arm in contact with that object lets go** (for `open_carton`, the moment the lid lies flat on the table and the flipping arm lets go; in bimanual tasks where a second arm presses or steadies the object flat after the primary arm releases, the boundary is when that last arm lets go).
+- **Retraction and next-stage prep**: arm retraction after the last arm lets go belongs to subtask $k+1$, **not** subtask $k$. Conversely, if the non-contacting arm begins moving toward the next subtask's object *before* the last arm lets go of the current object, those frames still belong to subtask $k$.
 - **Half-open intervals**: each row covers `[start, end)`. Sorted by `start`, rows within an episode must satisfy `start_0 = 0`, `start_{k+1} = end_k`, and `end_last = episode_length`. Prompts switch at `end_k`.
 - **Order and supplement episodes**: subtask names must come from the task spec and appear in task spec order as a contiguous subsequence. Single-stage or partial-stage supplement episodes are legal when they cover `[0, episode_length)`.
 - **Unannotated / bad episodes**: corrupted or unannotated episodes may be omitted from the table rather than fabricated.
