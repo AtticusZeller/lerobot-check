@@ -3,26 +3,40 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from collections.abc import Sequence
 from pathlib import Path
 
 from lerobot_check.analysis import (
-    DEFAULT_MAX_TRAJ_POINTS,
-    DEFAULT_MIN_REST_SPEED_MPS,
-    DEFAULT_SPEED_RATIO_THRESHOLD,
-    MixEntry,
-    analyze_dataset,
-    analyze_dataset_groups,
-    compute_all_coverages,
-    compute_mix,
-    parse_episode_groups,
-    suggest_placements,
+    DEFAULT_TRAJECTORY_SAMPLES,
+    compute_distribution,
+    format_distribution_summary,
+    load_distribution_json,
+    parse_episode_filter,
+    write_distribution_json,
+)
+from lerobot_check.calib import (
+    DEFAULT_CALIB_CAMERA,
+    DEFAULT_FRAMES_PER_ARM,
+    HeadCalibration,
+    calibrate_head_camera,
+    compare_arm_extrinsics,
+    load_head_calibration,
+    load_intrinsics,
+    select_calib_frames,
+    write_json,
 )
 from lerobot_check.dataset import (
     DatasetView,
     default_annotations_path,
-    default_report_dir,
+    default_calib_frames_path,
+    default_calib_head_path,
+    default_calib_intrinsics_path,
+    default_calib_points_path,
+    default_distribution_path,
+    default_suggestions_path,
+    default_targets_path,
     default_task_spec_path,
     detect_dataset_revision,
     format_dataset_info,
@@ -48,39 +62,19 @@ from lerobot_check.render import (
     resolve_render_cameras,
     select_frames_around_events,
 )
-from lerobot_check.report import (
-    format_frame_share_table,
-    format_mix_report,
-    format_suggestions_table,
-    write_report_bundle,
-    write_suggestions_csv,
-)
 from lerobot_check.schema import (
-    AnnotationRow,
     TaskSpec,
     load_annotations,
     load_task_spec,
 )
+from lerobot_check.suggest import (
+    format_suggestions_summary,
+    generate_suggestions,
+    load_target_polygon,
+    write_suggestions_csv,
+    write_suggestions_json,
+)
 from lerobot_check.validate import validate_annotations
-
-
-def _parse_episode_list(values: Sequence[str] | None, total_episodes: int) -> list[int]:
-    if not values:
-        return list(range(total_episodes))
-    episodes: set[int] = set()
-    for raw in values:
-        for token in (part.strip() for part in raw.split(",")):
-            if not token:
-                continue
-            if ":" in token:
-                parts = token.split(":")
-                if len(parts) != 2:
-                    raise ValueError(f"Invalid episode range: {token!r}")
-                start, end = int(parts[0]), int(parts[1])
-                episodes.update(range(start, end))
-            else:
-                episodes.add(int(token))
-    return sorted(episodes)
 
 
 def _parse_event_types(raw: str | None) -> tuple[str, ...]:
@@ -104,7 +98,7 @@ def _add_dataset_args(parser: argparse.ArgumentParser) -> None:
         type=str,
         default=None,
         help=(
-            "Dataset repo ID (e.g. Xense/bi_elite_cs66_rt_egg_carton_to_tray_1016_fixed). "
+            "Dataset repo ID (e.g. Xense/pack_iphone_box_1119). "
             "Used to resolve local cache path if --dataset-root is omitted."
         ),
     )
@@ -124,7 +118,11 @@ def _cmd_info(args: argparse.Namespace) -> int:
 def _cmd_propose(args: argparse.Namespace) -> int:
     root = resolve_dataset_root(args.dataset_root, args.repo_id)
     dataset = DatasetView(root, repo_id=args.repo_id)
-    episodes = _parse_episode_list(args.episodes, dataset.total_episodes)
+    episodes = (
+        parse_episode_filter(args.episodes, dataset.total_episodes)
+        if args.episodes
+        else list(range(dataset.total_episodes))
+    )
     config = ProposeConfig(
         gripper_delta=args.gripper_delta,
         squeeze_gap=args.squeeze_gap,
@@ -449,372 +447,324 @@ def _cmd_verify_relabel(args: argparse.Namespace) -> int:
     return 0 if result.ok else 1
 
 
-def _resolve_multi_dataset_roots(
-    *,
-    dataset_roots: Sequence[Path] | None,
-    repo_ids: Sequence[str] | None,
-    annotation_paths: Sequence[Path] | None,
-) -> list[tuple[Path | None, str | None]] | None:
-    pairs: list[tuple[Path | None, str | None]]
-    if dataset_roots and repo_ids:
-        if len(dataset_roots) != len(repo_ids):
-            print(
-                f"Expected equal counts for --dataset-root ({len(dataset_roots)}) "
-                f"and --repo-id ({len(repo_ids)}).",
-                file=sys.stderr,
-            )
-            return None
-        pairs = list(zip(dataset_roots, repo_ids, strict=True))
-    elif dataset_roots:
-        pairs = [(p, None) for p in dataset_roots]
-    elif repo_ids:
-        pairs = [(None, r) for r in repo_ids]
-    else:
-        print("Provide at least one --dataset-root or --repo-id.", file=sys.stderr)
-        return None
-
-    if annotation_paths is not None and len(annotation_paths) != len(pairs):
-        print(
-            f"Expected one --annotations per dataset "
-            f"(got {len(annotation_paths)} vs {len(pairs)}).",
-            file=sys.stderr,
-        )
-        return None
-    return pairs
-
-
-def _load_validated_inputs(
-    *,
-    dataset_roots: Sequence[Path] | None,
-    repo_ids: Sequence[str] | None,
-    annotation_paths: Sequence[Path] | None,
-    labels: Sequence[str] | None,
-    task_spec_path: Path | None,
-) -> tuple[TaskSpec, list[tuple[DatasetView, list[AnnotationRow], str]]] | None:
-    """Resolve, open, and validate one or more ``(dataset, annotations)`` inputs."""
-    pairs = _resolve_multi_dataset_roots(
-        dataset_roots=dataset_roots,
-        repo_ids=repo_ids,
-        annotation_paths=annotation_paths,
-    )
-    if pairs is None:
-        return None
-
-    n = len(pairs)
-    if labels is not None and len(labels) != n:
-        print(
-            f"Expected one --label per dataset (got {len(labels)} vs {n}).",
-            file=sys.stderr,
-        )
-        return None
-
-    datasets: list[tuple[DatasetView, str | None]] = []
-    for idx, (root_arg, repo_arg) in enumerate(pairs):
-        try:
-            root = resolve_dataset_root(root_arg, repo_arg)
-            dataset = DatasetView(root, repo_id=repo_arg)
-        except (OSError, ValueError) as exc:
-            print(f"[dataset #{idx + 1}] {exc}", file=sys.stderr)
-            return None
-        datasets.append((dataset, repo_arg))
-
-    first_dataset = datasets[0][0]
-    resolved_spec_path = (
-        task_spec_path
-        if task_spec_path is not None
-        else default_task_spec_path(first_dataset.root, repo_id=first_dataset.repo_id)
-    )
+def _cmd_distribution(args: argparse.Namespace) -> int:
     try:
-        task_spec = load_task_spec(resolved_spec_path)
+        root = resolve_dataset_root(args.dataset_root, args.repo_id)
+        dataset = DatasetView(root, repo_id=args.repo_id, revision=args.revision)
+    except (OSError, ValueError) as exc:
+        print(f"[dataset] {exc}", file=sys.stderr)
+        return 1
+
+    spec_path = (
+        args.task_spec
+        if args.task_spec is not None
+        else default_task_spec_path(root, repo_id=dataset.repo_id)
+    )
+    ann_path = (
+        args.annotations
+        if args.annotations is not None
+        else default_annotations_path(root, repo_id=dataset.repo_id, revision=dataset.revision)
+    )
+
+    try:
+        task_spec = load_task_spec(spec_path)
     except (OSError, ValueError) as exc:
         print(f"[task-spec] {exc}", file=sys.stderr)
-        return None
-
-    raw_labels: list[str] = []
-    loaded: list[tuple[DatasetView, list[AnnotationRow]]] = []
-    for idx, (dataset, explicit_repo) in enumerate(datasets):
-        ann_path = (
-            annotation_paths[idx]
-            if annotation_paths is not None
-            else default_annotations_path(
-                dataset.root, repo_id=dataset.repo_id, revision=dataset.revision
-            )
-        )
-        try:
-            rows = load_annotations(ann_path)
-        except (OSError, ValueError) as exc:
-            print(f"[annotations #{idx + 1}] {exc}", file=sys.stderr)
-            return None
-
-        expected_revision: str | None = None
-        if dataset.revision == "local":
-            print(
-                f"Warning: dataset #{idx + 1} ({dataset.repo_id}) revision could not be detected "
-                "('local'); annotation revision was not verified.",
-                file=sys.stderr,
-            )
-        else:
-            expected_revision = dataset.revision
-
-        violations = validate_annotations(
-            rows,
-            task_spec,
-            dataset.episode_lengths,
-            expected_repo_id=explicit_repo,
-            expected_revision=expected_revision,
-        )
-        if violations:
-            for violation in violations:
-                print(violation, file=sys.stderr)
-            print(
-                f"Validation failed for {ann_path} with {len(violations)} violation(s).",
-                file=sys.stderr,
-            )
-            return None
-
-        loaded.append((dataset, rows))
-        raw_labels.append(labels[idx] if labels is not None else dataset.repo_id)
-
-    # Disambiguate duplicate default labels so legends and tables remain distinct.
-    label_counts: dict[str, int] = {}
-    for lbl in raw_labels:
-        label_counts[lbl] = label_counts.get(lbl, 0) + 1
-    seen: dict[str, int] = {}
-    result: list[tuple[DatasetView, list[AnnotationRow], str]] = []
-    for (dataset, rows), lbl in zip(loaded, raw_labels, strict=True):
-        if label_counts[lbl] > 1:
-            seen[lbl] = seen.get(lbl, 0) + 1
-            final_label = f"{lbl}#{seen[lbl]}"
-        else:
-            final_label = lbl
-        result.append((dataset, rows, final_label))
-    return task_spec, result
-
-
-def _add_multi_dataset_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--task-spec",
-        type=Path,
-        default=None,
-        help=(
-            "Path to the YAML task spec file "
-            "(default: <lerobot_root>/.xense-viewer/subtasks/<org>__<name>.task_spec.yaml)."
-        ),
-    )
-    parser.add_argument(
-        "--dataset-root",
-        type=Path,
-        action="append",
-        default=None,
-        help="Local LeRobot v3.0 dataset directory (repeat once per input dataset).",
-    )
-    parser.add_argument(
-        "--repo-id",
-        type=str,
-        action="append",
-        default=None,
-        help="Dataset repo ID (repeat once per input dataset when --dataset-root is omitted).",
-    )
-    parser.add_argument(
-        "--annotations",
-        type=Path,
-        action="append",
-        default=None,
-        help=(
-            "Annotation CSV path paired with each dataset "
-            "(default: <lerobot_root>/.xense-viewer/subtasks/<org>__<name>@<revision>.csv)."
-        ),
-    )
-    parser.add_argument(
-        "--label",
-        type=str,
-        action="append",
-        default=None,
-        help="Optional display label for each input dataset (repeat to match datasets).",
-    )
-
-
-def _cmd_report(args: argparse.Namespace) -> int:
-    loaded = _load_validated_inputs(
-        dataset_roots=args.dataset_root,
-        repo_ids=args.repo_id,
-        annotation_paths=args.annotations,
-        labels=args.label,
-        task_spec_path=args.task_spec,
-    )
-    if loaded is None:
         return 1
-    task_spec, inputs = loaded
 
-    advice_markdown: str | None = None
-    if args.advice is not None:
-        try:
-            advice_markdown = args.advice.read_text(encoding="utf-8")
-        except OSError as exc:
-            print(f"[advice] {exc}", file=sys.stderr)
-            return 1
+    try:
+        rows = load_annotations(ann_path)
+    except (OSError, ValueError) as exc:
+        print(f"[annotations] {exc}", file=sys.stderr)
+        return 1
 
-    if args.group:
-        if len(inputs) != 1:
-            print(
-                "--group only applies when analyzing a single dataset input.",
-                file=sys.stderr,
-            )
-            return 1
-        dataset, rows, _ = inputs[0]
+    expected_revision: str | None = None
+    if dataset.revision == "local":
+        print(
+            "Warning: dataset revision could not be detected ('local'); "
+            "annotation revision was not verified.",
+            file=sys.stderr,
+        )
+    else:
+        expected_revision = dataset.revision
+
+    violations = validate_annotations(
+        rows,
+        task_spec,
+        dataset.episode_lengths,
+        expected_repo_id=args.repo_id,
+        expected_revision=expected_revision,
+    )
+    if violations:
+        for violation in violations:
+            print(violation, file=sys.stderr)
+        print(f"Validation failed with {len(violations)} violation(s).", file=sys.stderr)
+        return 1
+
+    episode_filter: list[int] | None = None
+    if args.episodes:
         try:
-            groups = parse_episode_groups(args.group, dataset.total_episodes)
+            episode_filter = parse_episode_filter(args.episodes, dataset.total_episodes)
         except ValueError as exc:
-            print(f"[group] {exc}", file=sys.stderr)
+            print(f"[episodes] {exc}", file=sys.stderr)
             return 1
-        analyses = analyze_dataset_groups(
+
+    try:
+        payload = compute_distribution(
             dataset,
             rows,
             task_spec,
-            groups,
-            speed_ratio_threshold=args.speed_ratio_threshold,
-            min_rest_speed_mps=args.min_rest_speed,
-            max_traj_points=args.max_traj_points,
+            annotations_path=ann_path.resolve(),
+            task_spec_path=spec_path.resolve(),
+            episode_filter=episode_filter,
+            trajectory_samples=args.trajectory_samples,
         )
-    else:
-        analyses = [
-            analyze_dataset(
-                dataset,
-                rows,
-                task_spec,
-                label=label,
-                speed_ratio_threshold=args.speed_ratio_threshold,
-                min_rest_speed_mps=args.min_rest_speed,
-                max_traj_points=args.max_traj_points,
-            )
-            for dataset, rows, label in inputs
-        ]
+    except (OSError, ValueError) as exc:
+        print(f"[distribution] {exc}", file=sys.stderr)
+        return 1
 
-    first_dataset = inputs[0][0]
-    output_target = (
+    out_path = (
         args.output
         if args.output is not None
-        else default_report_dir(
-            first_dataset.root,
-            repo_id=first_dataset.repo_id,
-            revision=first_dataset.revision,
-        )
+        else default_distribution_path(root, repo_id=dataset.repo_id, revision=dataset.revision)
     )
-    html_path, summary_path, _ = write_report_bundle(
-        analyses,
-        task_spec,
-        output_target,
-        speed_ratio_threshold=args.speed_ratio_threshold,
-        min_rest_speed_mps=args.min_rest_speed,
-        title=args.title,
-        advice_markdown=advice_markdown,
-    )
-
-    for analysis in analyses:
-        print(format_frame_share_table(analysis.frame_shares))
-        flagged_eps = sorted({m.episode_index for m in analysis.speed_metrics if m.not_slowed_down})
-        flagged_arm_records = sum(1 for m in analysis.speed_metrics if m.not_slowed_down)
-        idle_arm_records = sum(1 for m in analysis.speed_metrics if m.idle)
-        print(
-            f"Speed check (ratio > {args.speed_ratio_threshold:.2f}): "
-            f"{len(flagged_eps)} episode(s) flagged as not slowed down "
-            f"({flagged_arm_records} arm-episode record(s); "
-            f"{idle_arm_records} idle arm-episode(s))."
-        )
-        if analysis.skipped_objects:
-            print(f"Skipped object events: {len(analysis.skipped_objects)} (listed in report).")
-        print()
-
-    print(f"Wrote offline HTML report: {html_path}")
-    print(f"Wrote summary JSON: {summary_path}")
-    return 0
-
-
-def _cmd_mix(args: argparse.Namespace) -> int:
-    loaded = _load_validated_inputs(
-        dataset_roots=args.dataset_root,
-        repo_ids=args.repo_id,
-        annotation_paths=args.annotations,
-        labels=args.label,
-        task_spec_path=args.task_spec,
-    )
-    if loaded is None:
-        return 1
-    task_spec, inputs = loaded
-
-    n = len(inputs)
-    if args.repeat is None:
-        repeats = [1] * n
-    elif len(args.repeat) != n:
-        print(
-            f"Expected one --repeat per dataset (got {len(args.repeat)} vs {n}).",
-            file=sys.stderr,
-        )
-        return 1
-    else:
-        repeats = list(args.repeat)
-
-    if any(r < 1 for r in repeats):
-        print(f"All --repeat values must be >= 1, got {repeats}.", file=sys.stderr)
-        return 1
-
-    entries = [
-        MixEntry(
-            label=label,
-            rows=rows,
-            fps=dataset.fps,
-            total_episodes=dataset.total_episodes,
-            episode_lengths=dataset.episode_lengths,
-            repeat=repeat,
-        )
-        for (dataset, rows, label), repeat in zip(inputs, repeats, strict=True)
-    ]
-    per_input, combined = compute_mix(entries, task_spec)
-    print(format_mix_report(per_input, combined))
+    write_distribution_json(payload, out_path)
+    print(format_distribution_summary(payload))
+    print(f"\nWrote distribution JSON: {out_path}")
     return 0
 
 
 def _cmd_suggest(args: argparse.Namespace) -> int:
-    if args.count < 1:
-        print(f"--count / -n must be >= 1, got {args.count}.", file=sys.stderr)
-        return 1
+    has_dataset_ref = args.dataset_root is not None or args.repo_id is not None
+    root: Path | None = None
+    repo_id: str | None = args.repo_id
+    revision: str | None = args.revision
 
-    loaded = _load_validated_inputs(
-        dataset_roots=args.dataset_root,
-        repo_ids=args.repo_id,
-        annotation_paths=args.annotations,
-        labels=args.label,
-        task_spec_path=args.task_spec,
-    )
-    if loaded is None:
-        return 1
-    task_spec, inputs = loaded
+    if has_dataset_ref:
+        try:
+            root = resolve_dataset_root(args.dataset_root, args.repo_id)
+        except (OSError, ValueError) as exc:
+            print(f"[dataset] {exc}", file=sys.stderr)
+            return 1
+        repo_id = repo_id or infer_repo_id(root)
+        revision = revision or detect_dataset_revision(root)
 
-    analyses = [
-        analyze_dataset(
-            dataset,
-            rows,
-            task_spec,
-            label=label,
-            include_trajectories=False,
-        )
-        for dataset, rows, label in inputs
-    ]
-    all_poses = [sample for analysis in analyses for sample in analysis.object_poses]
-    all_skipped_objects = [item for analysis in analyses for item in analysis.skipped_objects]
-    coverages = compute_all_coverages(all_poses, task_spec)
-    suggestions, omitted_objects = suggest_placements(coverages, args.count, seed=args.seed)
-
-    if all_skipped_objects:
+    if args.distribution is not None:
+        dist_path = args.distribution
+    elif root is not None:
+        dist_path = default_distribution_path(root, repo_id=repo_id, revision=revision)
+    else:
         print(
-            f"Skipped object events: {len(all_skipped_objects)} "
-            "(missing event frame or absent subtask)."
+            "Provide --distribution or one of --dataset-root / --repo-id.",
+            file=sys.stderr,
         )
-    print(format_suggestions_table(suggestions, omitted_objects=omitted_objects))
+        return 1
+
+    try:
+        distribution = load_distribution_json(dist_path)
+    except (OSError, ValueError) as exc:
+        print(f"[distribution] {exc}", file=sys.stderr)
+        return 1
+
+    targets_path: Path | None = None
+    if args.targets is not None:
+        targets_path = args.targets
+        if not targets_path.is_file():
+            print(f"[targets] Target polygon file does not exist: {targets_path}", file=sys.stderr)
+            return 1
+    elif root is not None:
+        candidate = default_targets_path(root, repo_id=repo_id)
+        if candidate.is_file():
+            targets_path = candidate
+
+    calib_path: Path | None = None
+    if args.calib is not None:
+        calib_path = args.calib
+        if not calib_path.is_file():
+            print(f"[calib] Head calibration file does not exist: {calib_path}", file=sys.stderr)
+            return 1
+    elif root is not None:
+        candidate = default_calib_head_path(root, repo_id=repo_id)
+        if candidate.is_file():
+            calib_path = candidate
+
+    targets_payload = None
+    if targets_path is not None:
+        try:
+            targets_payload = load_target_polygon(targets_path)
+        except (OSError, ValueError) as exc:
+            print(f"[targets] {exc}", file=sys.stderr)
+            return 1
+
+    calibration: HeadCalibration | None = None
+    if calib_path is not None:
+        try:
+            calibration = load_head_calibration(calib_path)
+        except (OSError, ValueError) as exc:
+            print(f"[calib] {exc}", file=sys.stderr)
+            return 1
+
+    try:
+        payload = generate_suggestions(
+            distribution,
+            count=args.count,
+            test_per_tier=args.test_per_tier,
+            targets=targets_payload,
+            calibration=calibration,
+            object_filter=args.object,
+            seed=args.seed,
+            distribution_path=dist_path.resolve(),
+            targets_path=targets_path.resolve() if targets_path is not None else None,
+            calib_path=calib_path.resolve() if calib_path is not None else None,
+        )
+    except ValueError as exc:
+        print(f"[suggest] {exc}", file=sys.stderr)
+        return 1
 
     if args.output is not None:
-        write_suggestions_csv(suggestions, args.output)
-        print(f"\nWrote suggestions CSV: {args.output}")
+        out_path = args.output
+    elif root is not None:
+        out_path = default_suggestions_path(root, repo_id=repo_id, revision=revision)
+    else:
+        print("Provide -o/--output when --dataset-root and --repo-id are omitted.", file=sys.stderr)
+        return 1
+
+    write_suggestions_json(payload, out_path)
+    print(format_suggestions_summary(payload))
+    print(f"Wrote suggestions JSON: {out_path}")
+    if args.csv is not None:
+        write_suggestions_csv(payload, args.csv)
+        print(f"Wrote suggestions CSV: {args.csv}")
+    return 0
+
+
+def _cmd_calib_frames(args: argparse.Namespace) -> int:
+    try:
+        root = resolve_dataset_root(args.dataset_root, args.repo_id)
+        dataset = DatasetView(root, repo_id=args.repo_id, revision=args.revision)
+    except (OSError, ValueError) as exc:
+        print(f"[dataset] {exc}", file=sys.stderr)
+        return 1
+
+    out_path = (
+        args.output
+        if args.output is not None
+        else default_calib_frames_path(root, repo_id=dataset.repo_id)
+    )
+
+    existing = None
+    if args.append is not None:
+        if not out_path.is_file():
+            print(
+                f"[calib-frames] --append requires an existing frames file at {out_path}",
+                file=sys.stderr,
+            )
+            return 1
+        try:
+            existing = json.loads(out_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            print(f"[calib-frames] Failed to read {out_path}: {exc}", file=sys.stderr)
+            return 1
+
+    episodes = None
+    if args.episodes:
+        try:
+            episodes = parse_episode_filter(args.episodes, dataset.total_episodes)
+        except ValueError as exc:
+            print(f"[episodes] {exc}", file=sys.stderr)
+            return 1
+
+    try:
+        payload = select_calib_frames(
+            dataset,
+            camera=args.camera,
+            count_per_arm=args.count,
+            existing=existing,
+            append_per_arm=args.append,
+            episodes=episodes,
+        )
+    except (KeyError, ValueError) as exc:
+        print(f"[calib-frames] {exc}", file=sys.stderr)
+        return 1
+
+    write_json(payload, out_path)
+    per_arm: dict[str, int] = {}
+    for item in payload["frames"]:
+        arm = str(item["arm"])
+        per_arm[arm] = per_arm.get(arm, 0) + 1
+    counts_str = ", ".join(f"{arm}={cnt}" for arm, cnt in sorted(per_arm.items()))
+    print(f"Wrote {out_path}: {len(payload['frames'])} frame(s) ({counts_str})")
+    return 0
+
+
+def _cmd_calibrate(args: argparse.Namespace) -> int:
+    has_dataset_ref = args.dataset_root is not None or args.repo_id is not None
+    root: Path | None = None
+    repo_id: str | None = args.repo_id
+    if has_dataset_ref:
+        try:
+            root = resolve_dataset_root(args.dataset_root, args.repo_id)
+        except (OSError, ValueError) as exc:
+            print(f"[dataset] {exc}", file=sys.stderr)
+            return 1
+        repo_id = repo_id or infer_repo_id(root)
+
+    if args.points is not None:
+        points_path = args.points
+    elif root is not None:
+        points_path = default_calib_points_path(root, repo_id=repo_id)
+    else:
+        print("Provide --points or one of --dataset-root / --repo-id.", file=sys.stderr)
+        return 1
+
+    if args.intrinsics is not None:
+        intrinsics_path = args.intrinsics
+    elif root is not None:
+        intrinsics_path = default_calib_intrinsics_path(root, repo_id=repo_id)
+    else:
+        print("Provide --intrinsics or one of --dataset-root / --repo-id.", file=sys.stderr)
+        return 1
+
+    if args.output is not None:
+        out_path = args.output
+    elif root is not None:
+        out_path = default_calib_head_path(root, repo_id=repo_id)
+    else:
+        print("Provide -o/--output or one of --dataset-root / --repo-id.", file=sys.stderr)
+        return 1
+
+    try:
+        intrinsics = load_intrinsics(intrinsics_path)
+    except (OSError, ValueError) as exc:
+        print(f"[intrinsics] {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        points_payload = json.loads(points_path.read_text(encoding="utf-8"))
+        head_payload = calibrate_head_camera(points_payload, intrinsics)
+    except (OSError, ValueError) as exc:
+        print(f"[calibrate] {exc}", file=sys.stderr)
+        return 1
+
+    write_json(head_payload, out_path)
+    for arm_name, entry in head_payload["arms"].items():
+        offset_mm = [v * 1000.0 for v in entry["tool_offset"]]
+        loo = entry["loo_rms_px"]
+        loo_str = "n/a" if loo is None else f"{loo:.2f} px"
+        print(
+            f"arm={arm_name}: n={entry['n_points']}, rms={entry['rms_px']:.2f} px, "
+            f"loo_rms={loo_str}, tool_offset=[{offset_mm[0]:.1f}, {offset_mm[1]:.1f}, "
+            f"{offset_mm[2]:.1f}] mm"
+        )
+    diff = compare_arm_extrinsics(head_payload)
+    if diff is not None:
+        print(
+            "left vs right extrinsic diff: "
+            f"rot={diff['rotation_diff_deg']:.2f} deg, "
+            f"tvec={diff['tvec_diff_mm']:.1f} mm, "
+            f"camera_origin={diff['camera_origin_diff_mm']:.1f} mm"
+        )
+    print(f"Wrote head calibration JSON: {out_path}")
     return 0
 
 
@@ -823,7 +773,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="lerobot-check",
         description=(
-            "Subtask annotation, validation, relabeling, and analysis CLI for LeRobot v3.0."
+            "Subtask annotation, validation, relabeling, distribution, and calibration CLI "
+            "for LeRobot v3.0."
         ),
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -850,7 +801,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--episodes",
         nargs="+",
         default=None,
-        help="Episode indices or start:end ranges (comma or space separated). Default: all.",
+        help="Episode indices or ranges (comma or space separated). Default: all.",
     )
     propose_parser.add_argument(
         "--gripper-delta",
@@ -1168,113 +1119,228 @@ def build_parser() -> argparse.ArgumentParser:
     )
     verify_parser.set_defaults(func=_cmd_verify_relabel)
 
-    report_parser = subparsers.add_parser(
-        "report",
-        help="Generate an offline Chinese HTML analysis report and summary.json.",
+    dist_parser = subparsers.add_parser(
+        "distribution",
+        help="Compute machine-readable distribution.json for xense-lerobot-viewer.",
     )
-    _add_multi_dataset_args(report_parser)
-    report_parser.add_argument(
-        "--group",
+    _add_dataset_args(dist_parser)
+    dist_parser.add_argument(
+        "--revision",
         type=str,
-        action="append",
         default=None,
-        metavar="NAME=EPISODES",
-        help=(
-            "Partition a single dataset into colored episode groups "
-            "(e.g. --group 原数据=0-120 --group 补录=121-173 or 0:121 / 121:174)."
-        ),
+        help="Override detected dataset revision.",
     )
-    report_parser.add_argument(
-        "--advice",
+    dist_parser.add_argument(
+        "--annotations",
         type=Path,
         default=None,
-        help="Optional Markdown file (e.g. advice.md) to embed as the 'Agent 建议' section.",
-    )
-    report_parser.add_argument(
-        "--speed-ratio-threshold",
-        type=float,
-        default=DEFAULT_SPEED_RATIO_THRESHOLD,
         help=(
-            "Flag episodes as 'not slowed down' when fine_median / rest_median exceeds this "
-            f"threshold (default: {DEFAULT_SPEED_RATIO_THRESHOLD})."
+            "Path to the annotation CSV file "
+            "(default: <lerobot_root>/.xense-viewer/subtasks/<org>__<name>@<revision>.csv)."
         ),
     )
-    report_parser.add_argument(
-        "--min-rest-speed",
-        type=float,
-        default=DEFAULT_MIN_REST_SPEED_MPS,
-        help=(
-            "Non-fine median TCP speed (m/s) below which an arm is treated as idle "
-            f"(default: {DEFAULT_MIN_REST_SPEED_MPS})."
-        ),
-    )
-    report_parser.add_argument(
-        "--max-traj-points",
-        type=int,
-        default=DEFAULT_MAX_TRAJ_POINTS,
-        help=(
-            "Maximum sampled points per episode trajectory segment in 3D plots "
-            f"(default: {DEFAULT_MAX_TRAJ_POINTS})."
-        ),
-    )
-    report_parser.add_argument(
-        "--title",
-        type=str,
+    dist_parser.add_argument(
+        "--task-spec",
+        type=Path,
         default=None,
-        help="Optional custom HTML report title.",
+        help=(
+            "Path to the YAML task spec file "
+            "(default: <lerobot_root>/.xense-viewer/subtasks/<org>__<name>.task_spec.yaml)."
+        ),
     )
-    report_parser.add_argument(
+    dist_parser.add_argument(
+        "--episodes",
+        nargs="+",
+        default=None,
+        help=(
+            "Restrict output to episode indices/ranges (e.g. '0,30,60', '0-20', '0:21'). "
+            "Default: all episodes."
+        ),
+    )
+    dist_parser.add_argument(
+        "--trajectory-samples",
+        type=int,
+        default=DEFAULT_TRAJECTORY_SAMPLES,
+        help=(
+            "Number of progress-resampled points per trajectory from 0 to 1 "
+            f"(default: {DEFAULT_TRAJECTORY_SAMPLES})."
+        ),
+    )
+    dist_parser.add_argument(
         "-o",
         "--output",
         type=Path,
         default=None,
         help=(
-            "Output report directory or .html path "
-            "(default: <lerobot_root>/.xense-viewer/reports/<org>__<name>@<revision>/)."
+            "Output distribution JSON path "
+            "(default: <lerobot_root>/.xense-viewer/distribution/<org>__<name>@<revision>.json)."
         ),
     )
-    report_parser.set_defaults(func=_cmd_report)
-
-    mix_parser = subparsers.add_parser(
-        "mix",
-        help="Compute combined subtask and fine-window frame shares across repeated datasets.",
-    )
-    _add_multi_dataset_args(mix_parser)
-    mix_parser.add_argument(
-        "--repeat",
-        type=int,
-        action="append",
-        default=None,
-        help="Positive integer repetition weight for each input dataset (default: 1 each).",
-    )
-    mix_parser.set_defaults(func=_cmd_mix)
+    dist_parser.set_defaults(func=_cmd_distribution)
 
     suggest_parser = subparsers.add_parser(
         "suggest",
-        help="Suggest next-batch object placements (xy, yaw) sampled from sparse coverage cells.",
+        help="Generate collection placement suggestions and 3-tier test points.",
     )
-    _add_multi_dataset_args(suggest_parser)
+    _add_dataset_args(suggest_parser)
+    suggest_parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        help="Override detected dataset revision when resolving default paths.",
+    )
+    suggest_parser.add_argument(
+        "--distribution",
+        type=Path,
+        default=None,
+        help=(
+            "Path to distribution.json "
+            "(default: <lerobot_root>/.xense-viewer/distribution/<org>__<name>@<revision>.json)."
+        ),
+    )
+    suggest_parser.add_argument(
+        "--targets",
+        type=Path,
+        default=None,
+        help=(
+            "Optional target polygon JSON in head-image pixels "
+            "(default: <lerobot_root>/.xense-viewer/targets/<org>__<name>.json if present)."
+        ),
+    )
+    suggest_parser.add_argument(
+        "--calib",
+        type=Path,
+        default=None,
+        help=(
+            "Optional head-camera calibration head.json "
+            "(default: <lerobot_root>/.xense-viewer/calib/<org>__<name>.head.json if present)."
+        ),
+    )
     suggest_parser.add_argument(
         "-n",
         "--count",
         type=int,
-        required=True,
-        help="Number of batch episodes N to suggest.",
+        default=10,
+        help="Number of collection placements N per object (default: 10).",
+    )
+    suggest_parser.add_argument(
+        "--test-per-tier",
+        type=int,
+        default=3,
+        help="Number of test points per tier (dense, edge, empty) per object (default: 3).",
+    )
+    suggest_parser.add_argument(
+        "--object",
+        nargs="+",
+        default=None,
+        help="Optional subset of object names from distribution.json to generate for.",
     )
     suggest_parser.add_argument(
         "--seed",
         type=int,
         default=0,
-        help="Random seed for reproducible placement sampling (default: 0).",
+        help="Random seed for reproducible sampling (default: 0).",
     )
     suggest_parser.add_argument(
         "-o",
         "--output",
         type=Path,
         default=None,
-        help="Optional CSV path to write placement suggestions (outside the repository).",
+        help=(
+            "Output suggestions JSON path "
+            "(default: <lerobot_root>/.xense-viewer/suggestions/<org>__<name>@<revision>.json)."
+        ),
+    )
+    suggest_parser.add_argument(
+        "--csv",
+        type=Path,
+        default=None,
+        help="Optional CSV export path for placements and test points.",
     )
     suggest_parser.set_defaults(func=_cmd_suggest)
+
+    calib_frames_parser = subparsers.add_parser(
+        "calib-frames",
+        help="Select diverse TCP frames per arm for head-camera calibration.",
+    )
+    _add_dataset_args(calib_frames_parser)
+    calib_frames_parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        help="Override detected dataset revision.",
+    )
+    calib_frames_parser.add_argument(
+        "--camera",
+        type=str,
+        default=DEFAULT_CALIB_CAMERA,
+        help=f"Head camera feature key (default: {DEFAULT_CALIB_CAMERA}).",
+    )
+    calib_frames_parser.add_argument(
+        "-n",
+        "--count",
+        type=int,
+        default=DEFAULT_FRAMES_PER_ARM,
+        help=f"Number of frames to select per arm (default: {DEFAULT_FRAMES_PER_ARM}).",
+    )
+    calib_frames_parser.add_argument(
+        "--append",
+        type=int,
+        default=None,
+        help="Append K additional frames per arm to an existing frames.json, keeping existing IDs.",
+    )
+    calib_frames_parser.add_argument(
+        "--episodes",
+        nargs="+",
+        default=None,
+        help="Optional episode filter (indices or ranges). Default: all episodes.",
+    )
+    calib_frames_parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help=(
+            "Output frames JSON path "
+            "(default: <lerobot_root>/.xense-viewer/calib/<org>__<name>.frames.json)."
+        ),
+    )
+    calib_frames_parser.set_defaults(func=_cmd_calib_frames)
+
+    calibrate_parser = subparsers.add_parser(
+        "calibrate",
+        help="Solve per-arm head-camera extrinsics and tool offset from points.json.",
+    )
+    _add_dataset_args(calibrate_parser)
+    calibrate_parser.add_argument(
+        "--points",
+        type=Path,
+        default=None,
+        help=(
+            "Path to annotated points JSON "
+            "(default: <lerobot_root>/.xense-viewer/calib/<org>__<name>.points.json)."
+        ),
+    )
+    calibrate_parser.add_argument(
+        "--intrinsics",
+        type=Path,
+        default=None,
+        help=(
+            "Path to camera intrinsics JSON "
+            "(default: <lerobot_root>/.xense-viewer/calib/<org>__<name>.intrinsics.json)."
+        ),
+    )
+    calibrate_parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help=(
+            "Output head calibration JSON path "
+            "(default: <lerobot_root>/.xense-viewer/calib/<org>__<name>.head.json)."
+        ),
+    )
+    calibrate_parser.set_defaults(func=_cmd_calibrate)
 
     return parser
 

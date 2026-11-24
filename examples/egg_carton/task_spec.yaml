@@ -24,7 +24,6 @@ objects:
     event: release
     arm: left
     yaw_symmetry_deg: 180.0
-fine_window_s: 1.0
 coverage:
   xy_bin_m: 0.05
   yaw_bin_deg: 30.0

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import csv
+import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import yaml
 
@@ -42,11 +43,14 @@ class SubtaskSpec:
         prompt: Verbatim language instruction used by training and robot clients.
         cameras: Optional ordered camera feature keys (or short names) preferred when
             visually inspecting or annotating this subtask. Empty when unspecified.
+        arms: Optional ordered participating arms (``"left"`` / ``"right"``). When
+            empty, defaults to the unique arms of ``objects`` belonging to this subtask.
     """
 
     name: str
     prompt: str
     cameras: tuple[str, ...] = ()
+    arms: tuple[ArmSide, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -93,14 +97,12 @@ class TaskSpec:
         name: Human-readable task name.
         subtasks: Ordered tuple of subtask definitions.
         objects: Tuple of object pose definitions referencing ``subtasks``.
-        fine_window_s: Half-window duration delta (seconds) for fine-contact analysis.
         coverage: Workspace coverage grid parameters.
     """
 
     name: str
     subtasks: tuple[SubtaskSpec, ...]
     objects: tuple[ObjectSpec, ...] = ()
-    fine_window_s: float = 1.0
     coverage: CoverageSpec = field(default_factory=CoverageSpec)
 
     @property
@@ -146,6 +148,37 @@ class TaskSpec:
             if item.name == subtask:
                 return item.cameras
         raise KeyError(f"Unknown subtask: {subtask!r}")
+
+    def arms_for(self, subtask: str) -> tuple[ArmSide, ...]:
+        """Return participating arms for ``subtask``.
+
+        Uses ``subtask.arms`` when explicitly specified; otherwise defaults to the
+        unique arms of ``self.objects`` referencing ``subtask`` in spec order.
+
+        Args:
+            subtask: Name of the subtask to look up.
+
+        Returns:
+            Ordered tuple of participating arm sides.
+
+        Raises:
+            KeyError: If ``subtask`` is not present in this task spec.
+        """
+        target: SubtaskSpec | None = None
+        for item in self.subtasks:
+            if item.name == subtask:
+                target = item
+                break
+        if target is None:
+            raise KeyError(f"Unknown subtask: {subtask!r}")
+        if target.arms:
+            return target.arms
+
+        inferred: list[ArmSide] = []
+        for obj in self.objects:
+            if obj.subtask == subtask and obj.arm not in inferred:
+                inferred.append(obj.arm)
+        return tuple(inferred)
 
 
 @dataclass(frozen=True)
@@ -247,10 +280,35 @@ def parse_task_spec(raw: Any) -> TaskSpec:
                     )
                 seen_cams.add(cam_key)
                 cameras.append(cam_key)
+        raw_arms = entry.get("arms")
+        arms: list[ArmSide] = []
+        if raw_arms is not None:
+            if not isinstance(raw_arms, list):
+                raise ValueError(
+                    f"subtasks[{idx}].arms must be a list of arms, got {type(raw_arms).__name__}"
+                )
+            seen_arms: set[str] = set()
+            for arm_idx, arm_val in enumerate(raw_arms):
+                if arm_val not in VALID_ARMS:
+                    raise ValueError(
+                        f"subtasks[{idx}].arms[{arm_idx}] must be one of "
+                        f"{sorted(VALID_ARMS)}, got {arm_val!r}"
+                    )
+                if arm_val in seen_arms:
+                    raise ValueError(f"subtasks[{idx}].arms contains duplicate arm {arm_val!r}")
+                seen_arms.add(arm_val)
+                arms.append(cast(ArmSide, arm_val))
         if subtask_name in seen_subtasks:
             raise ValueError(f"Duplicate subtask name: {subtask_name!r}")
         seen_subtasks.add(subtask_name)
-        subtasks.append(SubtaskSpec(name=subtask_name, prompt=prompt, cameras=tuple(cameras)))
+        subtasks.append(
+            SubtaskSpec(
+                name=subtask_name,
+                prompt=prompt,
+                cameras=tuple(cameras),
+                arms=tuple(arms),
+            )
+        )
 
     raw_objects = raw.get("objects", [])
     if raw_objects is None:
@@ -300,7 +358,12 @@ def parse_task_spec(raw: Any) -> TaskSpec:
             )
         )
 
-    fine_window_s = _require_positive_float(raw.get("fine_window_s", 1.0), "fine_window_s")
+    if "fine_window_s" in raw:
+        warnings.warn(
+            "Task spec field 'fine_window_s' is deprecated and ignored.",
+            UserWarning,
+            stacklevel=2,
+        )
 
     raw_coverage = raw.get("coverage") or {}
     if not isinstance(raw_coverage, dict):
@@ -320,7 +383,6 @@ def parse_task_spec(raw: Any) -> TaskSpec:
         name=name,
         subtasks=tuple(subtasks),
         objects=tuple(objects),
-        fine_window_s=fine_window_s,
         coverage=coverage,
     )
 
@@ -350,6 +412,8 @@ def save_task_spec(spec: TaskSpec, path: Path) -> None:
         entry: dict[str, Any] = {"name": s.name, "prompt": s.prompt}
         if s.cameras:
             entry["cameras"] = list(s.cameras)
+        if s.arms:
+            entry["arms"] = list(s.arms)
         subtask_payloads.append(entry)
 
     payload: dict[str, Any] = {
@@ -365,7 +429,6 @@ def save_task_spec(spec: TaskSpec, path: Path) -> None:
             }
             for o in spec.objects
         ],
-        "fine_window_s": spec.fine_window_s,
         "coverage": {
             "xy_bin_m": spec.coverage.xy_bin_m,
             "yaw_bin_deg": spec.coverage.yaw_bin_deg,

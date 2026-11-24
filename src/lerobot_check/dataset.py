@@ -269,18 +269,116 @@ def default_task_spec_path(
     )
 
 
-def default_report_dir(
+def default_distribution_path(
     dataset_root: Path,
     *,
     repo_id: str | None = None,
     revision: str | None = None,
 ) -> Path:
-    """Return the shared default report directory under ``.xense-viewer/reports``."""
+    """Return the shared default distribution JSON path under ``.xense-viewer/distribution``."""
     resolved = dataset_root.expanduser().resolve()
     rid = repo_id or infer_repo_id(resolved)
     rev = revision or detect_dataset_revision(resolved)
     return (
-        dataset_lerobot_root(resolved) / ".xense-viewer" / "reports" / f"{dataset_slug(rid)}@{rev}"
+        dataset_lerobot_root(resolved)
+        / ".xense-viewer"
+        / "distribution"
+        / f"{dataset_slug(rid)}@{rev}.json"
+    )
+
+
+def default_suggestions_path(
+    dataset_root: Path,
+    *,
+    repo_id: str | None = None,
+    revision: str | None = None,
+) -> Path:
+    """Return the shared default suggestions JSON path under ``.xense-viewer/suggestions``."""
+    resolved = dataset_root.expanduser().resolve()
+    rid = repo_id or infer_repo_id(resolved)
+    rev = revision or detect_dataset_revision(resolved)
+    return (
+        dataset_lerobot_root(resolved)
+        / ".xense-viewer"
+        / "suggestions"
+        / f"{dataset_slug(rid)}@{rev}.json"
+    )
+
+
+def default_targets_path(
+    dataset_root: Path,
+    *,
+    repo_id: str | None = None,
+) -> Path:
+    """Return the shared default target polygon JSON path under ``.xense-viewer/targets``."""
+    resolved = dataset_root.expanduser().resolve()
+    rid = repo_id or infer_repo_id(resolved)
+    return (
+        dataset_lerobot_root(resolved) / ".xense-viewer" / "targets" / f"{dataset_slug(rid)}.json"
+    )
+
+
+def default_calib_intrinsics_path(
+    dataset_root: Path,
+    *,
+    repo_id: str | None = None,
+) -> Path:
+    """Return the shared default camera intrinsics JSON path under ``.xense-viewer/calib``."""
+    resolved = dataset_root.expanduser().resolve()
+    rid = repo_id or infer_repo_id(resolved)
+    return (
+        dataset_lerobot_root(resolved)
+        / ".xense-viewer"
+        / "calib"
+        / f"{dataset_slug(rid)}.intrinsics.json"
+    )
+
+
+def default_calib_frames_path(
+    dataset_root: Path,
+    *,
+    repo_id: str | None = None,
+) -> Path:
+    """Return the shared default calibration frames JSON path under ``.xense-viewer/calib``."""
+    resolved = dataset_root.expanduser().resolve()
+    rid = repo_id or infer_repo_id(resolved)
+    return (
+        dataset_lerobot_root(resolved)
+        / ".xense-viewer"
+        / "calib"
+        / f"{dataset_slug(rid)}.frames.json"
+    )
+
+
+def default_calib_points_path(
+    dataset_root: Path,
+    *,
+    repo_id: str | None = None,
+) -> Path:
+    """Return the shared default calibration points JSON path under ``.xense-viewer/calib``."""
+    resolved = dataset_root.expanduser().resolve()
+    rid = repo_id or infer_repo_id(resolved)
+    return (
+        dataset_lerobot_root(resolved)
+        / ".xense-viewer"
+        / "calib"
+        / f"{dataset_slug(rid)}.points.json"
+    )
+
+
+def default_calib_head_path(
+    dataset_root: Path,
+    *,
+    repo_id: str | None = None,
+) -> Path:
+    """Return the shared default head-camera calibration JSON path under ``.xense-viewer/calib``."""
+    resolved = dataset_root.expanduser().resolve()
+    rid = repo_id or infer_repo_id(resolved)
+    return (
+        dataset_lerobot_root(resolved)
+        / ".xense-viewer"
+        / "calib"
+        / f"{dataset_slug(rid)}.head.json"
     )
 
 
@@ -291,9 +389,13 @@ def format_dataset_info(dataset: DatasetView) -> str:
     ann_path = default_annotations_path(
         dataset.root, repo_id=dataset.repo_id, revision=dataset.revision
     )
-    report_path = default_report_dir(
+    dist_path = default_distribution_path(
         dataset.root, repo_id=dataset.repo_id, revision=dataset.revision
     )
+    sug_path = default_suggestions_path(
+        dataset.root, repo_id=dataset.repo_id, revision=dataset.revision
+    )
+    calib_head_path = default_calib_head_path(dataset.root, repo_id=dataset.repo_id)
     lines = [
         f"repo_id: {dataset.repo_id}",
         f"revision: {dataset.revision}",
@@ -304,7 +406,9 @@ def format_dataset_info(dataset: DatasetView) -> str:
         f"cameras: {', '.join(dataset.camera_keys) if dataset.camera_keys else '(none)'}",
         f"default_task_spec: {default_task_spec_path(dataset.root, repo_id=dataset.repo_id)}",
         f"default_annotations: {ann_path}",
-        f"default_report_dir: {report_path}",
+        f"default_distribution: {dist_path}",
+        f"default_suggestions: {sug_path}",
+        f"default_calib_head: {calib_head_path}",
         "",
         "episode_index\tlength\tduration_s",
     ]
@@ -503,6 +607,103 @@ class DatasetView:
                 f"Episode {episode_index} not found (valid range 0..{self.total_episodes - 1})"
             )
         return self._episodes[episode_index]
+
+    def camera_image_size(self, camera_key: str) -> tuple[int, int]:
+        """Return ``(width, height)`` in pixels for ``camera_key`` from metadata.
+
+        Args:
+            camera_key: Camera feature key (e.g. ``"observation.images.head"``).
+
+        Returns:
+            ``(width, height)`` tuple of positive integers.
+
+        Raises:
+            KeyError: If ``camera_key`` is not present in dataset metadata.
+            ValueError: If image dimensions cannot be determined from feature metadata.
+        """
+        if camera_key not in self.meta.features:
+            raise KeyError(f"Camera {camera_key!r} not found in dataset features")
+        feature = self.meta.features[camera_key]
+        info = feature.get("info")
+        if isinstance(info, dict) and "video.width" in info and "video.height" in info:
+            return int(info["video.width"]), int(info["video.height"])
+        shape = feature.get("shape")
+        if isinstance(shape, (list, tuple)) and len(shape) >= 2:
+            # LeRobot image/video feature shapes are stored as [height, width, channels].
+            return int(shape[1]), int(shape[0])
+        raise ValueError(f"Could not determine image size for camera {camera_key!r}")
+
+    def load_arm_tcp_table(
+        self,
+        episodes: Sequence[int] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+        """Load per-arm 9D TCP poses across episodes in one pass per parquet file.
+
+        Args:
+            episodes: Optional sequence of episode indices to load. Loads all
+                episodes when ``None``.
+
+        Returns:
+            Tuple ``(episode_indices, frame_indices, tcp_by_arm)`` where each
+            ``tcp_by_arm[arm]`` is a float64 array of shape ``(N, 9)`` containing
+            ``[x, y, z, r1, r2, r3, r4, r5, r6]``.
+        """
+        selected = sorted(set(episodes)) if episodes is not None else sorted(self._episodes.keys())
+        for ep_idx in selected:
+            self.get_episode(ep_idx)
+
+        selected_set = set(selected)
+        by_file: dict[Path, list[int]] = {}
+        for ep_idx in selected:
+            rec = self._episodes[ep_idx]
+            by_file.setdefault(rec.data_path, []).append(ep_idx)
+
+        ep_chunks: list[np.ndarray] = []
+        frame_chunks: list[np.ndarray] = []
+        state_chunks: list[np.ndarray] = []
+
+        for data_path in sorted(by_file):
+            table = pq.read_table(
+                data_path,
+                columns=["episode_index", "frame_index", "observation.state"],
+            )
+            ep_arr = table["episode_index"].to_numpy()
+            if len(by_file[data_path]) < len(self._episodes):
+                mask = np.isin(ep_arr, list(selected_set))
+                if not np.any(mask):
+                    continue
+                ep_arr = ep_arr[mask]
+                frame_arr = table["frame_index"].to_numpy()[mask]
+                state_arr = np.stack(table["observation.state"].to_numpy()[mask]).astype(np.float64)
+            else:
+                frame_arr = table["frame_index"].to_numpy()
+                state_arr = np.stack(table["observation.state"].to_numpy()).astype(np.float64)
+
+            ep_chunks.append(ep_arr.astype(np.int64))
+            frame_chunks.append(frame_arr.astype(np.int64))
+            state_chunks.append(state_arr)
+
+        if not ep_chunks:
+            empty_i = np.empty((0,), dtype=np.int64)
+            return (
+                empty_i,
+                empty_i,
+                {arm: np.empty((0, 9), dtype=np.float64) for arm in self.arm_indices},
+            )
+
+        all_ep = np.concatenate(ep_chunks)
+        all_frame = np.concatenate(frame_chunks)
+        all_state = np.concatenate(state_chunks, axis=0)
+        order = np.lexsort((all_frame, all_ep))
+        all_ep = all_ep[order]
+        all_frame = all_frame[order]
+        all_state = all_state[order]
+
+        tcp_by_arm: dict[str, np.ndarray] = {}
+        for arm_name, idx in self.arm_indices.items():
+            cols = [*idx.xyz, *idx.rot6d]
+            tcp_by_arm[arm_name] = all_state[:, cols].copy()
+        return all_ep, all_frame, tcp_by_arm
 
     def load_episode_state_matrix(self, episode_index: int) -> np.ndarray:
         """Load ``observation.state`` rows for one episode sorted by ``frame_index``.

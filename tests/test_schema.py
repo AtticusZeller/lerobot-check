@@ -1,16 +1,24 @@
-"""Tests for TaskSpec and AnnotationRow schema I/O."""
+"""Tests for TaskSpec, AnnotationRow schema I/O, and shared default paths."""
 
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from lerobot_check.dataset import (
     dataset_lerobot_root,
     default_annotations_path,
-    default_report_dir,
+    default_calib_frames_path,
+    default_calib_head_path,
+    default_calib_intrinsics_path,
+    default_calib_points_path,
+    default_distribution_path,
+    default_suggestions_path,
+    default_targets_path,
     default_task_spec_path,
+    format_dataset_info,
 )
 from lerobot_check.schema import (
     AnnotationRow,
@@ -38,7 +46,8 @@ def test_egg_carton_task_spec_has_verbatim_prompts() -> None:
     )
     assert spec.cameras_for("open_carton") == ("observation.images.right_wrist",)
     assert spec.cameras_for("place_eggs") == ("observation.images.left_wrist",)
-    assert spec.fine_window_s == pytest.approx(1.0)
+    assert spec.arms_for("open_carton") == ("right",)
+    assert spec.arms_for("place_eggs") == ("left",)
     assert spec.coverage.xy_bin_m == pytest.approx(0.05)
     assert spec.coverage.yaw_bin_deg == pytest.approx(30.0)
 
@@ -47,25 +56,48 @@ def test_task_spec_yaml_round_trip(tmp_path: Path) -> None:
     spec = TaskSpec(
         name="demo_task",
         subtasks=(
-            SubtaskSpec(name="stage_a", prompt="Do stage A."),
+            SubtaskSpec(name="stage_a", prompt="Do stage A.", arms=("left", "right")),
             SubtaskSpec(name="stage_b", prompt="Do stage B."),
         ),
         objects=(
             ObjectSpec(
                 name="cube",
-                subtask="stage_a",
+                subtask="stage_b",
                 event="grasp",
                 arm="left",
                 yaw_symmetry_deg=90.0,
             ),
         ),
-        fine_window_s=1.25,
         coverage=CoverageSpec(xy_bin_m=0.04, yaw_bin_deg=15.0, sparse_threshold=5),
     )
     out = tmp_path / "spec.yaml"
     save_task_spec(spec, out)
     loaded = load_task_spec(out)
     assert loaded == spec
+    assert loaded.arms_for("stage_a") == ("left", "right")
+    assert loaded.arms_for("stage_b") == ("left",)
+
+
+def test_deprecated_fine_window_s_warns_without_failing() -> None:
+    with pytest.warns(UserWarning, match="fine_window_s"):
+        spec = parse_task_spec(
+            {
+                "name": "legacy_task",
+                "subtasks": [{"name": "a", "prompt": "Do A."}],
+                "fine_window_s": 1.0,
+            }
+        )
+    assert spec.name == "legacy_task"
+    assert spec.subtask_names == ("a",)
+
+
+def test_task_spec_arms_validation() -> None:
+    with pytest.raises(ValueError, match="must be a list"):
+        parse_task_spec({"subtasks": [{"name": "a", "prompt": "p", "arms": "left"}]})
+    with pytest.raises(ValueError, match="must be one of"):
+        parse_task_spec({"subtasks": [{"name": "a", "prompt": "p", "arms": ["middle"]}]})
+    with pytest.raises(ValueError, match="duplicate arm"):
+        parse_task_spec({"subtasks": [{"name": "a", "prompt": "p", "arms": ["left", "left"]}]})
 
 
 @pytest.mark.parametrize(
@@ -98,7 +130,6 @@ def test_task_spec_yaml_round_trip(tmp_path: Path) -> None:
                 }
             ],
         },
-        {"subtasks": [{"name": "a", "prompt": "p"}], "fine_window_s": 0.0},
     ],
 )
 def test_parse_task_spec_rejects_invalid_inputs(bad_raw: object) -> None:
@@ -128,7 +159,7 @@ def test_annotations_csv_round_trip(tmp_path: Path) -> None:
             subtask="place_eggs",
             start=100,
             end=300,
-            contact=120,
+            contact=None,
             grasp=135,
             success=False,
             annotator="agent",
@@ -160,7 +191,6 @@ def test_load_annotations_rejects_invalid_annotator(tmp_path: Path) -> None:
 
 
 def test_task_spec_per_subtask_cameras_round_trip_and_backward_compat(tmp_path: Path) -> None:
-    # Backward compatibility: spec without `cameras` loads with empty tuples.
     legacy_spec = parse_task_spec(
         {
             "name": "legacy",
@@ -173,7 +203,6 @@ def test_task_spec_per_subtask_cameras_round_trip_and_backward_compat(tmp_path: 
     assert legacy_spec.cameras_for("stage_a") == ()
     assert legacy_spec.cameras_for("stage_b") == ()
 
-    # Spec with per-subtask cameras round-trips cleanly.
     spec = TaskSpec(
         name="with_cameras",
         subtasks=(
@@ -193,11 +222,6 @@ def test_task_spec_per_subtask_cameras_round_trip_and_backward_compat(tmp_path: 
     save_task_spec(spec, out)
     loaded = load_task_spec(out)
     assert loaded == spec
-    assert loaded.cameras_for("open_carton") == ("observation.images.right_wrist",)
-    assert loaded.cameras_for("place_eggs") == (
-        "observation.images.left_wrist",
-        "observation.images.head",
-    )
 
     with pytest.raises(ValueError, match="must be a list"):
         parse_task_spec(
@@ -221,7 +245,7 @@ def test_task_spec_per_subtask_cameras_round_trip_and_backward_compat(tmp_path: 
         )
 
 
-def test_default_xense_viewer_paths(tmp_path: Path) -> None:
+def test_default_xense_viewer_paths_and_format_info(tmp_path: Path) -> None:
     lerobot_root = tmp_path / "lerobot"
     ds_root = lerobot_root / "Xense" / "my_dataset"
     sha = "fd0f68ff3e923887f23b153412cd3faa8c441717"
@@ -229,11 +253,46 @@ def test_default_xense_viewer_paths(tmp_path: Path) -> None:
     trees_dir.mkdir(parents=True)
     (trees_dir / f"{sha}.json").write_text("{}", encoding="utf-8")
 
+    viewer_root = lerobot_root.resolve() / ".xense-viewer"
     assert dataset_lerobot_root(ds_root) == lerobot_root.resolve()
-    subtasks_dir = lerobot_root.resolve() / ".xense-viewer" / "subtasks"
-    assert default_task_spec_path(ds_root) == subtasks_dir / "Xense__my_dataset.task_spec.yaml"
-    assert default_annotations_path(ds_root) == subtasks_dir / f"Xense__my_dataset@{sha}.csv"
-    assert (
-        default_report_dir(ds_root)
-        == lerobot_root.resolve() / ".xense-viewer" / "reports" / f"Xense__my_dataset@{sha}"
+    assert default_task_spec_path(ds_root) == (
+        viewer_root / "subtasks" / "Xense__my_dataset.task_spec.yaml"
     )
+    assert default_annotations_path(ds_root) == (
+        viewer_root / "subtasks" / f"Xense__my_dataset@{sha}.csv"
+    )
+    assert default_distribution_path(ds_root) == (
+        viewer_root / "distribution" / f"Xense__my_dataset@{sha}.json"
+    )
+    assert default_suggestions_path(ds_root) == (
+        viewer_root / "suggestions" / f"Xense__my_dataset@{sha}.json"
+    )
+    assert default_targets_path(ds_root) == viewer_root / "targets" / "Xense__my_dataset.json"
+    assert default_calib_intrinsics_path(ds_root) == (
+        viewer_root / "calib" / "Xense__my_dataset.intrinsics.json"
+    )
+    assert default_calib_frames_path(ds_root) == (
+        viewer_root / "calib" / "Xense__my_dataset.frames.json"
+    )
+    assert default_calib_points_path(ds_root) == (
+        viewer_root / "calib" / "Xense__my_dataset.points.json"
+    )
+    assert default_calib_head_path(ds_root) == (
+        viewer_root / "calib" / "Xense__my_dataset.head.json"
+    )
+
+    fake_dataset = SimpleNamespace(
+        root=ds_root.resolve(),
+        repo_id="Xense/my_dataset",
+        revision=sha,
+        fps=30.0,
+        total_episodes=2,
+        camera_keys=("observation.images.head", "observation.images.right_wrist"),
+        episode_lengths={0: 300, 1: 450},
+    )
+    info_text = format_dataset_info(fake_dataset)  # type: ignore[arg-type]
+    assert "repo_id: Xense/my_dataset" in info_text
+    assert f".xense-viewer/distribution/Xense__my_dataset@{sha}.json" in info_text
+    assert f".xense-viewer/suggestions/Xense__my_dataset@{sha}.json" in info_text
+    assert ".xense-viewer/calib/Xense__my_dataset.head.json" in info_text
+    assert "default_report_dir" not in info_text
