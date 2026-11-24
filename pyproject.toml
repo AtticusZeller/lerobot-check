@@ -1,0 +1,45 @@
+[project]
+name = "lerobot-check"
+version = "0.1.0"
+description = "Subtask annotation, validation, and analysis CLI for LeRobot v3.0 datasets."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "av>=15.1.0",
+    "lerobot==0.5.1",
+    "numpy>=2.2.6",
+    "pillow>=13.0.0",
+    "pyarrow>=26.0.1",
+    "pyyaml>=6.0.4",
+]
+
+[project.scripts]
+lerobot-check = "lerobot_check.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.8.0,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.2.0",
+    "ruff>=0.17.6",
+    "ty>=0.0.109",
+    "types-pyyaml>=6.0.12.20261122",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "W", "RUF"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ty.environment]
+python-version = "3.12"
+
+[tool.ty.terminal]
+error-on-warning = true

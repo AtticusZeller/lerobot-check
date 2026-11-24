@@ -1,0 +1,20 @@
+# Python & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+*.egg-info/
+
+# Default data, annotation, render, and report output directories
+# Datasets, annotations, and generated reports must never enter this public repo.
+outputs/
+annotations/
+reports/
+renders/
+datasets/
