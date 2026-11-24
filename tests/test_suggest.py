@@ -84,7 +84,11 @@ def _make_plausible_calibration(
     )
 
 
-def _make_distribution_with_tiers() -> dict:
+def _make_distribution_with_tiers(
+    *,
+    position_point: str = "tool_point",
+    calibrated_arms: list[str] | None = None,
+) -> dict:
     """Create a distribution with a 3x3 occupied block (dense center, edge ring, empty out)."""
     xy_bin = 0.05
     z_val = -0.35
@@ -107,6 +111,7 @@ def _make_distribution_with_tiers() -> dict:
                         "z_m": z_val,
                         "raw_yaw_deg": float((r * 30) % 180),
                         "folded_yaw_deg": float((r * 30) % 180),
+                        "rot6d": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
                     }
                 )
                 ep += 1
@@ -119,6 +124,14 @@ def _make_distribution_with_tiers() -> dict:
             "task_name": "demo",
             "annotations_path": None,
             "task_spec_path": None,
+            "position_point": position_point,
+            "calib_path": "/tmp/fake.head.json" if position_point == "tool_point" else None,
+            "calib_mtime": None,
+            "calibrated_arms": (
+                ["right"]
+                if calibrated_arms is None and position_point == "tool_point"
+                else (calibrated_arms or [])
+            ),
             "fps": 30.0,
             "annotator_counts": {"agent": 0, "human": ep, "converted": 0, "total": ep},
             "dataset_total_episodes": ep,
@@ -347,3 +360,113 @@ def test_suggest_cli_errors_on_targets_without_calib(tmp_path: Path) -> None:
     )
     assert rc == 1
     assert not out_path.exists()
+
+
+def test_suggest_refuses_tcp_distribution_with_calib_and_uses_tool_point_plane() -> None:
+    from lerobot_check.analysis import compute_distribution_from_states
+    from lerobot_check.dataset import ArmState
+    from lerobot_check.schema import (
+        AnnotationRow,
+        CoverageSpec,
+        ObjectSpec,
+        SubtaskSpec,
+        TaskSpec,
+    )
+
+    cal = _make_plausible_calibration()
+    # Replace arm calibration with a realistic 18 cm tool offset along TCP +z.
+    T = cal.arms["right"].T_cam_base
+    tool_offset = np.array([0.01, -0.02, 0.18], dtype=np.float64)
+    cal = HeadCalibration(
+        repo_id=cal.repo_id,
+        revision=cal.revision,
+        camera=cal.camera,
+        image_size=cal.image_size,
+        intrinsics=cal.intrinsics,
+        arms={
+            "right": ArmCalibration(
+                arm="right",
+                T_cam_base=T,
+                tool_offset=tool_offset,
+                n_points=15,
+                rms_px=0.5,
+                loo_rms_px=0.7,
+                residuals=(),
+            )
+        },
+    )
+
+    # Tilted gripper: 180 deg flip around X (pointing straight down) + 25 deg pitch ->
+    # tool point sits below TCP in z and shifted in x/y.
+    rx, ry = math.radians(180.0), math.radians(25.0)
+    Rx = np.array([[1, 0, 0], [0, math.cos(rx), -math.sin(rx)], [0, math.sin(rx), math.cos(rx)]])
+    Ry = np.array([[math.cos(ry), 0, math.sin(ry)], [0, 1, 0], [-math.sin(ry), 0, math.cos(ry)]])
+    R_grip = Ry @ Rx
+    rot6d = np.concatenate([R_grip[:, 0], R_grip[:, 1]])
+
+    raw_tcp = np.array([1.02, 0.08, -0.18], dtype=np.float64)
+    expected_tool = raw_tcp + R_grip @ tool_offset
+
+    spec = TaskSpec(
+        name="tool_plane_demo",
+        subtasks=(SubtaskSpec(name="pick", prompt="Pick."),),
+        objects=(ObjectSpec("box", "pick", "grasp", "right", 180.0),),
+        coverage=CoverageSpec(xy_bin_m=0.05, yaw_bin_deg=30.0, sparse_threshold=2),
+    )
+    rows = [AnnotationRow("org/demo", "rev1", 0, "pick", 0, 5, None, 2, True, "human")]
+    arm_states = {
+        0: {
+            "right": ArmState("right", np.tile(raw_tcp, (5, 1)), np.tile(rot6d, (5, 1)), np.ones(5))
+        }
+    }
+
+    # Distribution without calibration uses raw TCP -> suggest with calibration must refuse.
+    dist_tcp = compute_distribution_from_states(
+        repo_id="org/demo",
+        revision="rev1",
+        fps=30.0,
+        episode_lengths={0: 5},
+        arm_states_by_episode=arm_states,
+        rows=rows,
+        task_spec=spec,
+        trajectory_samples=4,
+    )
+    with pytest.raises(ValueError, match="raw 'tcp' positions"):
+        generate_suggestions(dist_tcp, count=4, test_per_tier=1, targets=None, calibration=cal)
+
+    # Distribution with calibration uses tool point -> suggest back-projects onto tool-point z.
+    dist_tool = compute_distribution_from_states(
+        repo_id="org/demo",
+        revision="rev1",
+        fps=30.0,
+        episode_lengths={0: 5},
+        arm_states_by_episode=arm_states,
+        rows=rows,
+        task_spec=spec,
+        trajectory_samples=4,
+        tool_offsets={"right": tool_offset},
+        calib_path="/tmp/fake.head.json",
+    )
+    z_tool = float(expected_tool[2])
+    assert abs(z_tool - float(raw_tcp[2])) > 0.10
+    base_corners = np.array(
+        [
+            [expected_tool[0] - 0.10, expected_tool[1] - 0.10, z_tool],
+            [expected_tool[0] + 0.10, expected_tool[1] - 0.10, z_tool],
+            [expected_tool[0] + 0.10, expected_tool[1] + 0.10, z_tool],
+            [expected_tool[0] - 0.10, expected_tool[1] + 0.10, z_tool],
+        ],
+        dtype=np.float64,
+    )
+    targets = {
+        "version": 1,
+        "camera": "observation.images.head",
+        "image_size": [640, 480],
+        "polygon": project_base_points(base_corners, T, cal.intrinsics).tolist(),
+    }
+    res = generate_suggestions(
+        dist_tool, count=5, test_per_tier=1, targets=targets, calibration=cal
+    )
+    assert res["provenance"]["position_point"] == "tool_point"
+    assert res["objects"][0]["z_plane_m"] == pytest.approx(z_tool)
+    assert all(p["z_m"] == pytest.approx(z_tool) for p in res["placements"])

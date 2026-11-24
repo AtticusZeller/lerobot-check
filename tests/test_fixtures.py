@@ -107,6 +107,7 @@ def build_synthetic_fixtures() -> tuple[dict[str, Any], dict[str, Any]]:
         },
     }
 
+    tool_offset_right = np.array([0.0, 0.0, -0.15], dtype=np.float64)
     distribution = compute_distribution_from_states(
         repo_id="Synthetic/demo",
         revision="synthetic0001",
@@ -118,6 +119,9 @@ def build_synthetic_fixtures() -> tuple[dict[str, Any], dict[str, Any]]:
         annotations_path="/path/to/.xense-viewer/subtasks/Synthetic__demo@synthetic0001.csv",
         task_spec_path="/path/to/.xense-viewer/subtasks/Synthetic__demo.task_spec.yaml",
         trajectory_samples=5,
+        tool_offsets={"right": tool_offset_right},
+        calib_path="/path/to/.xense-viewer/calib/Synthetic__demo.head.json",
+        calib_mtime="2026-01-01T00:00:00+00:00",
     )
 
     intr = CameraIntrinsics(
@@ -142,7 +146,7 @@ def build_synthetic_fixtures() -> tuple[dict[str, Any], dict[str, Any]]:
         },
     )
     cam_pos = np.array([0.35, 0.08, 0.45], dtype=np.float64)
-    look_at = np.array([1.05, 0.08, -0.35], dtype=np.float64)
+    look_at = np.array([1.05, 0.08, -0.50], dtype=np.float64)
     z_ax = look_at - cam_pos
     z_ax /= np.linalg.norm(z_ax)
     x_ax = np.cross(z_ax, np.array([0.0, 0.0, 1.0]))
@@ -163,7 +167,7 @@ def build_synthetic_fixtures() -> tuple[dict[str, Any], dict[str, Any]]:
             "right": ArmCalibration(
                 arm="right",
                 T_cam_base=T_cb,
-                tool_offset=np.zeros(3, dtype=np.float64),
+                tool_offset=tool_offset_right,
                 n_points=15,
                 rms_px=0.5,
                 loo_rms_px=0.7,
@@ -171,12 +175,13 @@ def build_synthetic_fixtures() -> tuple[dict[str, Any], dict[str, Any]]:
             )
         },
     )
+    z_tool = -0.35 + float(tool_offset_right[2])
     base_corners = np.array(
         [
-            [0.90, -0.02, -0.35],
-            [1.18, -0.02, -0.35],
-            [1.18, 0.24, -0.35],
-            [0.90, 0.24, -0.35],
+            [0.90, -0.02, z_tool],
+            [1.18, -0.02, z_tool],
+            [1.18, 0.24, z_tool],
+            [0.90, 0.24, z_tool],
         ],
         dtype=np.float64,
     )

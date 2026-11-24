@@ -316,3 +316,110 @@ def test_cli_subcommands_removed_and_present() -> None:
         "calibrate",
     ):
         assert expected in help_text
+
+
+def test_distribution_tool_point_with_tilted_gripper_and_rot6d() -> None:
+    spec = TaskSpec(
+        name="tilt_task",
+        subtasks=(SubtaskSpec(name="pick", prompt="Pick."),),
+        objects=(
+            ObjectSpec(
+                name="cube",
+                subtask="pick",
+                event="grasp",
+                arm="right",
+                yaw_symmetry_deg=180.0,
+            ),
+        ),
+        coverage=CoverageSpec(xy_bin_m=0.05, yaw_bin_deg=30.0, sparse_threshold=2),
+    )
+    rows = [_row(0, "pick", 0, 10, grasp=4, annotator="human")]
+    ep_lengths = {0: 10}
+
+    # Build a tilted gripper rotation (roll=30 deg, pitch=40 deg, yaw=25 deg) so a tool offset
+    # along the TCP frame shifts the tool point in all three axes (x, y, z) relative to TCP.
+    rx, ry, rz = map(math.radians, (30.0, 40.0, 25.0))
+    Rx = np.array([[1, 0, 0], [0, math.cos(rx), -math.sin(rx)], [0, math.sin(rx), math.cos(rx)]])
+    Ry = np.array([[math.cos(ry), 0, math.sin(ry)], [0, 1, 0], [-math.sin(ry), 0, math.cos(ry)]])
+    Rz = np.array([[math.cos(rz), -math.sin(rz), 0], [math.sin(rz), math.cos(rz), 0], [0, 0, 1]])
+    R_tilt = Rz @ Ry @ Rx
+    rot6d_tilt = np.concatenate([R_tilt[:, 0], R_tilt[:, 1]])
+    tool_offset = np.array([0.02, -0.03, 0.18], dtype=np.float64)
+    delta_base = R_tilt @ tool_offset
+    # Ensure tilted offset genuinely shifts all three base coordinates.
+    assert np.all(np.abs(delta_base) > 0.02)
+
+    raw_xyz = np.column_stack(
+        [np.linspace(0.90, 1.00, 10), np.linspace(0.05, 0.15, 10), np.full(10, -0.20)]
+    )
+    rot6d_seq = np.tile(rot6d_tilt, (10, 1))
+    arm_states = {0: {"right": ArmState("right", raw_xyz, rot6d_seq, np.ones(10))}}
+
+    # Without calibration -> raw TCP positions.
+    dist_tcp = compute_distribution_from_states(
+        repo_id="org/tilt",
+        revision="rev1",
+        fps=30.0,
+        episode_lengths=ep_lengths,
+        arm_states_by_episode=arm_states,
+        rows=rows,
+        task_spec=spec,
+        trajectory_samples=5,
+    )
+    assert dist_tcp["provenance"]["position_point"] == "tcp"
+    assert dist_tcp["provenance"]["calib_path"] is None
+    assert dist_tcp["provenance"]["calibrated_arms"] == []
+    tcp_obj = dist_tcp["objects"][0]
+    tcp_pose = tcp_obj["poses"][0]
+    assert [tcp_pose["x_m"], tcp_pose["y_m"], tcp_pose["z_m"]] == pytest.approx(raw_xyz[4].tolist())
+    assert tcp_pose["rot6d"] == pytest.approx(rot6d_tilt.tolist())
+
+    tcp_ep = dist_tcp["subtasks"][0]["arms"]["right"]["episodes"][0]
+    assert tcp_ep["start_pose"]["rot6d"] == pytest.approx(rot6d_tilt.tolist())
+    assert tcp_ep["end_pose"]["rot6d"] == pytest.approx(rot6d_tilt.tolist())
+    assert all("rot6d" not in pt for pt in tcp_ep["trajectory"])
+
+    # With calibration tool_offset -> positions shift by R_tilt @ tool_offset; yaw/rot6d unchanged.
+    dist_tool = compute_distribution_from_states(
+        repo_id="org/tilt",
+        revision="rev1",
+        fps=30.0,
+        episode_lengths=ep_lengths,
+        arm_states_by_episode=arm_states,
+        rows=rows,
+        task_spec=spec,
+        trajectory_samples=5,
+        tool_offsets={"right": tool_offset},
+        calib_path="/tmp/fake.head.json",
+        calib_mtime="2026-11-24T00:00:00+00:00",
+    )
+    assert dist_tool["provenance"]["position_point"] == "tool_point"
+    assert dist_tool["provenance"]["calib_path"] == "/tmp/fake.head.json"
+    assert dist_tool["provenance"]["calib_mtime"] == "2026-11-24T00:00:00+00:00"
+    assert dist_tool["provenance"]["calibrated_arms"] == ["right"]
+
+    tool_obj = dist_tool["objects"][0]
+    tool_pose = tool_obj["poses"][0]
+    expected_obj_xyz = raw_xyz[4] + delta_base
+    assert [tool_pose["x_m"], tool_pose["y_m"], tool_pose["z_m"]] == pytest.approx(
+        expected_obj_xyz.tolist()
+    )
+    assert tool_obj["median_z_m"] == pytest.approx(float(expected_obj_xyz[2]))
+    assert tool_pose["raw_yaw_deg"] == pytest.approx(tcp_pose["raw_yaw_deg"])
+    assert tool_pose["folded_yaw_deg"] == pytest.approx(tcp_pose["folded_yaw_deg"])
+    assert tool_pose["rot6d"] == pytest.approx(rot6d_tilt.tolist())
+
+    tool_ep = dist_tool["subtasks"][0]["arms"]["right"]["episodes"][0]
+    assert [
+        tool_ep["start_pose"]["x_m"],
+        tool_ep["start_pose"]["y_m"],
+        tool_ep["start_pose"]["z_m"],
+    ] == pytest.approx((raw_xyz[0] + delta_base).tolist())
+    assert [
+        tool_ep["end_pose"]["x_m"],
+        tool_ep["end_pose"]["y_m"],
+        tool_ep["end_pose"]["z_m"],
+    ] == pytest.approx((raw_xyz[-1] + delta_base).tolist())
+    assert tool_ep["start_pose"]["yaw_deg"] == pytest.approx(tcp_ep["start_pose"]["yaw_deg"])
+    assert tool_ep["trajectory"][2]["z_m"] == pytest.approx(float(raw_xyz[0, 2] + delta_base[2]))
+    assert all("rot6d" not in pt for pt in tool_ep["trajectory"])

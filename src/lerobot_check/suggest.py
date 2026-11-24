@@ -395,6 +395,16 @@ def generate_suggestions(
             "or omit --targets to use the data bounding box fallback."
         )
 
+    prov = distribution["provenance"]
+    dist_position_point = str(prov.get("position_point", "tcp"))
+    dist_calibrated_arms = set(prov.get("calibrated_arms") or [])
+    if calibration is not None and dist_position_point != "tool_point":
+        raise ValueError(
+            "distribution.json was computed with raw 'tcp' positions, but head-camera "
+            "calibration is present. Re-run 'lerobot-check distribution' with calibration "
+            "so object poses and z-planes use the calibrated tool point before running 'suggest'."
+        )
+
     if targets is None:
         warnings.warn(
             "No target polygon provided; falling back to observed data bounding box + 5 cm.",
@@ -441,6 +451,12 @@ def generate_suggestions(
         z_plane_m = float(median_z_raw)
 
         arm_cal = calibration.arms.get(arm) if calibration is not None else None
+        if arm_cal is not None and dist_calibrated_arms and arm not in dist_calibrated_arms:
+            raise ValueError(
+                f"Object {obj_name!r} uses arm {arm!r}, which is calibrated in head.json "
+                "but was not calibrated when distribution.json was computed. "
+                "Re-run 'lerobot-check distribution' with the updated calibration."
+            )
         T_cam_base = arm_cal.T_cam_base if arm_cal is not None else None
         intrinsics = calibration.intrinsics if calibration is not None else None
 
@@ -626,13 +642,13 @@ def generate_suggestions(
                         )
                     )
 
-    prov = distribution["provenance"]
     return {
         "version": SUGGESTIONS_SCHEMA_VERSION,
         "provenance": {
             "repo_id": prov["repo_id"],
             "revision": prov["revision"],
             "task_name": prov["task_name"],
+            "position_point": dist_position_point,
             "distribution_path": str(distribution_path) if distribution_path is not None else None,
             "targets_path": str(targets_path) if targets_path is not None else None,
             "calib_path": str(calib_path) if calib_path is not None else None,

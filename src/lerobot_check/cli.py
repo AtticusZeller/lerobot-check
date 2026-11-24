@@ -6,6 +6,7 @@ import argparse
 import json
 import sys
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 
 from lerobot_check.analysis import (
@@ -509,6 +510,27 @@ def _cmd_distribution(args: argparse.Namespace) -> int:
             print(f"[episodes] {exc}", file=sys.stderr)
             return 1
 
+    calib_path: Path | None = None
+    if args.calib is not None:
+        calib_path = args.calib
+        if not calib_path.is_file():
+            print(f"[calib] Head calibration file does not exist: {calib_path}", file=sys.stderr)
+            return 1
+    else:
+        candidate_calib = default_calib_head_path(root, repo_id=dataset.repo_id)
+        if candidate_calib.is_file():
+            calib_path = candidate_calib
+
+    calibration: HeadCalibration | None = None
+    calib_mtime: str | None = None
+    if calib_path is not None:
+        try:
+            calibration = load_head_calibration(calib_path)
+            calib_mtime = datetime.fromtimestamp(calib_path.stat().st_mtime, tz=UTC).isoformat()
+        except (OSError, ValueError) as exc:
+            print(f"[calib] {exc}", file=sys.stderr)
+            return 1
+
     try:
         payload = compute_distribution(
             dataset,
@@ -518,6 +540,9 @@ def _cmd_distribution(args: argparse.Namespace) -> int:
             task_spec_path=spec_path.resolve(),
             episode_filter=episode_filter,
             trajectory_samples=args.trajectory_samples,
+            calibration=calibration,
+            calib_path=calib_path.resolve() if calib_path is not None else None,
+            calib_mtime=calib_mtime,
         )
     except (OSError, ValueError) as exc:
         print(f"[distribution] {exc}", file=sys.stderr)
@@ -1193,6 +1218,16 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Number of progress-resampled points per trajectory from 0 to 1 "
             f"(default: {DEFAULT_TRAJECTORY_SAMPLES})."
+        ),
+    )
+    dist_parser.add_argument(
+        "--calib",
+        type=Path,
+        default=None,
+        help=(
+            "Optional head-camera calibration head.json used to compute calibrated "
+            "tool-point positions p_tcp + R_tcp @ tool_offset "
+            "(default: <lerobot_root>/.xense-viewer/calib/<org>__<name>.head.json if present)."
         ),
     )
     dist_parser.add_argument(

@@ -12,6 +12,7 @@ from typing import Any
 
 import numpy as np
 
+from lerobot_check.calib import HeadCalibration
 from lerobot_check.dataset import ArmState, DatasetView, rotation_6d_to_matrix
 from lerobot_check.schema import AnnotationRow, CoverageSpec, ObjectSpec, TaskSpec
 
@@ -82,7 +83,7 @@ class FrameShareSummary:
 
 @dataclass(frozen=True)
 class ObjectPoseSample:
-    """Extracted event-frame TCP pose for one object in one episode.
+    """Extracted event-frame pose for one object in one episode.
 
     Attributes:
         episode_index: Zero-based episode index.
@@ -91,11 +92,12 @@ class ObjectPoseSample:
         event: Event type (``"grasp"`` or ``"release"``).
         arm: Robot arm whose base frame the pose is expressed in.
         frame: Frame index used for sampling.
-        x_m: TCP x position in meters (arm base frame).
-        y_m: TCP y position in meters (arm base frame).
-        z_m: TCP z position in meters (arm base frame).
+        x_m: Position X in meters (calibrated tool point when available, else TCP).
+        y_m: Position Y in meters (calibrated tool point when available, else TCP).
+        z_m: Position Z in meters (calibrated tool point when available, else TCP).
         raw_yaw_deg: Raw TCP yaw angle in ``(-180, 180]`` degrees.
         folded_yaw_deg: Symmetry-folded yaw angle in ``[0, yaw_symmetry_deg)`` degrees.
+        rot6d: 6D TCP orientation ``(r1, r2, r3, r4, r5, r6)`` at the event frame.
     """
 
     episode_index: int
@@ -109,6 +111,7 @@ class ObjectPoseSample:
     z_m: float
     raw_yaw_deg: float
     folded_yaw_deg: float
+    rot6d: tuple[float, float, float, float, float, float] = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0)
 
 
 @dataclass(frozen=True)
@@ -589,12 +592,36 @@ def resample_segment_pose(
     return points
 
 
+def apply_tool_offset(
+    tcp_xyz: np.ndarray,
+    tcp_rot6d: np.ndarray,
+    tool_offset: np.ndarray,
+) -> np.ndarray:
+    """Transform TCP positions to the calibrated tool point ``p_tcp + R_tcp @ tool_offset``.
+
+    Args:
+        tcp_xyz: Float64 array of shape ``(N, 3)`` or ``(3,)`` in base frame (meters).
+        tcp_rot6d: Float64 array of shape ``(N, 6)`` or ``(6,)`` storing 6D rotation.
+        tool_offset: Float64 3-vector ``(ox, oy, oz)`` in the TCP frame (meters).
+
+    Returns:
+        Tool-point positions in base frame with the same shape as ``tcp_xyz``.
+    """
+    xyz = np.asarray(tcp_xyz, dtype=np.float64)
+    offset = np.asarray(tool_offset, dtype=np.float64).reshape(3)
+    rot = rotation_6d_to_matrix(tcp_rot6d)
+    if xyz.ndim == 1:
+        return xyz + rot @ offset
+    return xyz + np.einsum("nij,j->ni", rot, offset)
+
+
 def extract_episode_object_poses(
     *,
     episode_index: int,
     ep_rows: Sequence[AnnotationRow],
     arms_by_name: Mapping[str, ArmState],
     objects: Sequence[ObjectSpec],
+    tool_offsets: Mapping[str, np.ndarray] | None = None,
 ) -> tuple[list[ObjectPoseSample], list[SkippedObjectEvent]]:
     """Extract object initial poses at event frames for one episode.
 
@@ -606,6 +633,9 @@ def extract_episode_object_poses(
         ep_rows: Annotation rows for this episode.
         arms_by_name: Mapping from arm name to ``ArmState`` for this episode.
         objects: Object specifications from ``task_spec.objects``.
+        tool_offsets: Optional mapping ``arm -> tool_offset (3,)`` from head-camera
+            calibration; when present for ``obj.arm``, positions are shifted to
+            ``p_tcp + R_tcp @ tool_offset``.
 
     Returns:
         Tuple ``(samples, skipped_events)``.
@@ -657,10 +687,21 @@ def extract_episode_object_poses(
             continue
 
         arm_state = arms_by_name[obj.arm]
+        rot6d_arr = arm_state.tcp_rot6d[frame]
+        rot = rotation_6d_to_matrix(rot6d_arr)
         xyz = arm_state.tcp_xyz[frame]
-        rot = rotation_6d_to_matrix(arm_state.tcp_rot6d[frame])
+        if tool_offsets is not None and obj.arm in tool_offsets:
+            xyz = xyz + rot @ np.asarray(tool_offsets[obj.arm], dtype=np.float64).reshape(3)
         raw_yaw = rotation_matrix_to_yaw_deg(rot)
         folded_yaw = fold_yaw_deg(raw_yaw, obj.yaw_symmetry_deg)
+        rot6d = (
+            float(rot6d_arr[0]),
+            float(rot6d_arr[1]),
+            float(rot6d_arr[2]),
+            float(rot6d_arr[3]),
+            float(rot6d_arr[4]),
+            float(rot6d_arr[5]),
+        )
 
         samples.append(
             ObjectPoseSample(
@@ -675,6 +716,7 @@ def extract_episode_object_poses(
                 z_m=float(xyz[2]),
                 raw_yaw_deg=raw_yaw,
                 folded_yaw_deg=folded_yaw,
+                rot6d=rot6d,
             )
         )
 
@@ -782,8 +824,15 @@ def compute_distribution_from_states(
     task_spec_path: Path | str | None = None,
     episode_filter: Collection[int] | None = None,
     trajectory_samples: int = DEFAULT_TRAJECTORY_SAMPLES,
+    tool_offsets: Mapping[str, np.ndarray] | None = None,
+    calib_path: Path | str | None = None,
+    calib_mtime: str | None = None,
 ) -> dict[str, Any]:
     """Compute the complete ``distribution.json`` payload from in-memory arm states.
+
+    When ``tool_offsets`` is provided, every position for calibrated arms is computed
+    at the calibrated tool point ``p_tcp + R_tcp @ tool_offset`` rather than the raw
+    TCP; yaw angles and ``rot6d`` orientations are unchanged.
 
     Args:
         repo_id: Dataset repository ID.
@@ -798,12 +847,25 @@ def compute_distribution_from_states(
         task_spec_path: Path to the source task spec YAML recorded in provenance.
         episode_filter: Optional subset of episode indices to restrict all metrics to.
         trajectory_samples: Number of evenly spaced progress points per trajectory (default 50).
+        tool_offsets: Optional mapping ``arm -> tool_offset (3,)`` from head calibration.
+        calib_path: Optional path to ``head.json`` recorded in provenance.
+        calib_mtime: Optional UTC ISO-8601 modification timestamp of ``head.json``.
 
     Returns:
         JSON-serializable dictionary matching the ``distribution.json`` v1 schema.
     """
     if trajectory_samples < 2:
         raise ValueError(f"trajectory_samples must be >= 2, got {trajectory_samples}")
+
+    normalized_offsets: dict[str, np.ndarray] = (
+        {
+            str(arm): np.asarray(vec, dtype=np.float64).reshape(3)
+            for arm, vec in tool_offsets.items()
+        }
+        if tool_offsets
+        else {}
+    )
+    position_point = "tool_point" if normalized_offsets else "tcp"
 
     dataset_total_episodes = len(episode_lengths)
     if episode_filter is not None:
@@ -870,6 +932,7 @@ def compute_distribution_from_states(
             ep_rows=ep_rows,
             arms_by_name=arms_by_name,
             objects=task_spec.objects,
+            tool_offsets=normalized_offsets or None,
         )
         all_object_poses.extend(ep_poses)
         all_skipped_objects.extend(ep_skipped)
@@ -881,6 +944,8 @@ def compute_distribution_from_states(
                 arm_state = arms_by_name[arm_name]
                 seg_xyz = arm_state.tcp_xyz[row.start : row.end]
                 seg_rot6d = arm_state.tcp_rot6d[row.start : row.end]
+                if arm_name in normalized_offsets:
+                    seg_xyz = apply_tool_offset(seg_xyz, seg_rot6d, normalized_offsets[arm_name])
                 resampled = resample_segment_pose(
                     seg_xyz, seg_rot6d, num_samples=trajectory_samples
                 )
@@ -915,12 +980,14 @@ def compute_distribution_from_states(
                             "y_m": start_pose.y_m,
                             "z_m": start_pose.z_m,
                             "yaw_deg": start_pose.yaw_deg,
+                            "rot6d": [float(v) for v in seg_rot6d[0]],
                         },
                         "end_pose": {
                             "x_m": end_pose.x_m,
                             "y_m": end_pose.y_m,
                             "z_m": end_pose.z_m,
                             "yaw_deg": end_pose.yaw_deg,
+                            "rot6d": [float(v) for v in seg_rot6d[-1]],
                         },
                         "trajectory": [
                             {
@@ -959,6 +1026,7 @@ def compute_distribution_from_states(
                         "z_m": p.z_m,
                         "raw_yaw_deg": p.raw_yaw_deg,
                         "folded_yaw_deg": p.folded_yaw_deg,
+                        "rot6d": list(p.rot6d),
                     }
                     for p in obj_poses
                 ],
@@ -1036,6 +1104,10 @@ def compute_distribution_from_states(
             "task_name": task_spec.name,
             "annotations_path": str(annotations_path) if annotations_path is not None else None,
             "task_spec_path": str(task_spec_path) if task_spec_path is not None else None,
+            "position_point": position_point,
+            "calib_path": str(calib_path) if calib_path is not None else None,
+            "calib_mtime": calib_mtime,
+            "calibrated_arms": sorted(normalized_offsets.keys()),
             "fps": fps,
             "annotator_counts": {
                 "agent": provenance.agent,
@@ -1081,6 +1153,9 @@ def compute_distribution(
     task_spec_path: Path | str | None = None,
     episode_filter: Collection[int] | None = None,
     trajectory_samples: int = DEFAULT_TRAJECTORY_SAMPLES,
+    calibration: HeadCalibration | None = None,
+    calib_path: Path | str | None = None,
+    calib_mtime: str | None = None,
 ) -> dict[str, Any]:
     """Compute the ``distribution.json`` payload directly from a ``DatasetView``.
 
@@ -1094,6 +1169,10 @@ def compute_distribution(
         task_spec_path: Source task spec YAML path for provenance.
         episode_filter: Optional collection of episode indices to restrict to.
         trajectory_samples: Number of evenly spaced progress points per trajectory.
+        calibration: Optional ``HeadCalibration`` providing per-arm ``tool_offset``
+            vectors so positions use ``p_tcp + R_tcp @ tool_offset``.
+        calib_path: Source ``head.json`` path recorded in provenance.
+        calib_mtime: UTC ISO-8601 modification timestamp of ``head.json``.
 
     Returns:
         JSON-serializable ``distribution.json`` v1 dictionary.
@@ -1108,6 +1187,12 @@ def compute_distribution(
             arm.arm: arm for arm in dataset.load_episode_arm_states(ep_idx)
         }
 
+    tool_offsets = (
+        {arm: cal.tool_offset for arm, cal in calibration.arms.items()}
+        if calibration is not None
+        else None
+    )
+
     return compute_distribution_from_states(
         repo_id=dataset.repo_id,
         revision=dataset.revision,
@@ -1120,6 +1205,9 @@ def compute_distribution(
         task_spec_path=task_spec_path,
         episode_filter=episode_filter,
         trajectory_samples=trajectory_samples,
+        tool_offsets=tool_offsets,
+        calib_path=calib_path,
+        calib_mtime=calib_mtime,
     )
 
 
@@ -1149,6 +1237,7 @@ def format_distribution_summary(payload: Mapping[str, Any]) -> str:
     skipped = prov["skipped_episodes"]
     lines = [
         f"Dataset: {prov['repo_id']} @ {prov['revision']} (fps={prov['fps']:g})",
+        f"Position point: {prov.get('position_point', 'tcp')}",
         (
             f"Episodes: {len(annotated)} annotated, {len(skipped)} skipped "
             f"(dataset total: {prov['dataset_total_episodes']})"
