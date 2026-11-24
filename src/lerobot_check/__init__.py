@@ -1,5 +1,12 @@
 """Analysis and annotation tools for LeRobot v3.0 datasets."""
 
+from lerobot_check.relabel import (
+    RelabelResult,
+    RelabelValidationError,
+    VerifyResult,
+    relabel_dataset,
+    verify_relabel,
+)
 from lerobot_check.schema import (
     ANNOTATION_COLUMNS,
     AnnotationRow,
@@ -19,14 +26,19 @@ __all__ = [
     "AnnotationRow",
     "CoverageSpec",
     "ObjectSpec",
+    "RelabelResult",
+    "RelabelValidationError",
     "SubtaskSpec",
     "TaskSpec",
     "ValidationViolation",
+    "VerifyResult",
     "load_annotations",
     "load_task_spec",
+    "relabel_dataset",
     "save_annotations",
     "save_task_spec",
     "validate_annotations",
+    "verify_relabel",
 ]
 
 __version__ = "0.1.0"

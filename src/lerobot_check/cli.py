@@ -1,4 +1,4 @@
-"""Command-line interface for ``lerobot-check`` (propose, render, validate)."""
+"""Command-line interface for ``lerobot-check`` (propose, render, validate, relabel)."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
-from lerobot_check.dataset import DatasetView, resolve_dataset_root
+from lerobot_check.dataset import DatasetView, detect_dataset_revision, resolve_dataset_root
 from lerobot_check.propose import (
     DEFAULT_RENDER_EVENT_TYPES,
     ProposeConfig,
@@ -16,6 +16,7 @@ from lerobot_check.propose import (
     propose_episode,
     write_proposals_csv,
 )
+from lerobot_check.relabel import RelabelValidationError, relabel_dataset, verify_relabel
 from lerobot_check.render import (
     DEFAULT_CAMERAS,
     parse_frame_spec,
@@ -233,6 +234,115 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _resolve_expected_revision(src_root: Path, explicit_revision: str | None) -> str | None:
+    if explicit_revision is not None:
+        return explicit_revision
+    detected = detect_dataset_revision(src_root)
+    if detected == "local":
+        print(
+            "Warning: dataset revision could not be detected ('local'); "
+            "annotation revision was not verified.",
+            file=sys.stderr,
+        )
+        return None
+    return detected
+
+
+def _cmd_relabel(args: argparse.Namespace) -> int:
+    try:
+        task_spec = load_task_spec(args.task_spec)
+    except (OSError, ValueError) as exc:
+        print(f"[task-spec] {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        rows = load_annotations(args.annotations)
+    except (OSError, ValueError) as exc:
+        print(f"[annotations] {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        src_root = resolve_dataset_root(args.src, args.repo_id)
+    except (OSError, ValueError) as exc:
+        print(f"[src] {exc}", file=sys.stderr)
+        return 1
+
+    expected_revision = _resolve_expected_revision(src_root, args.revision)
+
+    try:
+        result = relabel_dataset(
+            src_root,
+            args.dst,
+            rows,
+            task_spec,
+            expected_repo_id=args.repo_id,
+            expected_revision=expected_revision,
+        )
+    except RelabelValidationError as exc:
+        for violation in exc.violations:
+            print(violation, file=sys.stderr)
+        print(
+            f"Relabel aborted with {len(exc.violations)} violation(s); nothing written.",
+            file=sys.stderr,
+        )
+        return 1
+    except (FileExistsError, FileNotFoundError, OSError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"Wrote {result.dst}: {result.total_episodes} episodes, {result.total_frames} frames, "
+        f"{len(result.tasks)} tasks, task_index counts {list(result.task_counts)}"
+    )
+    return 0
+
+
+def _cmd_verify_relabel(args: argparse.Namespace) -> int:
+    try:
+        task_spec = load_task_spec(args.task_spec)
+    except (OSError, ValueError) as exc:
+        print(f"[task-spec] {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        rows = load_annotations(args.annotations)
+    except (OSError, ValueError) as exc:
+        print(f"[annotations] {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        src_root = resolve_dataset_root(args.src, args.repo_id)
+    except (OSError, ValueError) as exc:
+        print(f"[src] {exc}", file=sys.stderr)
+        return 1
+
+    expected_revision = _resolve_expected_revision(src_root, args.revision)
+
+    try:
+        result = verify_relabel(
+            src_root,
+            args.dst,
+            rows,
+            task_spec,
+            expected_repo_id=args.repo_id,
+            expected_revision=expected_revision,
+        )
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        print(f"ERROR {exc}", file=sys.stderr)
+        return 1
+
+    print(f"output: {result.total_frames} frames, task_index counts {list(result.task_counts)}")
+    if result.stats_mean or result.stats_count:
+        print(
+            f"stats.json task_index mean={result.stats_mean} count={result.stats_count} "
+            f"(data mean={result.data_mean:.6f})"
+        )
+    for err in result.errors:
+        print(f"ERROR {err}")
+    print("OK" if result.ok else f"{len(result.errors)} error(s)")
+    return 0 if result.ok else 1
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level argument parser for ``lerobot-check``."""
     parser = argparse.ArgumentParser(
@@ -439,6 +549,100 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the YAML task spec file.",
     )
     validate_parser.set_defaults(func=_cmd_validate)
+
+    relabel_parser = subparsers.add_parser(
+        "relabel",
+        help="Write a relabeled LeRobot v3.0 dataset with per-frame subtask task_index.",
+    )
+    relabel_parser.add_argument(
+        "--src",
+        "--dataset-root",
+        dest="src",
+        type=Path,
+        default=None,
+        help="Source LeRobot v3.0 dataset root.",
+    )
+    relabel_parser.add_argument(
+        "--repo-id",
+        type=str,
+        default=None,
+        help=(
+            "Dataset repo ID (resolves local cache path if --src is omitted and enforces "
+            "annotation repo_id)."
+        ),
+    )
+    relabel_parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        help="Expected dataset revision (overrides auto-detected local cache revision).",
+    )
+    relabel_parser.add_argument(
+        "--dst",
+        type=Path,
+        required=True,
+        help="Destination dataset root; must not exist.",
+    )
+    relabel_parser.add_argument(
+        "--annotations",
+        type=Path,
+        required=True,
+        help="Path to the annotation CSV file.",
+    )
+    relabel_parser.add_argument(
+        "--task-spec",
+        type=Path,
+        required=True,
+        help="Path to the YAML task spec file.",
+    )
+    relabel_parser.set_defaults(func=_cmd_relabel)
+
+    verify_parser = subparsers.add_parser(
+        "verify-relabel",
+        help="Verify that a relabeled dataset changed only task bookkeeping matching annotations.",
+    )
+    verify_parser.add_argument(
+        "--src",
+        "--dataset-root",
+        dest="src",
+        type=Path,
+        default=None,
+        help="Source LeRobot v3.0 dataset root before relabeling.",
+    )
+    verify_parser.add_argument(
+        "--repo-id",
+        type=str,
+        default=None,
+        help=(
+            "Dataset repo ID (resolves local cache path if --src is omitted and enforces "
+            "annotation repo_id)."
+        ),
+    )
+    verify_parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        help="Expected dataset revision (overrides auto-detected local cache revision).",
+    )
+    verify_parser.add_argument(
+        "--dst",
+        type=Path,
+        required=True,
+        help="Relabeled LeRobot v3.0 dataset root to verify.",
+    )
+    verify_parser.add_argument(
+        "--annotations",
+        type=Path,
+        required=True,
+        help="Path to the annotation CSV file.",
+    )
+    verify_parser.add_argument(
+        "--task-spec",
+        type=Path,
+        required=True,
+        help="Path to the YAML task spec file.",
+    )
+    verify_parser.set_defaults(func=_cmd_verify_relabel)
 
     return parser
 
