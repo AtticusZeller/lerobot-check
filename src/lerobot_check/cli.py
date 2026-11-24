@@ -154,7 +154,20 @@ def _cmd_render(args: argparse.Namespace) -> int:
             stride=args.stride,
         )
 
-    cameras = tuple(args.cameras) if args.cameras else DEFAULT_CAMERAS
+    if args.cameras:
+        cameras = tuple(args.cameras)
+    elif args.columns is not None:
+        cameras = (DEFAULT_CAMERAS[0],)
+    else:
+        cameras = DEFAULT_CAMERAS
+
+    if args.max_frames_per_image is not None:
+        max_frames_per_image = args.max_frames_per_image
+    elif args.columns is not None:
+        max_frames_per_image = args.columns * 8
+    else:
+        max_frames_per_image = 12
+
     written = render_episode_sheets(
         dataset,
         args.episode,
@@ -163,8 +176,9 @@ def _cmd_render(args: argparse.Namespace) -> int:
         cameras=cameras,
         tile_width=args.tile_width,
         tile_height=args.tile_height,
-        max_frames_per_image=args.max_frames_per_image,
+        max_frames_per_image=max_frames_per_image,
         highlight_frames=highlight_frames,
+        columns=args.columns,
     )
     for path in written:
         print(f"Wrote {path} ({len(frame_indices)} total frames across {len(written)} sheet(s))")
@@ -357,7 +371,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--cameras",
         nargs="+",
         default=None,
-        help="Camera feature keys to tile (default: head, left_wrist, right_wrist).",
+        help=(
+            "Camera keys or short names (default: head, left_wrist, right_wrist; "
+            "or head alone when --columns is set)."
+        ),
+    )
+    render_parser.add_argument(
+        "--columns",
+        type=int,
+        default=None,
+        help=(
+            "Single-camera grid layout column count for coarse scans "
+            "(default: multi-camera strip with 1 frame per row)."
+        ),
     )
     render_parser.add_argument(
         "--tile-width",
@@ -374,8 +400,11 @@ def build_parser() -> argparse.ArgumentParser:
     render_parser.add_argument(
         "--max-frames-per-image",
         type=int,
-        default=12,
-        help="Maximum frames stacked per PNG before splitting pages (default: 12).",
+        default=None,
+        help=(
+            "Maximum frames per PNG before splitting pages "
+            "(default: 12 for strip layout, columns*8 for grid layout)."
+        ),
     )
     render_parser.add_argument(
         "-o",

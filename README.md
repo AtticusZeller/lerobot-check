@@ -7,7 +7,7 @@
 当前提供以下 CLI 子命令（入口 `lerobot-check`）：
 
 - `propose`：基于相对幅度迟滞检测各臂夹爪的闭合 / 张开运动，结合 `action` 与 `observation.state` 夹爪差值检测夹紧区间（`squeeze`），并基于 TCP xyz 差分计算线速度与低速段，输出候选事件 CSV。
-- `render`：按指定帧号列表或候选事件 ± 窗口与步长，低内存解码并拼接 `head`、`left_wrist`、`right_wrist` 三路相机图像，绘制帧号与时间戳后输出 PNG。
+- `render`：低内存解码并输出带帧号与时间戳的 PNG 拼图，支持单相机网格粗扫（`--columns N`，如全 episode 按 1 s 步长）以及默认三路相机（`head`、`left_wrist`、`right_wrist`）精细逐帧查看。
 - `validate`：对照数据集元数据中的 episode 长度、数据集 revision 与 task spec 校验标注表，逐条输出违规并以非零状态码退出。
 
 面向标注 agent 的操作规范见 [docs/annotate.md](docs/annotate.md)。

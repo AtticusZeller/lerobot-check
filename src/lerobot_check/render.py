@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 
@@ -30,10 +31,13 @@ def parse_frame_spec(spec: str, episode_length: int) -> list[int]:
     """Parse a comma-separated frame specification into sorted unique frame indices.
 
     Supports single frames (``"120"``) and inclusive-end slices
-    (``"start:end"`` or ``"start:end:step"``).
+    (``"start:end"``, ``"start:end:step"``, or open-ended slices such as
+    ``"::30"`` / ``"0::30"`` where empty start defaults to ``0`` and empty end
+    defaults to ``episode_length - 1``).
 
     Args:
-        spec: Comma-separated frame numbers or slices, e.g. ``"100,200,300:360:15"``.
+        spec: Comma-separated frame numbers or slices, e.g. ``"100,200,300:360:15"``
+            or ``"::30"``.
         episode_length: Total frame count of the episode.
 
     Returns:
@@ -53,9 +57,9 @@ def parse_frame_spec(spec: str, episode_length: int) -> list[int]:
             parts = token.split(":")
             if len(parts) not in (2, 3):
                 raise ValueError(f"Invalid frame range token: {token!r}")
-            start = int(parts[0])
-            end = int(parts[1])
-            step = int(parts[2]) if len(parts) == 3 else 1
+            start = int(parts[0]) if parts[0] else 0
+            end = int(parts[1]) if parts[1] else episode_length - 1
+            step = int(parts[2]) if (len(parts) == 3 and parts[2]) else 1
             if step <= 0:
                 raise ValueError(f"Frame range step must be positive in {token!r}")
             if start < 0 or end >= episode_length or start > end:
@@ -161,6 +165,95 @@ def _resize_tile(
     return image.resize((tile_width, computed_h), Image.Resampling.BILINEAR)
 
 
+def _draw_frame_badge(
+    draw: ImageDraw.ImageDraw,
+    *,
+    x: int,
+    y: int,
+    frame_idx: int,
+    fps: float,
+    highlighted: bool,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+) -> None:
+    badge_text = f"f={frame_idx:05d} ({frame_idx / fps:.2f}s)"
+    if highlighted:
+        badge_text += " *"
+    text_bbox = draw.textbbox((0, 0), badge_text, font=font)
+    pad_x, pad_y = 6, 4
+    box_w = (text_bbox[2] - text_bbox[0]) + 2 * pad_x
+    box_h = (text_bbox[3] - text_bbox[1]) + 2 * pad_y
+    bg = _HIGHLIGHT_BG if highlighted else _BADGE_BG
+    draw.rectangle([(x + 4, y + 4), (x + 4 + box_w, y + 4 + box_h)], fill=bg)
+    draw.text(
+        (x + 4 + pad_x - text_bbox[0], y + 4 + pad_y - text_bbox[1]),
+        badge_text,
+        fill=_TEXT_COLOR,
+        font=font,
+    )
+
+
+def _render_single_camera_grid(
+    frames_by_index: Mapping[int, Mapping[str, Image.Image]],
+    *,
+    camera: str,
+    columns: int,
+    fps: float,
+    tile_width: int,
+    resolved_h: int,
+    highlight_set: set[int],
+) -> Image.Image:
+    sorted_indices = sorted(frames_by_index)
+    num_rows = math.ceil(len(sorted_indices) / columns)
+    sheet_w = columns * tile_width + (columns - 1) * _DIVIDER_PX
+    sheet_h = _HEADER_HEIGHT + num_rows * resolved_h + max(0, num_rows - 1) * _DIVIDER_PX
+
+    canvas = Image.new("RGB", (sheet_w, sheet_h), color=_BG_COLOR)
+    draw = ImageDraw.Draw(canvas)
+    header_font = _load_font(max(12, min(18, tile_width // 18)))
+    badge_font = _load_font(max(11, min(18, tile_width // 18)))
+
+    draw.rectangle([(0, 0), (sheet_w, _HEADER_HEIGHT)], fill=_HEADER_BG)
+    header_text = (
+        f"{_short_camera_name(camera)}  |  {len(sorted_indices)} frames "
+        f"(f={sorted_indices[0]}..{sorted_indices[-1]})"
+    )
+    draw.text((8, 6), header_text, fill=_TEXT_COLOR, font=header_font)
+
+    for col_idx in range(1, columns):
+        x0 = col_idx * (tile_width + _DIVIDER_PX)
+        draw.rectangle(
+            [(x0 - _DIVIDER_PX, _HEADER_HEIGHT), (x0 - 1, sheet_h)],
+            fill=_DIVIDER_COLOR,
+        )
+    for row_idx in range(1, num_rows):
+        y0 = _HEADER_HEIGHT + row_idx * (resolved_h + _DIVIDER_PX)
+        draw.rectangle(
+            [(0, y0 - _DIVIDER_PX), (sheet_w, y0 - 1)],
+            fill=_DIVIDER_COLOR,
+        )
+
+    for cell_idx, frame_idx in enumerate(sorted_indices):
+        cam_map = frames_by_index[frame_idx]
+        if camera not in cam_map:
+            raise ValueError(f"Missing image for frame {frame_idx}, camera {camera!r}")
+        row_idx, col_idx = divmod(cell_idx, columns)
+        x0 = col_idx * (tile_width + _DIVIDER_PX)
+        y0 = _HEADER_HEIGHT + row_idx * (resolved_h + _DIVIDER_PX)
+        tile = _resize_tile(cam_map[camera].convert("RGB"), tile_width, resolved_h)
+        canvas.paste(tile, (x0, y0))
+        _draw_frame_badge(
+            draw,
+            x=x0,
+            y=y0,
+            frame_idx=frame_idx,
+            fps=fps,
+            highlighted=frame_idx in highlight_set,
+            font=badge_font,
+        )
+
+    return canvas
+
+
 def render_contact_sheet(
     frames_by_index: Mapping[int, Mapping[str, Image.Image]],
     *,
@@ -169,29 +262,32 @@ def render_contact_sheet(
     tile_width: int = 320,
     tile_height: int | None = None,
     highlight_frames: Collection[int] = (),
+    columns: int | None = None,
 ) -> Image.Image:
-    """Tile multi-camera RGB frames into a single contact sheet with frame labels.
+    """Tile RGB frames into a single contact sheet with frame labels.
 
-    Each frame occupies one horizontal row containing the requested ``cameras``
-    side by side, with a high-contrast frame number and timestamp badge drawn on
-    the top-left of the row.
+    By default (``columns=None``), each frame occupies one horizontal row with
+    all ``cameras`` side by side. When ``columns`` is set (coarse grid mode),
+    ``cameras`` must contain exactly one camera and frames are placed in an
+    ``N``-column grid with frame number and timestamp drawn on every tile.
 
     Args:
         frames_by_index: Nested mapping ``frame_index -> camera_key -> PIL.Image``.
-        cameras: Ordered camera keys to display left-to-right.
+        cameras: Ordered camera keys to display.
         fps: Dataset frame rate in Hz used for timestamp labels.
         tile_width: Target width (pixels) of each individual camera tile.
         tile_height: Optional target height (pixels); preserves source aspect ratio
             when ``None``.
         highlight_frames: Optional set of frame indices (e.g. candidate events)
             whose frame label badge is highlighted.
+        columns: Optional grid column count for single-camera coarse contact sheets.
 
     Returns:
         Rendered RGB ``PIL.Image``.
 
     Raises:
-        ValueError: If ``frames_by_index`` or ``cameras`` is empty, or if a camera
-            image is missing for any requested frame.
+        ValueError: If arguments are empty/invalid, if ``columns`` is used with
+            multiple cameras, or if a camera image is missing for any frame.
     """
     if not frames_by_index:
         raise ValueError("frames_by_index must not be empty")
@@ -199,6 +295,14 @@ def render_contact_sheet(
         raise ValueError("cameras must not be empty")
     if tile_width <= 0 or (tile_height is not None and tile_height <= 0):
         raise ValueError("tile_width and tile_height must be positive")
+    if columns is not None:
+        if columns <= 0:
+            raise ValueError(f"columns must be positive, got {columns}")
+        if len(cameras) != 1:
+            raise ValueError(
+                f"Grid layout (--columns {columns}) requires a single camera, "
+                f"got {len(cameras)} cameras: {list(cameras)}"
+            )
 
     sorted_indices = sorted(frames_by_index)
     first_cam_img = frames_by_index[sorted_indices[0]][cameras[0]]
@@ -207,6 +311,18 @@ def render_contact_sheet(
         if tile_height is not None
         else max(1, round(first_cam_img.size[1] * tile_width / first_cam_img.size[0]))
     )
+    highlight_set = set(highlight_frames)
+
+    if columns is not None:
+        return _render_single_camera_grid(
+            frames_by_index,
+            camera=cameras[0],
+            columns=columns,
+            fps=fps,
+            tile_width=tile_width,
+            resolved_h=resolved_h,
+            highlight_set=highlight_set,
+        )
 
     num_cols = len(cameras)
     num_rows = len(sorted_indices)
@@ -229,7 +345,6 @@ def render_contact_sheet(
                 fill=_DIVIDER_COLOR,
             )
 
-    highlight_set = set(highlight_frames)
     for row_idx, frame_idx in enumerate(sorted_indices):
         y0 = _HEADER_HEIGHT + row_idx * (resolved_h + _DIVIDER_PX)
         if row_idx > 0:
@@ -246,19 +361,13 @@ def render_contact_sheet(
             tile = _resize_tile(cam_map[cam_key].convert("RGB"), tile_width, resolved_h)
             canvas.paste(tile, (x0, y0))
 
-        badge_text = f"f={frame_idx:05d} ({frame_idx / fps:.2f}s)"
-        if frame_idx in highlight_set:
-            badge_text += " *"
-        text_bbox = draw.textbbox((0, 0), badge_text, font=badge_font)
-        pad_x, pad_y = 6, 4
-        box_w = (text_bbox[2] - text_bbox[0]) + 2 * pad_x
-        box_h = (text_bbox[3] - text_bbox[1]) + 2 * pad_y
-        bg = _HIGHLIGHT_BG if frame_idx in highlight_set else _BADGE_BG
-        draw.rectangle([(4, y0 + 4), (4 + box_w, y0 + 4 + box_h)], fill=bg)
-        draw.text(
-            (4 + pad_x - text_bbox[0], y0 + 4 + pad_y - text_bbox[1]),
-            badge_text,
-            fill=_TEXT_COLOR,
+        _draw_frame_badge(
+            draw,
+            x=0,
+            y=y0,
+            frame_idx=frame_idx,
+            fps=fps,
+            highlighted=frame_idx in highlight_set,
             font=badge_font,
         )
 
@@ -378,6 +487,21 @@ def decode_video_frames_pyav(
     return decoded
 
 
+def _resolve_camera_keys(
+    cameras: Sequence[str],
+    available: Mapping[str, object],
+) -> tuple[str, ...]:
+    resolved: list[str] = []
+    for cam in cameras:
+        if cam in available:
+            resolved.append(cam)
+        elif f"observation.images.{cam}" in available:
+            resolved.append(f"observation.images.{cam}")
+        else:
+            resolved.append(cam)
+    return tuple(resolved)
+
+
 def render_episode_sheets(
     dataset: DatasetView,
     episode_index: int,
@@ -389,6 +513,7 @@ def render_episode_sheets(
     tile_height: int | None = None,
     max_frames_per_image: int | None = None,
     highlight_frames: Collection[int] = (),
+    columns: int | None = None,
 ) -> list[Path]:
     """Decode requested frames for an episode and write one or more tiled PNGs.
 
@@ -397,12 +522,13 @@ def render_episode_sheets(
         episode_index: Zero-based episode index.
         frame_indices: Sorted frame indices to render.
         output_path: Destination PNG path (or prefix when split across multiple sheets).
-        cameras: Camera keys to include per frame row.
+        cameras: Camera keys (or short names such as ``"head"``) to render.
         tile_width: Width of each camera tile in pixels.
         tile_height: Optional height of each camera tile in pixels.
         max_frames_per_image: Optional page size; when exceeded, writes numbered PNGs
             (``<stem>_001.png``, ``<stem>_002.png``, ...).
         highlight_frames: Optional event frames to visually highlight in badges.
+        columns: Optional grid column count for single-camera coarse scans.
 
     Returns:
         List of written PNG file paths.
@@ -418,14 +544,24 @@ def render_episode_sheets(
                 f"(length={record.length})"
             )
 
-    missing_cams = [cam for cam in cameras if cam not in record.videos]
+    resolved_cameras = _resolve_camera_keys(cameras, record.videos)
+    if columns is not None:
+        if columns <= 0:
+            raise ValueError(f"columns must be positive, got {columns}")
+        if len(resolved_cameras) != 1:
+            raise ValueError(
+                f"Grid layout (--columns {columns}) requires a single camera, "
+                f"got {len(resolved_cameras)} cameras: {list(resolved_cameras)}"
+            )
+
+    missing_cams = [cam for cam in resolved_cameras if cam not in record.videos]
     if missing_cams:
         raise ValueError(
             f"Episode {episode_index} does not contain requested cameras: {missing_cams}"
         )
 
     decoded_per_cam: dict[str, dict[int, Image.Image]] = {}
-    for cam in cameras:
+    for cam in resolved_cameras:
         span = record.videos[cam]
         targets = [(f, span.from_timestamp + f / dataset.fps) for f in unique_frames]
         decoded_per_cam[cam] = decode_video_frames_pyav(
@@ -437,7 +573,7 @@ def render_episode_sheets(
         )
 
     frames_by_index: dict[int, dict[str, Image.Image]] = {
-        f: {cam: decoded_per_cam[cam][f] for cam in cameras} for f in unique_frames
+        f: {cam: decoded_per_cam[cam][f] for cam in resolved_cameras} for f in unique_frames
     }
 
     if max_frames_per_image is not None and max_frames_per_image <= 0:
@@ -458,11 +594,12 @@ def render_episode_sheets(
         chunk_map = {f: frames_by_index[f] for f in chunk}
         sheet = render_contact_sheet(
             chunk_map,
-            cameras=cameras,
+            cameras=resolved_cameras,
             fps=dataset.fps,
             tile_width=tile_width,
             tile_height=tile_height,
             highlight_frames=highlight_frames,
+            columns=columns,
         )
         if len(chunks) == 1:
             dest = output_path
