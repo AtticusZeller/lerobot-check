@@ -1,4 +1,4 @@
-"""Command-line interface for ``lerobot-check`` (propose, render, validate)."""
+"""Command-line interface for ``lerobot-check``."""
 
 from __future__ import annotations
 
@@ -7,6 +7,16 @@ import sys
 from collections.abc import Sequence
 from pathlib import Path
 
+from lerobot_check.analysis import (
+    DEFAULT_MAX_TRAJ_POINTS,
+    DEFAULT_MIN_REST_SPEED_MPS,
+    DEFAULT_SPEED_RATIO_THRESHOLD,
+    MixEntry,
+    analyze_dataset,
+    compute_all_coverages,
+    compute_mix,
+    suggest_placements,
+)
 from lerobot_check.dataset import DatasetView, resolve_dataset_root
 from lerobot_check.propose import (
     DEFAULT_RENDER_EVENT_TYPES,
@@ -22,7 +32,14 @@ from lerobot_check.render import (
     render_episode_sheets,
     select_frames_around_events,
 )
-from lerobot_check.schema import load_annotations, load_task_spec
+from lerobot_check.report import (
+    format_frame_share_table,
+    format_mix_report,
+    format_suggestions_table,
+    write_html_report,
+    write_suggestions_csv,
+)
+from lerobot_check.schema import AnnotationRow, TaskSpec, load_annotations, load_task_spec
 from lerobot_check.validate import validate_annotations
 
 
@@ -233,6 +250,312 @@ def _cmd_validate(args: argparse.Namespace) -> int:
     return 0
 
 
+def _load_validated_inputs(
+    *,
+    dataset_roots: Sequence[Path] | None,
+    repo_ids: Sequence[str] | None,
+    annotation_paths: Sequence[Path],
+    labels: Sequence[str] | None,
+    task_spec: TaskSpec,
+) -> list[tuple[DatasetView, list[AnnotationRow], str]] | None:
+    """Resolve, open, and validate one or more ``(dataset, annotations)`` inputs."""
+    n = len(annotation_paths)
+    roots_list: list[Path | None]
+    repos_list: list[str | None]
+
+    if dataset_roots and repo_ids:
+        if len(dataset_roots) != n or len(repo_ids) != n:
+            print(
+                f"Expected equal counts for --dataset-root ({len(dataset_roots)}), "
+                f"--repo-id ({len(repo_ids)}), and --annotations ({n}).",
+                file=sys.stderr,
+            )
+            return None
+        roots_list = list(dataset_roots)
+        repos_list = list(repo_ids)
+    elif dataset_roots:
+        if len(dataset_roots) != n:
+            print(
+                f"Expected one --dataset-root per --annotations (got {len(dataset_roots)} vs {n}).",
+                file=sys.stderr,
+            )
+            return None
+        roots_list = list(dataset_roots)
+        repos_list = [None] * n
+    elif repo_ids:
+        if len(repo_ids) != n:
+            print(
+                f"Expected one --repo-id per --annotations (got {len(repo_ids)} vs {n}).",
+                file=sys.stderr,
+            )
+            return None
+        roots_list = [None] * n
+        repos_list = list(repo_ids)
+    else:
+        print(
+            "Provide at least one --dataset-root or --repo-id matching each --annotations.",
+            file=sys.stderr,
+        )
+        return None
+
+    if labels is not None and len(labels) != n:
+        print(
+            f"Expected one --label per --annotations (got {len(labels)} vs {n}).",
+            file=sys.stderr,
+        )
+        return None
+
+    raw_labels: list[str] = []
+    loaded: list[tuple[DatasetView, list[AnnotationRow]]] = []
+    for idx in range(n):
+        try:
+            rows = load_annotations(annotation_paths[idx])
+        except (OSError, ValueError) as exc:
+            print(f"[annotations #{idx + 1}] {exc}", file=sys.stderr)
+            return None
+
+        root = resolve_dataset_root(roots_list[idx], repos_list[idx])
+        dataset = DatasetView(root, repo_id=repos_list[idx])
+
+        expected_revision: str | None = None
+        if dataset.revision == "local":
+            print(
+                f"Warning: dataset #{idx + 1} ({dataset.repo_id}) revision could not be detected "
+                "('local'); annotation revision was not verified.",
+                file=sys.stderr,
+            )
+        else:
+            expected_revision = dataset.revision
+
+        violations = validate_annotations(
+            rows,
+            task_spec,
+            dataset.episode_lengths,
+            expected_repo_id=repos_list[idx],
+            expected_revision=expected_revision,
+        )
+        if violations:
+            for violation in violations:
+                print(violation, file=sys.stderr)
+            print(
+                f"Validation failed for {annotation_paths[idx]} with "
+                f"{len(violations)} violation(s).",
+                file=sys.stderr,
+            )
+            return None
+
+        loaded.append((dataset, rows))
+        raw_labels.append(labels[idx] if labels is not None else dataset.repo_id)
+
+    # Disambiguate duplicate default labels so legends and tables remain distinct.
+    label_counts: dict[str, int] = {}
+    for lbl in raw_labels:
+        label_counts[lbl] = label_counts.get(lbl, 0) + 1
+    seen: dict[str, int] = {}
+    result: list[tuple[DatasetView, list[AnnotationRow], str]] = []
+    for (dataset, rows), lbl in zip(loaded, raw_labels, strict=True):
+        if label_counts[lbl] > 1:
+            seen[lbl] = seen.get(lbl, 0) + 1
+            final_label = f"{lbl}#{seen[lbl]}"
+        else:
+            final_label = lbl
+        result.append((dataset, rows, final_label))
+    return result
+
+
+def _add_multi_dataset_args(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--task-spec",
+        type=Path,
+        required=True,
+        help="Path to the YAML task spec file.",
+    )
+    parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        action="append",
+        default=None,
+        help="Local LeRobot v3.0 dataset directory (repeat once per input dataset).",
+    )
+    parser.add_argument(
+        "--repo-id",
+        type=str,
+        action="append",
+        default=None,
+        help="Dataset repo ID (repeat once per input dataset when --dataset-root is omitted).",
+    )
+    parser.add_argument(
+        "--annotations",
+        type=Path,
+        action="append",
+        required=True,
+        help="Annotation CSV path paired with each --dataset-root / --repo-id.",
+    )
+    parser.add_argument(
+        "--label",
+        type=str,
+        action="append",
+        default=None,
+        help="Optional display label for each input dataset (repeat to match --annotations).",
+    )
+
+
+def _cmd_report(args: argparse.Namespace) -> int:
+    try:
+        task_spec = load_task_spec(args.task_spec)
+    except (OSError, ValueError) as exc:
+        print(f"[task-spec] {exc}", file=sys.stderr)
+        return 1
+
+    inputs = _load_validated_inputs(
+        dataset_roots=args.dataset_root,
+        repo_ids=args.repo_id,
+        annotation_paths=args.annotations,
+        labels=args.label,
+        task_spec=task_spec,
+    )
+    if inputs is None:
+        return 1
+
+    analyses = [
+        analyze_dataset(
+            dataset,
+            rows,
+            task_spec,
+            label=label,
+            speed_ratio_threshold=args.speed_ratio_threshold,
+            min_rest_speed_mps=args.min_rest_speed,
+            max_traj_points=args.max_traj_points,
+        )
+        for dataset, rows, label in inputs
+    ]
+
+    output_path = write_html_report(
+        analyses,
+        task_spec,
+        args.output,
+        speed_ratio_threshold=args.speed_ratio_threshold,
+        min_rest_speed_mps=args.min_rest_speed,
+        title=args.title,
+    )
+
+    for analysis in analyses:
+        print(format_frame_share_table(analysis.frame_shares))
+        flagged_eps = sorted({m.episode_index for m in analysis.speed_metrics if m.not_slowed_down})
+        flagged_arm_records = sum(1 for m in analysis.speed_metrics if m.not_slowed_down)
+        idle_arm_records = sum(1 for m in analysis.speed_metrics if m.idle)
+        print(
+            f"Speed check (ratio > {args.speed_ratio_threshold:.2f}): "
+            f"{len(flagged_eps)} episode(s) flagged as not slowed down "
+            f"({flagged_arm_records} arm-episode record(s); "
+            f"{idle_arm_records} idle arm-episode(s))."
+        )
+        if analysis.skipped_objects:
+            print(f"Skipped object events: {len(analysis.skipped_objects)} (listed in report).")
+        print()
+
+    print(f"Wrote offline HTML report: {output_path}")
+    return 0
+
+
+def _cmd_mix(args: argparse.Namespace) -> int:
+    try:
+        task_spec = load_task_spec(args.task_spec)
+    except (OSError, ValueError) as exc:
+        print(f"[task-spec] {exc}", file=sys.stderr)
+        return 1
+
+    inputs = _load_validated_inputs(
+        dataset_roots=args.dataset_root,
+        repo_ids=args.repo_id,
+        annotation_paths=args.annotations,
+        labels=args.label,
+        task_spec=task_spec,
+    )
+    if inputs is None:
+        return 1
+
+    n = len(inputs)
+    if args.repeat is None:
+        repeats = [1] * n
+    elif len(args.repeat) != n:
+        print(
+            f"Expected one --repeat per --annotations (got {len(args.repeat)} vs {n}).",
+            file=sys.stderr,
+        )
+        return 1
+    else:
+        repeats = list(args.repeat)
+
+    if any(r < 1 for r in repeats):
+        print(f"All --repeat values must be >= 1, got {repeats}.", file=sys.stderr)
+        return 1
+
+    entries = [
+        MixEntry(
+            label=label,
+            rows=rows,
+            fps=dataset.fps,
+            total_episodes=dataset.total_episodes,
+            episode_lengths=dataset.episode_lengths,
+            repeat=repeat,
+        )
+        for (dataset, rows, label), repeat in zip(inputs, repeats, strict=True)
+    ]
+    per_input, combined = compute_mix(entries, task_spec)
+    print(format_mix_report(per_input, combined))
+    return 0
+
+
+def _cmd_suggest(args: argparse.Namespace) -> int:
+    try:
+        task_spec = load_task_spec(args.task_spec)
+    except (OSError, ValueError) as exc:
+        print(f"[task-spec] {exc}", file=sys.stderr)
+        return 1
+
+    if args.count < 1:
+        print(f"--count / -n must be >= 1, got {args.count}.", file=sys.stderr)
+        return 1
+
+    inputs = _load_validated_inputs(
+        dataset_roots=args.dataset_root,
+        repo_ids=args.repo_id,
+        annotation_paths=args.annotations,
+        labels=args.label,
+        task_spec=task_spec,
+    )
+    if inputs is None:
+        return 1
+
+    analyses = [
+        analyze_dataset(
+            dataset,
+            rows,
+            task_spec,
+            label=label,
+            include_trajectories=False,
+        )
+        for dataset, rows, label in inputs
+    ]
+    all_poses = [sample for analysis in analyses for sample in analysis.object_poses]
+    all_skipped_objects = [item for analysis in analyses for item in analysis.skipped_objects]
+    coverages = compute_all_coverages(all_poses, task_spec)
+    suggestions, omitted_objects = suggest_placements(coverages, args.count, seed=args.seed)
+
+    if all_skipped_objects:
+        print(
+            f"Skipped object events: {len(all_skipped_objects)} "
+            "(missing event frame or absent subtask)."
+        )
+    print(format_suggestions_table(suggestions, omitted_objects=omitted_objects))
+
+    if args.output is not None:
+        write_suggestions_csv(suggestions, args.output)
+        print(f"\nWrote suggestions CSV: {args.output}")
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level argument parser for ``lerobot-check``."""
     parser = argparse.ArgumentParser(
@@ -439,6 +762,94 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to the YAML task spec file.",
     )
     validate_parser.set_defaults(func=_cmd_validate)
+
+    report_parser = subparsers.add_parser(
+        "report",
+        help="Generate an offline static HTML analysis report for one or more datasets.",
+    )
+    _add_multi_dataset_args(report_parser)
+    report_parser.add_argument(
+        "--speed-ratio-threshold",
+        type=float,
+        default=DEFAULT_SPEED_RATIO_THRESHOLD,
+        help=(
+            "Flag episodes as 'not slowed down' when fine_median / rest_median exceeds this "
+            f"threshold (default: {DEFAULT_SPEED_RATIO_THRESHOLD})."
+        ),
+    )
+    report_parser.add_argument(
+        "--min-rest-speed",
+        type=float,
+        default=DEFAULT_MIN_REST_SPEED_MPS,
+        help=(
+            "Non-fine median TCP speed (m/s) below which an arm is treated as idle "
+            f"(default: {DEFAULT_MIN_REST_SPEED_MPS})."
+        ),
+    )
+    report_parser.add_argument(
+        "--max-traj-points",
+        type=int,
+        default=DEFAULT_MAX_TRAJ_POINTS,
+        help=(
+            "Maximum sampled points per episode trajectory segment in 3D plots "
+            f"(default: {DEFAULT_MAX_TRAJ_POINTS})."
+        ),
+    )
+    report_parser.add_argument(
+        "--title",
+        type=str,
+        default=None,
+        help="Optional custom HTML report title.",
+    )
+    report_parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        required=True,
+        help="Output HTML file path (outside the repository).",
+    )
+    report_parser.set_defaults(func=_cmd_report)
+
+    mix_parser = subparsers.add_parser(
+        "mix",
+        help="Compute combined subtask and fine-window frame shares across repeated datasets.",
+    )
+    _add_multi_dataset_args(mix_parser)
+    mix_parser.add_argument(
+        "--repeat",
+        type=int,
+        action="append",
+        default=None,
+        help="Positive integer repetition weight for each input dataset (default: 1 each).",
+    )
+    mix_parser.set_defaults(func=_cmd_mix)
+
+    suggest_parser = subparsers.add_parser(
+        "suggest",
+        help="Suggest next-batch object placements (xy, yaw) sampled from sparse coverage cells.",
+    )
+    _add_multi_dataset_args(suggest_parser)
+    suggest_parser.add_argument(
+        "-n",
+        "--count",
+        type=int,
+        required=True,
+        help="Number of batch episodes N to suggest.",
+    )
+    suggest_parser.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed for reproducible placement sampling (default: 0).",
+    )
+    suggest_parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional CSV path to write placement suggestions (outside the repository).",
+    )
+    suggest_parser.set_defaults(func=_cmd_suggest)
 
     return parser
 
