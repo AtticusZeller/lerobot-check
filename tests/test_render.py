@@ -10,6 +10,7 @@ import pytest
 from PIL import Image
 
 from lerobot_check.cli import main
+from lerobot_check.dataset import EpisodeRecord, VideoSpan
 from lerobot_check.render import (
     _BOUNDARY_BORDER,
     _BOUNDARY_CAM_GAP_PX,
@@ -18,12 +19,14 @@ from lerobot_check.render import (
     _HUMAN_MARKER_BG,
     DEFAULT_CAMERAS,
     BoundaryCell,
+    _crop_and_resize_height,
     compose_boundary_sheets,
     parse_boundary_spec,
     parse_crop_specs,
     parse_episode_spec,
     parse_frame_spec,
     render_contact_sheet,
+    resolve_crop_keys,
     resolve_exemplar_cameras,
     resolve_render_cameras,
     select_boundary_exemplars,
@@ -507,8 +510,23 @@ def test_parse_crop_specs_valid_and_errors() -> None:
         ["head=90,40,550,360", "observation.images.left_wrist=0, 10, 320, 240"]
     ) == {
         "head": (90, 40, 550, 360),
-        "left_wrist": (0, 10, 320, 240),
+        "observation.images.left_wrist": (0, 10, 320, 240),
     }
+
+    resolved = resolve_crop_keys(
+        {
+            "head": (90, 40, 550, 360),
+            "observation.images.left_wrist": (0, 10, 320, 240),
+        },
+        DEFAULT_CAMERAS,
+    )
+    assert resolved == {
+        "observation.images.head": (90, 40, 550, 360),
+        "observation.images.left_wrist": (0, 10, 320, 240),
+    }
+
+    with pytest.raises(ValueError, match="nocam"):
+        resolve_crop_keys({"nocam": (0, 0, 10, 10)}, DEFAULT_CAMERAS)
 
     for bad in (
         "head:90,40,550,360",
@@ -524,6 +542,28 @@ def test_parse_crop_specs_valid_and_errors() -> None:
     ):
         with pytest.raises(ValueError):
             parse_crop_specs([bad])
+
+
+def test_crop_and_resize_height_rejects_out_of_bounds_box() -> None:
+    frame = Image.new("RGB", (640, 480), color=(10, 20, 30))
+    cropped = _crop_and_resize_height(
+        frame,
+        crop=(90, 40, 550, 360),
+        tile_height=240,
+        camera="observation.images.head",
+    )
+    assert cropped.size == (round(460 * 240 / 320), 240)
+
+    with pytest.raises(ValueError, match=r"observation\.images\.head") as exc_info:
+        _crop_and_resize_height(
+            frame,
+            crop=(600, 400, 900, 900),
+            tile_height=240,
+            camera="observation.images.head",
+        )
+    msg = str(exc_info.value)
+    assert "(600,400,900,900)" in msg
+    assert "640x480" in msg
 
 
 def test_compose_boundary_sheets_pagination_dimensions_and_human_marker() -> None:
@@ -649,4 +689,103 @@ def test_cli_boundary_sheet_rejects_last_and_unknown_subtask(
     captured_unknown = capsys.readouterr()
     assert exit_unknown != 0
     assert "Unknown subtask" in captured_unknown.err
+    assert not out_dir.exists()
+
+
+def test_cli_boundary_sheet_rejects_unknown_crop_camera_and_out_of_bounds_crop(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ds_root = tmp_path / "Xense" / "demo_ds"
+    ds_root.mkdir(parents=True)
+    spec_path = tmp_path / "spec.yaml"
+    spec_path.write_text(
+        "name: demo\nsubtasks:\n"
+        "  - name: stage_a\n    prompt: A\n"
+        "  - name: stage_b\n    prompt: B\n",
+        encoding="utf-8",
+    )
+    ann_path = tmp_path / "annotations.csv"
+    save_annotations(
+        [
+            _row(0, "stage_a", 0, 50),
+            _row(0, "stage_b", 50, 100),
+        ],
+        ann_path,
+    )
+
+    class _FakeDataset:
+        def __init__(self, root: Path, repo_id: str | None = None, revision: str | None = None):
+            self.root = root
+            self.repo_id = repo_id or "Xense/demo_ds"
+            self.revision = revision or "rev1"
+            self.fps = 30.0
+            self.camera_keys = DEFAULT_CAMERAS
+            self.episode_lengths = {0: 100}
+
+        def get_episode(self, episode_index: int) -> EpisodeRecord:
+            span = VideoSpan(path=tmp_path / "fake.mp4", from_timestamp=0.0, to_timestamp=4.0)
+            return EpisodeRecord(
+                episode_index=episode_index,
+                length=100,
+                data_path=tmp_path / "fake.parquet",
+                videos={cam: span for cam in DEFAULT_CAMERAS},
+            )
+
+    monkeypatch.setattr("lerobot_check.cli.DatasetView", _FakeDataset)
+    monkeypatch.setattr(
+        "lerobot_check.render.decode_video_frames_pyav",
+        lambda path, targets, *, fps, **kwargs: {
+            frame_id: Image.new("RGB", (640, 480), color=(20, 40, 60)) for frame_id, _ in targets
+        },
+    )
+
+    out_dir = tmp_path / "out_crop_err"
+
+    exit_unknown_cam = main(
+        [
+            "boundary-sheet",
+            "--dataset-root",
+            str(ds_root),
+            "--annotations",
+            str(ann_path),
+            "--task-spec",
+            str(spec_path),
+            "--subtasks",
+            "stage_a",
+            "--crop",
+            "nocam=0,0,10,10",
+            "-o",
+            str(out_dir),
+        ]
+    )
+    captured_cam = capsys.readouterr()
+    assert exit_unknown_cam == 1
+    assert "nocam" in captured_cam.err
+    assert "observation.images.head" in captured_cam.err
+    assert not out_dir.exists()
+
+    exit_oob = main(
+        [
+            "boundary-sheet",
+            "--dataset-root",
+            str(ds_root),
+            "--annotations",
+            str(ann_path),
+            "--task-spec",
+            str(spec_path),
+            "--subtasks",
+            "stage_a",
+            "--crop",
+            "head=600,400,900,900",
+            "-o",
+            str(out_dir),
+        ]
+    )
+    captured_oob = capsys.readouterr()
+    assert exit_oob == 1
+    assert "observation.images.head" in captured_oob.err
+    assert "(600,400,900,900)" in captured_oob.err
+    assert "640x480" in captured_oob.err
     assert not out_dir.exists()

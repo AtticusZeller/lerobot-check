@@ -1010,14 +1010,11 @@ def parse_episode_spec(spec: str) -> list[int]:
 def parse_crop_specs(specs: Sequence[str] | None) -> dict[str, tuple[int, int, int, int]]:
     """Parse repeatable ``CAM=x0,y0,x1,y1`` crop specifications.
 
-    Camera names are normalized to short names (stripping ``observation.images.``)
-    so crops match whether the user passes short names or full feature keys.
-
     Args:
         specs: Optional sequence of ``CAM=x0,y0,x1,y1`` strings.
 
     Returns:
-        Mapping ``short_camera_name -> (x0, y0, x1, y1)``.
+        Mapping ``camera_name -> (x0, y0, x1, y1)``.
 
     Raises:
         ValueError: If syntax is invalid, coordinates are non-integer or negative,
@@ -1031,7 +1028,7 @@ def parse_crop_specs(specs: Sequence[str] | None) -> dict[str, tuple[int, int, i
         if "=" not in raw:
             raise ValueError(f"Invalid crop spec {raw!r}; expected 'CAM=x0,y0,x1,y1'.")
         cam_raw, coords_raw = raw.split("=", 1)
-        cam = _short_camera_name(cam_raw.strip())
+        cam = cam_raw.strip()
         if not cam:
             raise ValueError(f"Empty camera name in crop spec {raw!r}.")
 
@@ -1052,6 +1049,47 @@ def parse_crop_specs(specs: Sequence[str] | None) -> dict[str, tuple[int, int, i
         crops[cam] = (x0, y0, x1, y1)
 
     return crops
+
+
+def resolve_crop_keys(
+    crops: Mapping[str, tuple[int, int, int, int]] | None,
+    resolved_cameras: Sequence[str],
+) -> dict[str, tuple[int, int, int, int]]:
+    """Resolve crop camera keys against ``resolved_cameras`` and reject unknown keys.
+
+    Matches keys the same way cameras are resolved: exact key match, adding the
+    ``observation.images.`` prefix, or matching the short camera name.
+
+    Args:
+        crops: Mapping from raw camera key or short name to ``(x0, y0, x1, y1)``.
+        resolved_cameras: Ordered resolved camera keys selected for rendering.
+
+    Returns:
+        Mapping ``resolved_camera_key -> (x0, y0, x1, y1)``.
+
+    Raises:
+        ValueError: If any crop camera key does not match any camera in ``resolved_cameras``.
+    """
+    if not crops:
+        return {}
+
+    available_set = set(resolved_cameras)
+    short_to_resolved = {_short_camera_name(cam): cam for cam in resolved_cameras}
+    mapped: dict[str, tuple[int, int, int, int]] = {}
+    for cam_spec, box in crops.items():
+        if cam_spec in available_set:
+            target = cam_spec
+        elif f"observation.images.{cam_spec}" in available_set:
+            target = f"observation.images.{cam_spec}"
+        elif _short_camera_name(cam_spec) in short_to_resolved:
+            target = short_to_resolved[_short_camera_name(cam_spec)]
+        else:
+            raise ValueError(
+                f"Unknown crop camera {cam_spec!r}; "
+                f"must match one of resolved cameras: {list(resolved_cameras)}."
+            )
+        mapped[target] = box
+    return mapped
 
 
 def resolve_boundary_subtasks(
@@ -1167,16 +1205,18 @@ def _crop_and_resize_height(
     *,
     crop: tuple[int, int, int, int] | None,
     tile_height: int | None,
+    camera: str | None = None,
 ) -> Image.Image:
     rgb = image.convert("RGB")
     if crop is not None:
         x0, y0, x1, y1 = crop
         w, h = rgb.size
-        cx1 = min(x1, w)
-        cy1 = min(y1, h)
-        if x0 >= cx1 or y0 >= cy1:
-            raise ValueError(f"Crop box {crop} falls outside image size {w}x{h}.")
-        rgb = rgb.crop((x0, y0, cx1, cy1))
+        if x0 < 0 or y0 < 0 or x1 > w or y1 > h or x0 >= x1 or y0 >= y1:
+            cam_desc = f" for camera {camera!r}" if camera else ""
+            raise ValueError(
+                f"Crop box ({x0},{y0},{x1},{y1}){cam_desc} exceeds decoded frame size {w}x{h}."
+            )
+        rgb = rgb.crop((x0, y0, x1, y1))
 
     if tile_height is not None:
         if tile_height <= 0:
@@ -1365,6 +1405,7 @@ def render_boundary_sheets(
             raise ValueError(
                 f"Episode {ef.episode_index} does not contain requested cameras: {missing_cams}"
             )
+        resolved_crops = resolve_crop_keys(crops, resolved_cameras)
 
         cam_images: list[Image.Image] = []
         for cam in resolved_cameras:
@@ -1375,14 +1416,12 @@ def render_boundary_sheets(
                 [(ef.frame, target_ts)],
                 fps=dataset.fps,
             )
-            crop_box = None
-            if crops:
-                crop_box = crops.get(cam) or crops.get(_short_camera_name(cam))
             cam_images.append(
                 _crop_and_resize_height(
                     decoded[ef.frame],
-                    crop=crop_box,
+                    crop=resolved_crops.get(cam),
                     tile_height=tile_height,
+                    camera=cam,
                 )
             )
         cells.append(

@@ -61,6 +61,7 @@ from lerobot_check.relabel import (
 )
 from lerobot_check.render import (
     DEFAULT_CAMERAS,
+    _resolve_camera_keys,
     parse_boundary_spec,
     parse_crop_specs,
     parse_episode_spec,
@@ -69,6 +70,7 @@ from lerobot_check.render import (
     render_boundary_sheets,
     render_episode_sheets,
     resolve_boundary_subtasks,
+    resolve_crop_keys,
     resolve_exemplar_cameras,
     resolve_render_cameras,
     select_boundary_exemplars,
@@ -417,6 +419,18 @@ def _cmd_boundary_sheet(args: argparse.Namespace) -> int:
         return 1
 
     cameras = tuple(args.cameras) if args.cameras else DEFAULT_CAMERAS
+    dataset_camera_keys = getattr(dataset, "camera_keys", ())
+    resolved_cameras = (
+        _resolve_camera_keys(cameras, dict.fromkeys(dataset_camera_keys))
+        if dataset_camera_keys
+        else cameras
+    )
+    try:
+        resolved_crops = resolve_crop_keys(crops, resolved_cameras)
+    except ValueError as exc:
+        print(f"[crop] {exc}", file=sys.stderr)
+        return 1
+
     episode_lengths = getattr(dataset, "episode_lengths", None)
 
     for subtask_pos, subtask_name in target_subtasks:
@@ -446,8 +460,8 @@ def _cmd_boundary_sheet(args: argparse.Namespace) -> int:
                 args.output,
                 subtask_position=subtask_pos,
                 subtask=subtask_name,
-                cameras=cameras,
-                crops=crops,
+                cameras=resolved_cameras,
+                crops=resolved_crops,
                 tile_height=args.tile_height,
                 columns=args.columns,
                 per_page=args.per_page,
