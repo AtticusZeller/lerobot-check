@@ -3,14 +3,16 @@
 from __future__ import annotations
 
 import math
+from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 import av
 from PIL import Image, ImageDraw, ImageFont
 
 from lerobot_check.dataset import DatasetView, EpisodeRecord
-from lerobot_check.schema import TaskSpec
+from lerobot_check.schema import AnnotationRow, TaskSpec
 
 DEFAULT_CAMERAS: tuple[str, ...] = (
     "observation.images.head",
@@ -25,7 +27,211 @@ _HEADER_BG = (32, 32, 36)
 _DIVIDER_COLOR = (65, 65, 72)
 _BADGE_BG = (16, 16, 20)
 _HIGHLIGHT_BG = (196, 132, 0)
+_BOUNDARY_BG = (220, 38, 38)
+_BOUNDARY_BORDER = (239, 68, 68)
+_BOUNDARY_BORDER_PX = 4
 _TEXT_COLOR = (255, 255, 255)
+
+
+@dataclass(frozen=True)
+class BoundarySpec:
+    """Parsed ``--boundary`` selector for human-reviewed exemplar rendering.
+
+    Attributes:
+        prev_subtask: Leading subtask name (or the target subtask in grasp mode).
+        next_subtask: Following subtask name, or ``None`` in ``<subtask>:grasp`` mode.
+        is_grasp: ``True`` for ``<subtask>:grasp`` exemplars, ``False`` for transitions.
+    """
+
+    prev_subtask: str
+    next_subtask: str | None
+    is_grasp: bool = False
+
+    @property
+    def raw(self) -> str:
+        """Canonical ``<left>:<right>`` boundary string."""
+        if self.is_grasp:
+            return f"{self.prev_subtask}:grasp"
+        return f"{self.prev_subtask}:{self.next_subtask}"
+
+    @property
+    def label(self) -> str:
+        """Short visual marker label drawn on the target frame."""
+        return "GRASP" if self.is_grasp else "BOUNDARY"
+
+
+@dataclass(frozen=True)
+class BoundaryExemplar:
+    """One human-reviewed exemplar frame selected from an annotation CSV."""
+
+    episode_index: int
+    frame: int
+    boundary: BoundarySpec
+
+
+def parse_boundary_spec(spec: str) -> BoundarySpec:
+    """Parse ``<prev_subtask>:<next_subtask>`` or ``<subtask>:grasp``.
+
+    Args:
+        spec: Raw ``--boundary`` CLI argument.
+
+    Returns:
+        Parsed ``BoundarySpec``.
+
+    Raises:
+        ValueError: If ``spec`` does not contain exactly two non-empty colon-separated parts.
+    """
+    parts = [part.strip() for part in spec.split(":")]
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValueError(
+            f"Invalid boundary {spec!r}; expected '<prev_subtask>:<next_subtask>' "
+            "or '<subtask>:grasp'."
+        )
+    left, right = parts
+    if right == "grasp":
+        return BoundarySpec(prev_subtask=left, next_subtask=None, is_grasp=True)
+    return BoundarySpec(prev_subtask=left, next_subtask=right, is_grasp=False)
+
+
+def resolve_exemplar_cameras(
+    boundary: BoundarySpec,
+    *,
+    explicit_cameras: Sequence[str] | None = None,
+    task_spec: TaskSpec | None = None,
+) -> tuple[str, ...]:
+    """Resolve cameras for a boundary exemplar strip.
+
+    Validates subtask names against ``task_spec`` when ``task_spec`` is provided.
+    Explicit ``--cameras`` overrides task-spec cameras; otherwise takes the ordered,
+    deduplicated union of the relevant subtask camera lists, falling back to
+    ``DEFAULT_CAMERAS`` when none are configured.
+    """
+    spec_cams: list[str] = []
+    seen_short: set[str] = set()
+    if task_spec is not None:
+        subtasks_to_check = (
+            (boundary.prev_subtask,)
+            if boundary.is_grasp
+            else (boundary.prev_subtask, str(boundary.next_subtask))
+        )
+        for name in subtasks_to_check:
+            for cam in task_spec.cameras_for(name):
+                short = _short_camera_name(cam)
+                if short not in seen_short:
+                    seen_short.add(short)
+                    spec_cams.append(cam)
+
+    if explicit_cameras:
+        return tuple(explicit_cameras)
+    if spec_cams:
+        return tuple(spec_cams)
+    return DEFAULT_CAMERAS
+
+
+def select_boundary_exemplars(
+    rows: Sequence[AnnotationRow],
+    boundary: BoundarySpec,
+    *,
+    max_episodes: int = 3,
+) -> list[BoundaryExemplar]:
+    """Select human-reviewed boundary or grasp exemplars in ascending episode order.
+
+    For transition boundaries ``prev:next``, an episode qualifies only when BOTH
+    the ``prev`` and ``next`` rows have ``annotator == "human"`` and satisfy
+    ``prev.end == next.start``. For ``subtask:grasp``, an episode qualifies when
+    that subtask's row has ``annotator == "human"`` and a non-null ``grasp`` frame.
+    """
+    if max_episodes < 1:
+        raise ValueError(f"max_episodes must be >= 1, got {max_episodes}")
+
+    by_episode: dict[int, list[AnnotationRow]] = defaultdict(list)
+    for row in rows:
+        by_episode[row.episode_index].append(row)
+
+    selected: list[BoundaryExemplar] = []
+    for ep_idx in sorted(by_episode):
+        ep_rows = by_episode[ep_idx]
+        if boundary.is_grasp:
+            for row in ep_rows:
+                if (
+                    row.subtask == boundary.prev_subtask
+                    and row.annotator == "human"
+                    and row.grasp is not None
+                ):
+                    selected.append(
+                        BoundaryExemplar(
+                            episode_index=ep_idx,
+                            frame=row.grasp,
+                            boundary=boundary,
+                        )
+                    )
+                    break
+        else:
+            prev_human = [
+                r for r in ep_rows if r.subtask == boundary.prev_subtask and r.annotator == "human"
+            ]
+            next_human = [
+                r for r in ep_rows if r.subtask == boundary.next_subtask and r.annotator == "human"
+            ]
+            matched_frame: int | None = None
+            for prev_row in prev_human:
+                for next_row in next_human:
+                    if prev_row.end == next_row.start:
+                        matched_frame = prev_row.end
+                        break
+                if matched_frame is not None:
+                    break
+            if matched_frame is not None:
+                selected.append(
+                    BoundaryExemplar(
+                        episode_index=ep_idx,
+                        frame=matched_frame,
+                        boundary=boundary,
+                    )
+                )
+
+        if len(selected) >= max_episodes:
+            break
+
+    return selected
+
+
+def select_frames_in_window(
+    center: int,
+    *,
+    episode_length: int,
+    window_frames: int,
+    stride: int,
+) -> list[int]:
+    """Sample frames in half-open ``[center - window_frames, center + window_frames)``.
+
+    Steps symmetrically at ``stride`` from ``center`` so ``center`` itself is
+    always included, clamped to ``[0, episode_length)``.
+    """
+    if episode_length <= 0:
+        raise ValueError(f"episode_length must be positive, got {episode_length}")
+    if not 0 <= center < episode_length:
+        raise ValueError(f"center frame {center} is outside [0, {episode_length - 1}]")
+    if window_frames < 0:
+        raise ValueError(f"window_frames must be >= 0, got {window_frames}")
+    if stride <= 0:
+        raise ValueError(f"stride must be >= 1, got {stride}")
+
+    low = max(0, center - window_frames)
+    high = min(episode_length, center + window_frames)
+    selected: set[int] = {center}
+
+    offset = stride
+    while center - offset >= low:
+        selected.add(center - offset)
+        offset += stride
+
+    offset = stride
+    while center + offset < high:
+        selected.add(center + offset)
+        offset += stride
+
+    return sorted(selected)
 
 
 def parse_frame_spec(spec: str, episode_length: int) -> list[int]:
@@ -218,15 +424,21 @@ def _draw_frame_badge(
     fps: float,
     highlighted: bool,
     font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    boundary_label: str | None = None,
 ) -> None:
     badge_text = f"f={frame_idx:05d} ({frame_idx / fps:.2f}s)"
-    if highlighted:
+    if boundary_label is not None:
+        badge_text += f"  {boundary_label}"
+        bg = _BOUNDARY_BG
+    elif highlighted:
         badge_text += " *"
+        bg = _HIGHLIGHT_BG
+    else:
+        bg = _BADGE_BG
     text_bbox = draw.textbbox((0, 0), badge_text, font=font)
     pad_x, pad_y = 6, 4
     box_w = (text_bbox[2] - text_bbox[0]) + 2 * pad_x
     box_h = (text_bbox[3] - text_bbox[1]) + 2 * pad_y
-    bg = _HIGHLIGHT_BG if highlighted else _BADGE_BG
     draw.rectangle([(x + 4, y + 4), (x + 4 + box_w, y + 4 + box_h)], fill=bg)
     draw.text(
         (x + 4 + pad_x - text_bbox[0], y + 4 + pad_y - text_bbox[1]),
@@ -245,6 +457,7 @@ def _render_single_camera_grid(
     tile_width: int,
     resolved_h: int,
     highlight_set: set[int],
+    boundary_map: Mapping[int, str],
 ) -> Image.Image:
     sorted_indices = sorted(frames_by_index)
     num_rows = math.ceil(len(sorted_indices) / columns)
@@ -285,6 +498,13 @@ def _render_single_camera_grid(
         y0 = _HEADER_HEIGHT + row_idx * (resolved_h + _DIVIDER_PX)
         tile = _resize_tile(cam_map[camera].convert("RGB"), tile_width, resolved_h)
         canvas.paste(tile, (x0, y0))
+        boundary_label = boundary_map.get(frame_idx)
+        if boundary_label is not None:
+            draw.rectangle(
+                [(x0, y0), (x0 + tile_width - 1, y0 + resolved_h - 1)],
+                outline=_BOUNDARY_BORDER,
+                width=_BOUNDARY_BORDER_PX,
+            )
         _draw_frame_badge(
             draw,
             x=x0,
@@ -293,6 +513,7 @@ def _render_single_camera_grid(
             fps=fps,
             highlighted=frame_idx in highlight_set,
             font=badge_font,
+            boundary_label=boundary_label,
         )
 
     return canvas
@@ -307,6 +528,7 @@ def render_contact_sheet(
     tile_height: int | None = None,
     highlight_frames: Collection[int] = (),
     columns: int | None = None,
+    boundary_frames: Mapping[int, str] | None = None,
 ) -> Image.Image:
     """Tile RGB frames into a single contact sheet with frame labels.
 
@@ -325,6 +547,8 @@ def render_contact_sheet(
         highlight_frames: Optional set of frame indices (e.g. candidate events)
             whose frame label badge is highlighted.
         columns: Optional grid column count for single-camera coarse contact sheets.
+        boundary_frames: Optional mapping ``frame_index -> label`` (e.g. ``"BOUNDARY"``
+            or ``"GRASP"``) drawn with a coloured full-row border and prominent badge.
 
     Returns:
         Rendered RGB ``PIL.Image``.
@@ -356,6 +580,7 @@ def render_contact_sheet(
         else max(1, round(first_cam_img.size[1] * tile_width / first_cam_img.size[0]))
     )
     highlight_set = set(highlight_frames)
+    boundary_map = dict(boundary_frames) if boundary_frames else {}
 
     if columns is not None:
         return _render_single_camera_grid(
@@ -366,6 +591,7 @@ def render_contact_sheet(
             tile_width=tile_width,
             resolved_h=resolved_h,
             highlight_set=highlight_set,
+            boundary_map=boundary_map,
         )
 
     num_cols = len(cameras)
@@ -405,6 +631,14 @@ def render_contact_sheet(
             tile = _resize_tile(cam_map[cam_key].convert("RGB"), tile_width, resolved_h)
             canvas.paste(tile, (x0, y0))
 
+        boundary_label = boundary_map.get(frame_idx)
+        if boundary_label is not None:
+            draw.rectangle(
+                [(0, y0), (sheet_w - 1, y0 + resolved_h - 1)],
+                outline=_BOUNDARY_BORDER,
+                width=_BOUNDARY_BORDER_PX,
+            )
+
         _draw_frame_badge(
             draw,
             x=0,
@@ -413,6 +647,7 @@ def render_contact_sheet(
             fps=fps,
             highlighted=frame_idx in highlight_set,
             font=badge_font,
+            boundary_label=boundary_label,
         )
 
     return canvas
@@ -558,6 +793,7 @@ def render_episode_sheets(
     max_frames_per_image: int | None = None,
     highlight_frames: Collection[int] = (),
     columns: int | None = None,
+    boundary_frames: Mapping[int, str] | None = None,
 ) -> list[Path]:
     """Decode requested frames for an episode and write one or more tiled PNGs.
 
@@ -573,6 +809,8 @@ def render_episode_sheets(
             (``<stem>_001.png``, ``<stem>_002.png``, ...).
         highlight_frames: Optional event frames to visually highlight in badges.
         columns: Optional grid column count for single-camera coarse scans.
+        boundary_frames: Optional mapping ``frame_index -> label`` rendered with a
+            coloured full-row border and prominent label badge.
 
     Returns:
         List of written PNG file paths.
@@ -644,6 +882,7 @@ def render_episode_sheets(
             tile_height=tile_height,
             highlight_frames=highlight_frames,
             columns=columns,
+            boundary_frames=boundary_frames,
         )
         if len(chunks) == 1:
             dest = output_path
@@ -653,3 +892,52 @@ def render_episode_sheets(
         written.append(dest)
 
     return written
+
+
+def render_boundary_exemplars(
+    dataset: DatasetView,
+    exemplars: Sequence[BoundaryExemplar],
+    output_dir: Path,
+    *,
+    cameras: Sequence[str] = DEFAULT_CAMERAS,
+    window_s: float = 1.0,
+    stride: int = 3,
+    tile_width: int = 320,
+    tile_height: int | None = None,
+) -> list[tuple[BoundaryExemplar, Path]]:
+    """Render one marked strip PNG per selected human boundary exemplar.
+
+    Each PNG shows frames in ``[b - window, b + window)`` at ``stride`` with the
+    target boundary or grasp frame visibly outlined and labeled.
+    """
+    if window_s < 0.0:
+        raise ValueError(f"window_s must be >= 0, got {window_s}")
+    if stride <= 0:
+        raise ValueError(f"stride must be >= 1, got {stride}")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    window_frames = round(window_s * dataset.fps)
+    results: list[tuple[BoundaryExemplar, Path]] = []
+    for ex in exemplars:
+        record = dataset.get_episode(ex.episode_index)
+        frame_indices = select_frames_in_window(
+            ex.frame,
+            episode_length=record.length,
+            window_frames=window_frames,
+            stride=stride,
+        )
+        safe_boundary = ex.boundary.raw.replace(":", "__").replace("/", "_")
+        dest = output_dir / f"ep{ex.episode_index:04d}_{safe_boundary}_f{ex.frame:05d}.png"
+        written = render_episode_sheets(
+            dataset,
+            ex.episode_index,
+            frame_indices,
+            dest,
+            cameras=cameras,
+            tile_width=tile_width,
+            tile_height=tile_height,
+            max_frames_per_image=None,
+            boundary_frames={ex.frame: ex.boundary.label},
+        )
+        results.append((ex, written[0]))
+    return results

@@ -48,7 +48,23 @@ Inspect generated pages **in order** and **stop as soon as you have located ever
 
 If a subtask configures multiple cameras in the task spec, omit `--columns` to render them side by side, or pass `--cameras <cam>` explicitly for a single-camera coarse grid.
 
-### 2. Fine Pass (Per-Subtask Cameras, ±1 s at 1–3 Frame Stride)
+### 2. Fine Pass (Compare Against Human Exemplars, ±1 s at 1–3 Frame Stride)
+
+Before placing a boundary (or `grasp`) in a new episode, render the user's own human-reviewed exemplars for that boundary so you match the **exact same physical event**:
+
+```bash
+uv run lerobot-check exemplars \
+  --repo-id Xense/pack_iphone_box_1119 \
+  --boundary place_phone:move_lid \
+  --max-episodes 3 \
+  --window-s 1.0 \
+  --stride 3 \
+  -o /tmp/lerobot-check/exemplars
+```
+
+For grasp frames, pass `--boundary <subtask>:grasp` (for example `--boundary place_phone:grasp`). Each exemplar PNG shows the subtask's configured cameras (the union of both subtasks' `cameras` for a transition boundary) over `[b - window, b + window)` with the human-reviewed frame highlighted by a red border and `BOUNDARY` / `GRASP` badge. If no human exemplars exist yet for that boundary, `exemplars` prints a message and exits `0` so you can proceed from the written rules.
+
+The task spec comments state the written rule; the exemplars show the user's standard. **If the exemplars and the written rule disagree, follow the exemplars and record the discrepancy in the row's `note`.**
 
 For each approximate frame found in the coarse pass, render a ±1 s window (`--window-s 1.0`) at 1–3 frame stride (`--stride 2` or `3`, or `--stride 1` when exact precision is needed) using `--subtask <name>`:
 

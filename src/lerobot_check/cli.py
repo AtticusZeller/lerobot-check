@@ -59,9 +59,13 @@ from lerobot_check.relabel import (
     verify_relabel,
 )
 from lerobot_check.render import (
+    parse_boundary_spec,
     parse_frame_spec,
+    render_boundary_exemplars,
     render_episode_sheets,
+    resolve_exemplar_cameras,
     resolve_render_cameras,
+    select_boundary_exemplars,
     select_frames_around_events,
 )
 from lerobot_check.schema import (
@@ -248,6 +252,97 @@ def _cmd_render(args: argparse.Namespace) -> int:
     )
     for path in written:
         print(f"Wrote {path} ({len(frame_indices)} total frames across {len(written)} sheet(s))")
+    return 0
+
+
+def _cmd_exemplars(args: argparse.Namespace) -> int:
+    try:
+        boundary = parse_boundary_spec(args.boundary)
+    except ValueError as exc:
+        print(f"[boundary] {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        root = resolve_dataset_root(args.dataset_root, args.repo_id)
+        dataset = DatasetView(root, repo_id=args.repo_id, revision=args.revision)
+    except (OSError, ValueError) as exc:
+        print(f"[dataset] {exc}", file=sys.stderr)
+        return 1
+
+    task_spec: TaskSpec | None = None
+    spec_path = (
+        args.task_spec
+        if args.task_spec is not None
+        else default_task_spec_path(root, repo_id=dataset.repo_id)
+    )
+    if args.task_spec is not None or spec_path.is_file():
+        try:
+            task_spec = load_task_spec(spec_path)
+        except (OSError, ValueError) as exc:
+            print(f"[task-spec] {exc}", file=sys.stderr)
+            return 1
+
+    try:
+        cameras = resolve_exemplar_cameras(
+            boundary,
+            explicit_cameras=args.cameras,
+            task_spec=task_spec,
+        )
+    except (KeyError, ValueError) as exc:
+        print(f"[cameras] {exc}", file=sys.stderr)
+        return 1
+
+    ann_path = (
+        args.annotations
+        if args.annotations is not None
+        else default_annotations_path(root, repo_id=dataset.repo_id, revision=dataset.revision)
+    )
+    if args.annotations is None and not ann_path.is_file():
+        print(
+            f"No human exemplars found for boundary '{boundary.raw}' "
+            f"(annotation CSV not found: {ann_path})."
+        )
+        return 0
+
+    try:
+        rows = load_annotations(ann_path)
+    except (OSError, ValueError) as exc:
+        print(f"[annotations] {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        exemplars = select_boundary_exemplars(
+            rows,
+            boundary,
+            max_episodes=args.max_episodes,
+        )
+    except ValueError as exc:
+        print(f"[exemplars] {exc}", file=sys.stderr)
+        return 1
+
+    if not exemplars:
+        print(f"No human exemplars found for boundary '{boundary.raw}' in {ann_path}.")
+        return 0
+
+    try:
+        rendered = render_boundary_exemplars(
+            dataset,
+            exemplars,
+            args.output,
+            cameras=cameras,
+            window_s=args.window_s,
+            stride=args.stride,
+            tile_width=args.tile_width,
+            tile_height=args.tile_height,
+        )
+    except (OSError, RuntimeError, ValueError) as exc:
+        print(f"[exemplars] {exc}", file=sys.stderr)
+        return 1
+
+    cam_names = ", ".join(cam.removeprefix("observation.images.") for cam in cameras)
+    print(f"boundary={boundary.raw} cameras=[{cam_names}] count={len(rendered)}")
+    for ex, png_path in rendered:
+        print(f"episode={ex.episode_index} frame={ex.frame} path={png_path}")
     return 0
 
 
@@ -1046,6 +1141,89 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output PNG file path (outside the repository).",
     )
     render_parser.set_defaults(func=_cmd_render)
+
+    exemplars_parser = subparsers.add_parser(
+        "exemplars",
+        help="Render boundary or grasp strip exemplars from human-reviewed annotation rows.",
+    )
+    _add_dataset_args(exemplars_parser)
+    exemplars_parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        help="Override detected dataset revision when resolving default annotations path.",
+    )
+    exemplars_parser.add_argument(
+        "--annotations",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the annotation CSV file "
+            "(default: <lerobot_root>/.xense-viewer/subtasks/<org>__<name>@<revision>.csv)."
+        ),
+    )
+    exemplars_parser.add_argument(
+        "--task-spec",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the YAML task spec file "
+            "(default: <lerobot_root>/.xense-viewer/subtasks/<org>__<name>.task_spec.yaml)."
+        ),
+    )
+    exemplars_parser.add_argument(
+        "--boundary",
+        type=str,
+        required=True,
+        help="Target boundary '<prev_subtask>:<next_subtask>' or '<subtask>:grasp'.",
+    )
+    exemplars_parser.add_argument(
+        "--max-episodes",
+        type=int,
+        default=3,
+        help="Maximum number of human-reviewed exemplar episodes to render (default: 3).",
+    )
+    exemplars_parser.add_argument(
+        "--window-s",
+        type=float,
+        default=1.0,
+        help="Half-window radius around the boundary frame in seconds (default: 1.0).",
+    )
+    exemplars_parser.add_argument(
+        "--stride",
+        type=int,
+        default=3,
+        help="Sampling stride in frames within the window (default: 3).",
+    )
+    exemplars_parser.add_argument(
+        "--cameras",
+        nargs="+",
+        default=None,
+        help=(
+            "Explicit camera keys or short names "
+            "(overrides the union of subtask cameras from the task spec)."
+        ),
+    )
+    exemplars_parser.add_argument(
+        "--tile-width",
+        type=int,
+        default=320,
+        help="Width of each camera tile in pixels (default: 320).",
+    )
+    exemplars_parser.add_argument(
+        "--tile-height",
+        type=int,
+        default=None,
+        help="Height of each camera tile in pixels (default: preserve aspect ratio).",
+    )
+    exemplars_parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        required=True,
+        help="Output directory for exemplar PNGs (outside the repository).",
+    )
+    exemplars_parser.set_defaults(func=_cmd_exemplars)
 
     validate_parser = subparsers.add_parser(
         "validate",
