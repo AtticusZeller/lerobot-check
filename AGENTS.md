@@ -43,7 +43,7 @@ CLI commands take explicit input/output paths. Write all generated artifacts out
   - `render.py`: low-memory PyAV frame decoding and multi-camera PNG tiling
   - `relabel.py`: N-stage `task_index` relabeling and verification
   - `analysis.py`: `distribution.json` computation (frame shares, object poses/coverage, resampled trajectories, subtask-arm metrics)
-  - `calib.py`: head-camera calibration frame selection (`calib-frames`), joint extrinsic+tool-offset solver (`calibrate`), and projection/back-projection geometry
+  - `calib.py`: head-camera calibration frame selection (`calib-frames` with `--max-gripper`, `--max-speed`, `--no-speed-filter`, `--append`, `--arms`), joint extrinsic+tool-offset solver (`calibrate`), and projection/back-projection geometry
   - `suggest.py`: target polygon back-projection, collection placement sampling, and three-tier test point generation
   - `cli.py`: `lerobot-check` CLI entry point
 - Prefer small, single-responsibility functions with explicit type annotations and Google-style docstrings.

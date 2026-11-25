@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import math
 from collections import defaultdict
@@ -22,6 +23,9 @@ DEFAULT_FRAMES_PER_ARM = 15
 # Verified on bi_flexiv_rizon4_rt (pack_iphone_box_1119): 0.0 is closed, 1.0 is open;
 # gripper <= 0.05 keeps tightly closed fingertips while excluding visibly open jaws (>= 0.06).
 DEFAULT_MAX_GRIPPER_POS = 0.05
+# Among closed-gripper frames on pack_iphone_box_1119, ~half move at <= 0.03 m/s,
+# keeping motion blur and camera/state sync error sub-pixel while preserving pose diversity.
+DEFAULT_MAX_SPEED_MPS = 0.03
 ROBUST_LOSS_SCALE_PX = 3.0
 OUTLIER_MEDIAN_MULTIPLIER = 3.0
 OUTLIER_MIN_PX = 15.0
@@ -437,6 +441,70 @@ def _next_arm_frame_index(existing_frames: Sequence[Mapping[str, Any]], arm: str
     return max_num + 1
 
 
+def _compute_tcp_speeds_mps(
+    ep_indices: np.ndarray,
+    frame_indices: np.ndarray,
+    xyz: np.ndarray,
+    *,
+    fps: float,
+) -> np.ndarray:
+    """Compute per-frame TCP linear speed (m/s) via within-episode central differences.
+
+    Uses central difference ``||p[i+1] - p[i-1]|| / ((f[i+1] - f[i-1]) / fps)`` for
+    interior frames of each episode, one-sided differences at episode boundaries, and
+    ``NaN`` for 1-frame episodes. Never differentiates across episode boundaries.
+    """
+    if fps <= 0.0 or not math.isfinite(fps):
+        raise ValueError(f"fps must be positive and finite, got {fps}")
+
+    n = len(xyz)
+    speeds = np.full(n, np.nan, dtype=np.float64)
+    if n == 0:
+        return speeds
+
+    ep_arr = np.asarray(ep_indices, dtype=np.int64)
+    fr_arr = np.asarray(frame_indices, dtype=np.int64)
+    pos = np.asarray(xyz, dtype=np.float64)
+
+    # Sort row indices by (episode_index, frame_index) so episodes form contiguous runs
+    # ordered by frame_index even if input rows are out of order.
+    order = np.lexsort((fr_arr, ep_arr))
+    sorted_ep = ep_arr[order]
+    boundaries = np.flatnonzero(np.diff(sorted_ep) != 0) + 1
+    starts = np.concatenate(([0], boundaries))
+    ends = np.concatenate((boundaries, [n]))
+
+    for s, e in zip(starts, ends, strict=True):
+        length = int(e - s)
+        if length < 2:
+            continue
+        idx = order[s:e]
+        p = pos[idx]
+        f = fr_arr[idx].astype(np.float64)
+
+        ep_speeds = np.full(length, np.nan, dtype=np.float64)
+
+        dt0 = (f[1] - f[0]) / fps
+        if dt0 > 0.0:
+            ep_speeds[0] = float(np.linalg.norm(p[1] - p[0])) / dt0
+
+        dt_last = (f[-1] - f[-2]) / fps
+        if dt_last > 0.0:
+            ep_speeds[-1] = float(np.linalg.norm(p[-1] - p[-2])) / dt_last
+
+        if length >= 3:
+            dt_mid = (f[2:] - f[:-2]) / fps
+            valid = dt_mid > 0.0
+            norms = np.linalg.norm(p[2:] - p[:-2], axis=1)
+            mid_speeds = np.full(length - 2, np.nan, dtype=np.float64)
+            mid_speeds[valid] = norms[valid] / dt_mid[valid]
+            ep_speeds[1:-1] = mid_speeds
+
+        speeds[idx] = ep_speeds
+
+    return speeds
+
+
 def select_calib_frames(
     dataset: DatasetView,
     *,
@@ -446,14 +514,18 @@ def select_calib_frames(
     append_per_arm: int | None = None,
     episodes: Sequence[int] | None = None,
     max_gripper_pos: float | None = DEFAULT_MAX_GRIPPER_POS,
+    max_speed_mps: float | None = DEFAULT_MAX_SPEED_MPS,
+    arms: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     """Select diverse calibration frames per arm via farthest point sampling.
 
-    By default restricts newly selected frames to those where that arm's gripper
-    is closed (``gripper <= max_gripper_pos``) so the fingertip midpoint is
-    unambiguous to click. When ``existing`` and ``append_per_arm`` are provided,
-    all existing entries and IDs are preserved verbatim and ``append_per_arm``
-    new closed-gripper frames per arm are appended.
+    By default restricts newly selected frames to closed-gripper
+    (``gripper <= max_gripper_pos``) and slow-moving (``speed <= max_speed_mps``)
+    frames so the fingertip midpoint is sharp and unaffected by motion blur or
+    camera/state timing offset. When ``existing`` and ``append_per_arm`` are
+    provided, all existing entries and IDs are preserved verbatim (and still serve
+    as FPS seeds) while ``append_per_arm`` new frames are appended for each arm in
+    ``arms`` (or all arms when ``arms`` is ``None``).
 
     Args:
         dataset: Open ``DatasetView``.
@@ -464,6 +536,9 @@ def select_calib_frames(
         episodes: Optional subset of episodes to sample from (default all episodes).
         max_gripper_pos: Maximum allowed gripper opening for newly selected frames
             (default ``0.05``; pass ``None`` to disable filtering).
+        max_speed_mps: Maximum allowed TCP linear speed in m/s for newly selected
+            frames (default ``0.03``; pass ``None`` to disable filtering).
+        arms: Optional subset of arm names to add new frames for (default all arms).
 
     Returns:
         JSON-serializable dictionary matching the ``frames.json`` v1 schema.
@@ -476,7 +551,7 @@ def select_calib_frames(
         if existing.get("version") != CALIB_SCHEMA_VERSION:
             raise ValueError(f"Unsupported existing frames version: {existing.get('version')!r}")
         camera = str(existing.get("camera", camera))
-        existing_frames = [dict(item) for item in existing.get("frames", [])]
+        existing_frames = [copy.deepcopy(dict(item)) for item in existing.get("frames", [])]
         to_pick = append_per_arm
     else:
         if count_per_arm < 1:
@@ -484,8 +559,10 @@ def select_calib_frames(
         existing_frames = []
         to_pick = count_per_arm
 
-    if max_gripper_pos is not None and max_gripper_pos < 0.0:
+    if max_gripper_pos is not None and (math.isnan(max_gripper_pos) or max_gripper_pos < 0.0):
         raise ValueError(f"max_gripper_pos must be non-negative, got {max_gripper_pos}")
+    if max_speed_mps is not None and (math.isnan(max_speed_mps) or max_speed_mps < 0.0):
+        raise ValueError(f"max_speed_mps must be non-negative, got {max_speed_mps}")
 
     width, height = dataset.camera_image_size(camera)
     if hasattr(dataset, "load_arm_calib_table"):
@@ -496,11 +573,30 @@ def select_calib_frames(
         ep_indices, frame_indices, tcp_by_arm = dataset.load_arm_tcp_table(episodes=episodes)
         gripper_by_arm = {}
 
+    available_arms = list(tcp_by_arm.keys())
+    if arms is not None:
+        requested_arms: list[str] = []
+        for name in arms:
+            if name not in requested_arms:
+                requested_arms.append(name)
+        if not requested_arms:
+            raise ValueError("arms must not be empty")
+        unknown = [name for name in requested_arms if name not in tcp_by_arm]
+        if unknown:
+            raise ValueError(f"Unknown arm(s): {unknown}; available arms: {available_arms}")
+        target_arms = requested_arms
+    else:
+        target_arms = available_arms
+
+    fps = float(dataset.fps)
     frames_out: list[dict[str, Any]] = list(existing_frames)
-    for arm_name, tcps in tcp_by_arm.items():
+    for arm_name in target_arms:
+        tcps = tcp_by_arm[arm_name]
         if len(tcps) == 0:
             continue
         features = _tcp_pose_features(tcps)
+        speeds = _compute_tcp_speeds_mps(ep_indices, frame_indices, tcps[:, 0:3], fps=fps)
+
         arm_existing = [item for item in existing_frames if item.get("arm") == arm_name]
         existing_pairs = {
             (int(item["episode_index"]), int(item["frame_index"])) for item in arm_existing
@@ -512,13 +608,20 @@ def select_calib_frames(
             ],
             dtype=bool,
         )
+        active_filters: list[str] = []
         if max_gripper_pos is not None and arm_name in gripper_by_arm:
             excluded |= gripper_by_arm[arm_name] > max_gripper_pos
-            if np.all(excluded):
-                raise ValueError(
-                    f"No eligible closed-gripper frames for arm {arm_name!r} with "
-                    f"gripper <= {max_gripper_pos:g}; adjust --max-gripper if needed."
-                )
+            active_filters.append(f"gripper <= {max_gripper_pos:g}")
+        if max_speed_mps is not None:
+            excluded |= np.isnan(speeds) | (speeds > max_speed_mps)
+            active_filters.append(f"speed <= {max_speed_mps:g} m/s")
+
+        if np.all(excluded):
+            filter_desc = " and ".join(active_filters) if active_filters else "current filters"
+            raise ValueError(
+                f"No eligible frames for arm {arm_name!r} with {filter_desc}; "
+                "adjust --max-speed or --max-gripper if needed."
+            )
 
         seed_feats: np.ndarray | None = None
         if arm_existing:
@@ -533,6 +636,7 @@ def select_calib_frames(
         )
         next_num = _next_arm_frame_index(existing_frames, arm_name)
         for offset_i, row_idx in enumerate(chosen):
+            speed_val = float(speeds[row_idx])
             frames_out.append(
                 {
                     "id": f"{arm_name}-{next_num + offset_i:03d}",
@@ -540,6 +644,7 @@ def select_calib_frames(
                     "episode_index": int(ep_indices[row_idx]),
                     "frame_index": int(frame_indices[row_idx]),
                     "tcp": [float(v) for v in tcps[row_idx]],
+                    "speed_mps": None if math.isnan(speed_val) else round(speed_val, 4),
                 }
             )
 

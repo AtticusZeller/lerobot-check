@@ -203,6 +203,7 @@ def test_select_calib_frames_fps_and_append_preserves_ids() -> None:
     class _FakeDataset:
         repo_id = "Xense/demo"
         revision = "abc123"
+        fps = 30.0
 
         def camera_image_size(self, camera_key: str) -> tuple[int, int]:
             assert camera_key == "observation.images.head"
@@ -212,7 +213,7 @@ def test_select_calib_frames_fps_and_append_preserves_ids() -> None:
             return ep_idx, fr_idx, tcp_by_arm
 
     ds = _FakeDataset()
-    initial = select_calib_frames(ds, count_per_arm=5)  # type: ignore[arg-type]
+    initial = select_calib_frames(ds, count_per_arm=5, max_speed_mps=None)  # type: ignore[arg-type]
     assert initial["version"] == 1
     assert initial["image_size"] == [640, 480]
     assert len(initial["frames"]) == 10
@@ -225,6 +226,7 @@ def test_select_calib_frames_fps_and_append_preserves_ids() -> None:
         ds,  # type: ignore[arg-type]
         existing=initial,
         append_per_arm=3,
+        max_speed_mps=None,
     )
     assert len(appended["frames"]) == 16
     # First 10 entries and their IDs remain completely unchanged.
@@ -377,9 +379,9 @@ def test_calib_frames_cli_refuses_existing_without_overwrite(tmp_path, capsys, m
     tcps = {
         "left": np.array(
             [
-                [0.90, -0.10, -0.30, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-                [1.00, -0.10, -0.25, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-                [1.10, -0.15, -0.20, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                [0.9000, -0.10, -0.30, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                [0.9005, -0.10, -0.30, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+                [0.9010, -0.10, -0.30, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
             ],
             dtype=np.float64,
         )
@@ -390,6 +392,7 @@ def test_calib_frames_cli_refuses_existing_without_overwrite(tmp_path, capsys, m
             self.repo_id = repo_id or "Xense/demo_ds"
             self.revision = revision or "local"
             self.total_episodes = 1
+            self.fps = 30.0
 
         def camera_image_size(self, camera_key: str) -> tuple[int, int]:
             return (640, 480)
@@ -443,17 +446,20 @@ def test_select_calib_frames_filters_open_grippers() -> None:
     ep_idx = np.zeros(20, dtype=np.int64)
     fr_idx = np.arange(20, dtype=np.int64)
     # Frames 0..9 have open grippers (0.20..1.00) with extreme TCP positions that naive FPS
-    # would pick first; frames 10..19 have closed grippers (0.00..0.04).
+    # would pick first; frames 10..19 have closed grippers (0.00..0.04) moving slowly (0.015 m/s).
     tcps = np.zeros((20, 9), dtype=np.float64)
     for i in range(20):
-        scale = 5.0 if i < 10 else 0.05
-        tcps[i, 0:3] = [1.0 + i * scale, 0.0, -0.3]
+        if i < 10:
+            tcps[i, 0:3] = [1.0 + i * 5.0, 0.0, -0.3]
+        else:
+            tcps[i, 0:3] = [1.0 + (i - 10) * 0.0005, 0.0, -0.3]
         tcps[i, 3:9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
     grippers = np.array([0.2 + 0.08 * i for i in range(10)] + [0.004 * (i + 1) for i in range(10)])
 
     class _FakeCalibDataset:
         repo_id = "Xense/grip_test"
         revision = "rev1"
+        fps = 30.0
 
         def camera_image_size(self, camera_key: str) -> tuple[int, int]:
             return (640, 480)
@@ -495,7 +501,7 @@ def test_select_calib_frames_filters_open_grippers() -> None:
     assert all(grippers[f] <= 0.05 for f in new_frames)
 
     # Error clearly when threshold excludes all frames.
-    with pytest.raises(ValueError, match="No eligible closed-gripper frames"):
+    with pytest.raises(ValueError, match="No eligible frames for arm 'right'"):
         select_calib_frames(ds, count_per_arm=2, max_gripper_pos=0.0)  # type: ignore[arg-type]
 
 
@@ -593,3 +599,294 @@ def test_robust_calibration_flags_outliers_and_recovers_pose() -> None:
     assert float(np.linalg.norm(offset_est - offset_true) * 1000.0) < 5.0
     assert float(np.linalg.norm(T_est[:3, 3] - T_clean[:3, 3]) * 1000.0) < 2.0
     assert float(np.linalg.norm(offset_est - offset_clean) * 1000.0) < 2.0
+
+
+def test_select_calib_frames_speed_filter_and_disable() -> None:
+    import pytest
+
+    fps = 30.0
+    # Episode 0: 8 fast frames (0.30 m/s = 0.01 m/frame) at extreme x=2.0..2.07.
+    # Episode 1: 8 slow frames (0.015 m/s = 0.0005 m/frame) at x=0.90..0.9035.
+    # Episode 2: 1-frame episode (speed is NaN -> excluded when speed filter is active).
+    ep_idx = np.array([0] * 8 + [1] * 8 + [2], dtype=np.int64)
+    fr_idx = np.array(list(range(8)) + list(range(8)) + [0], dtype=np.int64)
+    tcps = np.zeros((17, 9), dtype=np.float64)
+    tcps[:, 3:9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+    for i in range(8):
+        tcps[i, 0:3] = [2.0 + i * 0.01, 0.0, -0.2]
+    for i in range(8):
+        tcps[8 + i, 0:3] = [0.90 + i * 0.0005, 0.1, -0.3]
+    tcps[16, 0:3] = [9.0, 9.0, 9.0]  # extreme single-frame episode
+    grippers = np.full(17, 0.01, dtype=np.float64)
+
+    class _FakeSpeedDataset:
+        repo_id = "Xense/speed_test"
+        revision = "rev1"
+        fps = 30.0
+
+        def camera_image_size(self, camera_key: str) -> tuple[int, int]:
+            return (640, 480)
+
+        def load_arm_calib_table(self, episodes=None):
+            return ep_idx, fr_idx, {"left": tcps}, {"left": grippers}
+
+    ds = _FakeSpeedDataset()
+    slow_only = select_calib_frames(ds, count_per_arm=5)  # type: ignore[arg-type]
+    assert len(slow_only["frames"]) == 5
+    for item in slow_only["frames"]:
+        assert item["episode_index"] == 1
+        assert "speed_mps" in item
+        assert item["speed_mps"] <= 0.03
+        # Constant velocity 0.0005 m/frame * 30 fps = 0.015 m/s everywhere in episode 1
+        # (both one-sided edges and central interior differences).
+        assert abs(item["speed_mps"] - (0.0005 * fps)) < 1e-4
+
+    # Disabling the speed filter allows picking fast / 1-frame extreme poses.
+    unfiltered = select_calib_frames(
+        ds,  # type: ignore[arg-type]
+        count_per_arm=5,
+        max_speed_mps=None,
+    )
+    unfiltered_eps = {item["episode_index"] for item in unfiltered["frames"]}
+    assert 0 in unfiltered_eps or 2 in unfiltered_eps
+    for item in unfiltered["frames"]:
+        if item["episode_index"] == 0:
+            assert abs(item["speed_mps"] - (0.01 * fps)) < 1e-4
+        elif item["episode_index"] == 2:
+            assert item["speed_mps"] is None
+
+    with pytest.raises(ValueError, match="max_speed_mps must be non-negative"):
+        select_calib_frames(ds, count_per_arm=2, max_speed_mps=-0.01)  # type: ignore[arg-type]
+
+
+def test_speed_filter_does_not_span_episode_boundaries() -> None:
+    # Two consecutive episodes with a huge 5.0 m jump across the episode boundary.
+    # Episode 0: stationary at x=0.0 (speed = 0.0 m/s).
+    # Episode 1: slow linear motion along y at 0.0004 m/frame * 25 fps = 0.01 m/s starting at x=5.0.
+    ep_idx = np.array([0, 0, 0, 0, 1, 1, 1, 1], dtype=np.int64)
+    fr_idx = np.array([0, 1, 2, 3, 0, 1, 2, 3], dtype=np.int64)
+    tcps = np.zeros((8, 9), dtype=np.float64)
+    tcps[:, 3:9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+    for i in range(4):
+        tcps[i, 0:3] = [0.0, 0.0, -0.3]
+    for i in range(4):
+        tcps[4 + i, 0:3] = [5.0, i * 0.0004, -0.3]
+    grippers = np.zeros(8, dtype=np.float64)
+
+    class _FakeBoundaryDataset:
+        repo_id = "Xense/ep_boundary"
+        revision = "rev1"
+        fps = 25.0
+
+        def camera_image_size(self, camera_key: str) -> tuple[int, int]:
+            return (640, 480)
+
+        def load_arm_calib_table(self, episodes=None):
+            return ep_idx, fr_idx, {"right": tcps}, {"right": grippers}
+
+    res = select_calib_frames(
+        _FakeBoundaryDataset(),  # type: ignore[arg-type]
+        count_per_arm=8,
+        max_speed_mps=0.03,
+    )
+    by_key = {(f["episode_index"], f["frame_index"]): f["speed_mps"] for f in res["frames"]}
+    assert len(by_key) == 8
+    # Boundary frames (ep 0 frame 3 and ep 1 frame 0) must NOT see the 5 m jump.
+    assert by_key[(0, 3)] == 0.0
+    assert abs(by_key[(1, 0)] - 0.01) < 1e-4
+
+
+def test_calib_frames_cli_per_arm_append_and_validation(tmp_path, capsys, monkeypatch) -> None:
+    import json
+
+    import pytest
+
+    from lerobot_check import cli
+
+    lerobot_root = tmp_path / "lerobot"
+    ds_root = lerobot_root / "Xense" / "arm_append_ds"
+    ds_root.mkdir(parents=True)
+    frames_path = tmp_path / "frames.json"
+
+    ep_idx = np.array([0] * 6, dtype=np.int64)
+    fr_idx = np.arange(6, dtype=np.int64)
+    # Slow closed-gripper frames (0.0005 m at 30 fps => 0.015 m/s) except fast frame 5.
+    left_tcps = np.zeros((6, 9), dtype=np.float64)
+    right_tcps = np.zeros((6, 9), dtype=np.float64)
+    for i in range(6):
+        left_tcps[i, 0:3] = [0.80 + i * 0.0005, -0.10, -0.30]
+        left_tcps[i, 3:9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+        right_tcps[i, 0:3] = [0.80 + i * 0.0005, 0.10, -0.30]
+        right_tcps[i, 3:9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+    left_tcps[5, 0] = 1.50  # fast jump at frame 5 (and affects frame 4 central diff)
+    grippers = {"left": np.full(6, 0.01), "right": np.full(6, 0.01)}
+
+    existing_entries = [
+        {
+            "id": "left-000",
+            "arm": "left",
+            "episode_index": 0,
+            "frame_index": 0,
+            "tcp": left_tcps[0].tolist(),
+            "skipped": True,
+        },
+        {
+            "id": "left-001",
+            "arm": "left",
+            "episode_index": 0,
+            "frame_index": 1,
+            "tcp": left_tcps[1].tolist(),
+            "pixel": [123.5, 240.0],
+        },
+        {
+            "id": "right-000",
+            "arm": "right",
+            "episode_index": 0,
+            "frame_index": 0,
+            "tcp": right_tcps[0].tolist(),
+            "pixel": [410.0, 220.0],
+        },
+    ]
+    existing_payload = {
+        "version": 1,
+        "repo_id": "Xense/arm_append_ds",
+        "revision": "rev1",
+        "camera": "observation.images.head",
+        "image_size": [640, 480],
+        "frames": existing_entries,
+    }
+    existing_json_entries = [json.dumps(e, sort_keys=False) for e in existing_entries]
+    frames_path.write_text(json.dumps(existing_payload, indent=2), encoding="utf-8")
+
+    class _FakeArmDataset:
+        def __init__(self, root, *, repo_id=None, revision=None) -> None:
+            self.repo_id = repo_id or "Xense/arm_append_ds"
+            self.revision = revision or "rev1"
+            self.total_episodes = 1
+            self.fps = 30.0
+
+        def camera_image_size(self, camera_key: str) -> tuple[int, int]:
+            return (640, 480)
+
+        def load_arm_calib_table(self, episodes=None):
+            return ep_idx, fr_idx, {"left": left_tcps, "right": right_tcps}, grippers
+
+    monkeypatch.setattr(cli, "DatasetView", _FakeArmDataset)
+
+    # --arms without --append is an error.
+    rc_no_append = cli.main(
+        [
+            "calib-frames",
+            "--dataset-root",
+            str(ds_root),
+            "--arms",
+            "left",
+            "--overwrite",
+            "-o",
+            str(frames_path),
+        ]
+    )
+    assert rc_no_append == 1
+    assert "--arms is only allowed with --append" in capsys.readouterr().err
+
+    # --max-speed and --no-speed-filter are mutually exclusive.
+    with pytest.raises(SystemExit) as exc_info:
+        cli.main(
+            [
+                "calib-frames",
+                "--dataset-root",
+                str(ds_root),
+                "--max-speed",
+                "0.05",
+                "--no-speed-filter",
+                "-o",
+                str(frames_path),
+            ]
+        )
+    assert exc_info.value.code == 2
+    capsys.readouterr()
+
+    # Unknown arm reports available arms.
+    rc_unknown = cli.main(
+        [
+            "calib-frames",
+            "--dataset-root",
+            str(ds_root),
+            "--append",
+            "1",
+            "--arms",
+            "middle",
+            "-o",
+            str(frames_path),
+        ]
+    )
+    assert rc_unknown == 1
+    err_unknown = capsys.readouterr().err
+    assert "Unknown arm" in err_unknown
+    assert "left" in err_unknown and "right" in err_unknown
+
+    # Valid --append 1 --arms left adds exactly left-002 and preserves existing entries verbatim.
+    rc_append = cli.main(
+        [
+            "calib-frames",
+            "--dataset-root",
+            str(ds_root),
+            "--append",
+            "1",
+            "--arms",
+            "left",
+            "-o",
+            str(frames_path),
+        ]
+    )
+    assert rc_append == 0
+    out_append = capsys.readouterr().out
+    assert "left=+1" in out_append
+    updated = json.loads(frames_path.read_text(encoding="utf-8"))
+    assert len(updated["frames"]) == 4
+    assert [json.dumps(e, sort_keys=False) for e in updated["frames"][:3]] == existing_json_entries
+    added = updated["frames"][3]
+    assert added["id"] == "left-002"
+    assert added["arm"] == "left"
+    assert added["frame_index"] in (2, 3)
+    assert abs(added["speed_mps"] - 0.015) < 1e-4
+
+    # Requesting more frames than eligible warns on stderr and exits 0 with available frames.
+    rc_partial = cli.main(
+        [
+            "calib-frames",
+            "--dataset-root",
+            str(ds_root),
+            "--append",
+            "5",
+            "--arms",
+            "left",
+            "-o",
+            str(frames_path),
+        ]
+    )
+    assert rc_partial == 0
+    captured = capsys.readouterr()
+    assert "Warning:" in captured.err
+    assert "requested 5" in captured.err
+    assert "left=+1" in captured.out
+    assert len(json.loads(frames_path.read_text(encoding="utf-8"))["frames"]) == 5
+
+    # When zero eligible frames remain, error names arm and active filters.
+    rc_none = cli.main(
+        [
+            "calib-frames",
+            "--dataset-root",
+            str(ds_root),
+            "--append",
+            "1",
+            "--arms",
+            "left",
+            "-o",
+            str(frames_path),
+        ]
+    )
+    assert rc_none == 1
+    err_none = capsys.readouterr().err
+    assert "left" in err_none
+    assert "--max-speed" in err_none and "--max-gripper" in err_none

@@ -21,6 +21,7 @@ from lerobot_check.calib import (
     DEFAULT_CALIB_CAMERA,
     DEFAULT_FRAMES_PER_ARM,
     DEFAULT_MAX_GRIPPER_POS,
+    DEFAULT_MAX_SPEED_MPS,
     HeadCalibration,
     calibrate_head_camera,
     compare_arm_extrinsics,
@@ -767,6 +768,28 @@ def _cmd_calib_frames(args: argparse.Namespace) -> int:
         )
         return 1
 
+    parsed_arms: list[str] | None = None
+    if args.arms is not None:
+        if args.append is None:
+            print(
+                "[calib-frames] --arms is only allowed with --append.",
+                file=sys.stderr,
+            )
+            return 1
+        parsed_arms = [part.strip() for part in args.arms.split(",") if part.strip()]
+        if not parsed_arms:
+            print(
+                "[calib-frames] --arms must specify at least one arm name.",
+                file=sys.stderr,
+            )
+            return 1
+
+    max_speed_mps = (
+        None
+        if args.no_speed_filter
+        else (DEFAULT_MAX_SPEED_MPS if args.max_speed is None else args.max_speed)
+    )
+
     try:
         root = resolve_dataset_root(args.dataset_root, args.repo_id)
     except (OSError, ValueError) as exc:
@@ -816,6 +839,12 @@ def _cmd_calib_frames(args: argparse.Namespace) -> int:
             print(f"[episodes] {exc}", file=sys.stderr)
             return 1
 
+    before_per_arm: dict[str, int] = {}
+    if existing is not None:
+        for item in existing.get("frames", []):
+            arm = str(item.get("arm", ""))
+            before_per_arm[arm] = before_per_arm.get(arm, 0) + 1
+
     try:
         payload = select_calib_frames(
             dataset,
@@ -825,6 +854,8 @@ def _cmd_calib_frames(args: argparse.Namespace) -> int:
             append_per_arm=args.append,
             episodes=episodes,
             max_gripper_pos=args.max_gripper,
+            max_speed_mps=max_speed_mps,
+            arms=parsed_arms,
         )
     except (KeyError, ValueError) as exc:
         print(f"[calib-frames] {exc}", file=sys.stderr)
@@ -835,8 +866,25 @@ def _cmd_calib_frames(args: argparse.Namespace) -> int:
     for item in payload["frames"]:
         arm = str(item["arm"])
         per_arm[arm] = per_arm.get(arm, 0) + 1
+
+    requested_count = args.append if args.append is not None else args.count
+    added_per_arm: dict[str, int] = {}
+    target_arm_list = (
+        list(dict.fromkeys(parsed_arms)) if parsed_arms is not None else sorted(per_arm)
+    )
+    for arm in target_arm_list:
+        added = per_arm.get(arm, 0) - before_per_arm.get(arm, 0)
+        added_per_arm[arm] = added
+        if added < requested_count:
+            print(
+                f"Warning: arm={arm!r} requested {requested_count} frame(s), "
+                f"only {added} eligible frame(s) available.",
+                file=sys.stderr,
+            )
+
     counts_str = ", ".join(f"{arm}={cnt}" for arm, cnt in sorted(per_arm.items()))
-    print(f"Wrote {out_path}: {len(payload['frames'])} frame(s) ({counts_str})")
+    added_str = ", ".join(f"{arm}=+{cnt}" for arm, cnt in added_per_arm.items())
+    print(f"Wrote {out_path}: {len(payload['frames'])} frame(s) ({counts_str}; added: {added_str})")
     return 0
 
 
@@ -1555,6 +1603,31 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Maximum gripper opening allowed for newly selected frames "
             f"(default: {DEFAULT_MAX_GRIPPER_POS:g}, closed fingertips)."
+        ),
+    )
+    speed_group = calib_frames_parser.add_mutually_exclusive_group()
+    speed_group.add_argument(
+        "--max-speed",
+        type=float,
+        default=None,
+        help=(
+            "Maximum TCP linear speed in m/s for newly selected frames "
+            f"(default: {DEFAULT_MAX_SPEED_MPS:g})."
+        ),
+    )
+    speed_group.add_argument(
+        "--no-speed-filter",
+        action="store_true",
+        default=False,
+        help="Disable TCP speed filtering (mutually exclusive with --max-speed).",
+    )
+    calib_frames_parser.add_argument(
+        "--arms",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated arm names to append frames for (e.g. 'left' or 'left,right'). "
+            "Allowed only with --append."
         ),
     )
     calib_frames_parser.add_argument(
