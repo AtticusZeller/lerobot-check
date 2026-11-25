@@ -12,13 +12,22 @@ from PIL import Image
 from lerobot_check.cli import main
 from lerobot_check.render import (
     _BOUNDARY_BORDER,
+    _BOUNDARY_CAM_GAP_PX,
+    _BOUNDARY_CELL_GAP_PX,
+    _BOUNDARY_LABEL_HEIGHT,
+    _HUMAN_MARKER_BG,
     DEFAULT_CAMERAS,
+    BoundaryCell,
+    compose_boundary_sheets,
     parse_boundary_spec,
+    parse_crop_specs,
+    parse_episode_spec,
     parse_frame_spec,
     render_contact_sheet,
     resolve_exemplar_cameras,
     resolve_render_cameras,
     select_boundary_exemplars,
+    select_end_frames,
     select_frames_around_events,
     select_frames_in_window,
 )
@@ -430,4 +439,214 @@ def test_cli_exemplars_no_human_exemplars_exits_zero_with_message(
     assert exit_code == 0
     assert "No human exemplars found" in captured.out
     assert "stage_a:stage_b" in captured.out
+    assert not out_dir.exists()
+
+
+def test_select_end_frames_offset_clamping_filter_missing_and_annotator() -> None:
+    rows = [
+        _row(10, "stage_a", 0, 100, annotator="human"),
+        _row(10, "stage_b", 100, 250, annotator="human"),
+        _row(10, "stage_c", 250, 400, annotator="human"),
+        _row(2, "stage_a", 0, 80, annotator="agent"),
+        _row(2, "stage_b", 80, 180, annotator="agent"),
+        _row(2, "stage_c", 180, 300, annotator="agent"),
+        # Episode 5 omits stage_b (supplement episode).
+        _row(5, "stage_a", 0, 120, annotator="converted"),
+        _row(5, "stage_c", 120, 200, annotator="converted"),
+    ]
+
+    default = select_end_frames(rows, "stage_b")
+    assert [(item.episode_index, item.frame, item.annotator) for item in default] == [
+        (2, 179, "agent"),
+        (10, 249, "human"),
+    ]
+
+    clamped_low = select_end_frames(rows, "stage_b", offset=-500)
+    assert [(item.episode_index, item.frame) for item in clamped_low] == [
+        (2, 80),
+        (10, 100),
+    ]
+
+    clamped_high = select_end_frames(rows, "stage_b", offset=500)
+    assert [(item.episode_index, item.frame) for item in clamped_high] == [
+        (2, 299),
+        (10, 399),
+    ]
+
+    clamped_explicit_len = select_end_frames(
+        rows,
+        "stage_b",
+        offset=500,
+        episode_lengths={2: 310, 10: 420},
+    )
+    assert [(item.episode_index, item.frame) for item in clamped_explicit_len] == [
+        (2, 309),
+        (10, 419),
+    ]
+
+    filtered = select_end_frames(rows, "stage_a", episodes={5, 10})
+    assert [(item.episode_index, item.frame, item.annotator) for item in filtered] == [
+        (5, 119, "converted"),
+        (10, 99, "human"),
+    ]
+
+
+def test_parse_episode_spec_valid_and_errors() -> None:
+    assert parse_episode_spec("5,9,20-28") == [5, 9, 20, 21, 22, 23, 24, 25, 26, 27, 28]
+    assert parse_episode_spec(" 10, 2-4, 4, 0-0 ") == [0, 2, 3, 4, 10]
+
+    for bad in ("", "   ", "1,,2", "28-20", "-1", "1-2-3", "abc", "1:5", "2-"):
+        with pytest.raises(ValueError):
+            parse_episode_spec(bad)
+
+
+def test_parse_crop_specs_valid_and_errors() -> None:
+    assert parse_crop_specs(None) == {}
+    assert parse_crop_specs([]) == {}
+    assert parse_crop_specs(
+        ["head=90,40,550,360", "observation.images.left_wrist=0, 10, 320, 240"]
+    ) == {
+        "head": (90, 40, 550, 360),
+        "left_wrist": (0, 10, 320, 240),
+    }
+
+    for bad in (
+        "head:90,40,550,360",
+        "=0,0,10,10",
+        "head=0,0,10",
+        "head=0,0,10,10,20",
+        "head=0,0,10.5,20",
+        "head=-1,0,10,10",
+        "head=10,0,10,20",
+        "head=20,0,10,20",
+        "head=0,20,10,20",
+        "head=0,30,10,20",
+    ):
+        with pytest.raises(ValueError):
+            parse_crop_specs([bad])
+
+
+def test_compose_boundary_sheets_pagination_dimensions_and_human_marker() -> None:
+    def _make_cell(ep: int, annotator: str) -> BoundaryCell:
+        return BoundaryCell(
+            episode_index=ep,
+            frame=100 + ep,
+            annotator=annotator,  # type: ignore[arg-type]
+            images=(
+                Image.new("RGB", (120, 80), color=(40, 60, 80)),
+                Image.new("RGB", (100, 80), color=(80, 60, 40)),
+            ),
+        )
+
+    cells = [_make_cell(i, "human" if i == 0 else "agent") for i in range(25)]
+
+    paged = compose_boundary_sheets(cells, columns=2, per_page=12)
+    assert len(paged) == 3
+
+    expected_cell_w = 120 + 100 + _BOUNDARY_CAM_GAP_PX
+    expected_cell_h = _BOUNDARY_LABEL_HEIGHT + 80
+    assert paged[0].size == (
+        2 * expected_cell_w + _BOUNDARY_CELL_GAP_PX,
+        6 * expected_cell_h + 5 * _BOUNDARY_CELL_GAP_PX,
+    )
+    assert paged[2].size == (
+        2 * expected_cell_w + _BOUNDARY_CELL_GAP_PX,
+        expected_cell_h,
+    )
+
+    single = compose_boundary_sheets(cells, columns=4, per_page=0)
+    assert len(single) == 1
+    assert single[0].size == (
+        4 * expected_cell_w + 3 * _BOUNDARY_CELL_GAP_PX,
+        7 * expected_cell_h + 6 * _BOUNDARY_CELL_GAP_PX,
+    )
+
+    arr = np.asarray(paged[0])
+    marker_rgb = np.array(_HUMAN_MARKER_BG, dtype=np.uint8)
+    human_label_bar = arr[0:_BOUNDARY_LABEL_HEIGHT, 0:expected_cell_w]
+    agent_x0 = expected_cell_w + _BOUNDARY_CELL_GAP_PX
+    agent_label_bar = arr[0:_BOUNDARY_LABEL_HEIGHT, agent_x0 : agent_x0 + expected_cell_w]
+    assert np.any(np.all(human_label_bar == marker_rgb, axis=-1))
+    assert not np.any(np.all(agent_label_bar == marker_rgb, axis=-1))
+
+    resized = compose_boundary_sheets(cells[:2], columns=2, per_page=0, tile_height=40)
+    resized_cell_w = 60 + 50 + _BOUNDARY_CAM_GAP_PX
+    resized_cell_h = _BOUNDARY_LABEL_HEIGHT + 40
+    assert resized[0].size == (2 * resized_cell_w + _BOUNDARY_CELL_GAP_PX, resized_cell_h)
+
+
+def test_cli_boundary_sheet_rejects_last_and_unknown_subtask(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ds_root = tmp_path / "Xense" / "demo_ds"
+    ds_root.mkdir(parents=True)
+    spec_path = tmp_path / "spec.yaml"
+    spec_path.write_text(
+        "name: demo\nsubtasks:\n"
+        "  - name: stage_a\n    prompt: A\n"
+        "  - name: stage_b\n    prompt: B\n"
+        "  - name: stage_c\n    prompt: C\n",
+        encoding="utf-8",
+    )
+    ann_path = tmp_path / "annotations.csv"
+    save_annotations(
+        [
+            _row(0, "stage_a", 0, 50),
+            _row(0, "stage_b", 50, 80),
+            _row(0, "stage_c", 80, 100),
+        ],
+        ann_path,
+    )
+
+    class _FakeDataset:
+        def __init__(self, root: Path, repo_id: str | None = None, revision: str | None = None):
+            self.root = root
+            self.repo_id = repo_id or "Xense/demo_ds"
+            self.revision = revision or "rev1"
+            self.fps = 30.0
+            self.episode_lengths = {0: 100}
+
+    monkeypatch.setattr("lerobot_check.cli.DatasetView", _FakeDataset)
+
+    out_dir = tmp_path / "out_boundary"
+    exit_last = main(
+        [
+            "boundary-sheet",
+            "--dataset-root",
+            str(ds_root),
+            "--annotations",
+            str(ann_path),
+            "--task-spec",
+            str(spec_path),
+            "--subtasks",
+            "stage_c",
+            "-o",
+            str(out_dir),
+        ]
+    )
+    captured_last = capsys.readouterr()
+    assert exit_last != 0
+    assert "last subtask" in captured_last.err
+    assert not out_dir.exists()
+
+    exit_unknown = main(
+        [
+            "boundary-sheet",
+            "--dataset-root",
+            str(ds_root),
+            "--annotations",
+            str(ann_path),
+            "--task-spec",
+            str(spec_path),
+            "--subtasks",
+            "nonexistent",
+            "-o",
+            str(out_dir),
+        ]
+    )
+    captured_unknown = capsys.readouterr()
+    assert exit_unknown != 0
+    assert "Unknown subtask" in captured_unknown.err
     assert not out_dir.exists()

@@ -12,7 +12,7 @@ import av
 from PIL import Image, ImageDraw, ImageFont
 
 from lerobot_check.dataset import DatasetView, EpisodeRecord
-from lerobot_check.schema import AnnotationRow, TaskSpec
+from lerobot_check.schema import AnnotationRow, Annotator, TaskSpec
 
 DEFAULT_CAMERAS: tuple[str, ...] = (
     "observation.images.head",
@@ -31,6 +31,11 @@ _BOUNDARY_BG = (220, 38, 38)
 _BOUNDARY_BORDER = (239, 68, 68)
 _BOUNDARY_BORDER_PX = 4
 _TEXT_COLOR = (255, 255, 255)
+_BOUNDARY_LABEL_HEIGHT = 26
+_BOUNDARY_CAM_GAP_PX = 2
+_BOUNDARY_CELL_GAP_PX = 6
+_HUMAN_MARKER_BG = (22, 163, 74)
+_HUMAN_MARKER_FG = (255, 255, 255)
 
 
 @dataclass(frozen=True)
@@ -941,3 +946,464 @@ def render_boundary_exemplars(
         )
         results.append((ex, written[0]))
     return results
+
+
+@dataclass(frozen=True)
+class EndFrame:
+    """Selected boundary check frame for one episode."""
+
+    episode_index: int
+    frame: int
+    annotator: Annotator
+
+
+@dataclass(frozen=True)
+class BoundaryCell:
+    """Decoded camera images and metadata for one episode cell on a boundary sheet."""
+
+    episode_index: int
+    frame: int
+    annotator: Annotator
+    images: tuple[Image.Image, ...]
+
+
+def parse_episode_spec(spec: str) -> list[int]:
+    """Parse an episode filter specification with inclusive ranges, e.g. ``5,9,20-28``.
+
+    Args:
+        spec: Comma-separated non-negative episode indices or ``start-end`` inclusive ranges.
+
+    Returns:
+        Sorted list of unique episode indices.
+
+    Raises:
+        ValueError: If ``spec`` is empty or contains malformed or reversed tokens.
+    """
+    if not spec or not spec.strip():
+        raise ValueError("Episode specification must not be empty.")
+
+    episodes: set[int] = set()
+    for raw_token in spec.split(","):
+        token = raw_token.strip()
+        if not token:
+            raise ValueError(f"Empty token in episode specification: {spec!r}")
+        if "-" in token:
+            parts = [part.strip() for part in token.split("-")]
+            if len(parts) != 2 or not parts[0].isdigit() or not parts[1].isdigit():
+                raise ValueError(
+                    f"Invalid episode range {token!r}; expected non-negative 'start-end'."
+                )
+            start_ep, end_ep = int(parts[0]), int(parts[1])
+            if start_ep > end_ep:
+                raise ValueError(f"Episode range start > end in {token!r}.")
+            episodes.update(range(start_ep, end_ep + 1))
+        else:
+            if not token.isdigit():
+                raise ValueError(
+                    f"Invalid episode index {token!r}; expected a non-negative integer."
+                )
+            episodes.add(int(token))
+
+    return sorted(episodes)
+
+
+def parse_crop_specs(specs: Sequence[str] | None) -> dict[str, tuple[int, int, int, int]]:
+    """Parse repeatable ``CAM=x0,y0,x1,y1`` crop specifications.
+
+    Camera names are normalized to short names (stripping ``observation.images.``)
+    so crops match whether the user passes short names or full feature keys.
+
+    Args:
+        specs: Optional sequence of ``CAM=x0,y0,x1,y1`` strings.
+
+    Returns:
+        Mapping ``short_camera_name -> (x0, y0, x1, y1)``.
+
+    Raises:
+        ValueError: If syntax is invalid, coordinates are non-integer or negative,
+            or ``x0 < x1`` / ``y0 < y1`` is violated.
+    """
+    if not specs:
+        return {}
+
+    crops: dict[str, tuple[int, int, int, int]] = {}
+    for raw in specs:
+        if "=" not in raw:
+            raise ValueError(f"Invalid crop spec {raw!r}; expected 'CAM=x0,y0,x1,y1'.")
+        cam_raw, coords_raw = raw.split("=", 1)
+        cam = _short_camera_name(cam_raw.strip())
+        if not cam:
+            raise ValueError(f"Empty camera name in crop spec {raw!r}.")
+
+        parts = [part.strip() for part in coords_raw.split(",")]
+        if len(parts) != 4:
+            raise ValueError(
+                f"Invalid crop box in {raw!r}; expected four comma-separated integers x0,y0,x1,y1."
+            )
+        try:
+            x0, y0, x1, y1 = (int(part) for part in parts)
+        except ValueError as exc:
+            raise ValueError(f"Non-integer crop coordinate in {raw!r}.") from exc
+
+        if x0 < 0 or y0 < 0:
+            raise ValueError(f"Crop coordinates must be non-negative in {raw!r}.")
+        if not (x0 < x1 and y0 < y1):
+            raise ValueError(f"Crop box must satisfy x0 < x1 and y0 < y1 in {raw!r}.")
+        crops[cam] = (x0, y0, x1, y1)
+
+    return crops
+
+
+def resolve_boundary_subtasks(
+    task_spec: TaskSpec,
+    requested: Sequence[str] | None = None,
+) -> list[tuple[int, str]]:
+    """Resolve and validate target subtasks for ``boundary-sheet``.
+
+    Args:
+        task_spec: Task specification defining subtask order.
+        requested: Optional requested subtask names. When omitted, selects every
+            subtask except the last one.
+
+    Returns:
+        Ordered list of ``(position_1based, subtask_name)`` pairs.
+
+    Raises:
+        ValueError: If any requested subtask is unknown, is the last subtask in the
+            spec, or if the spec has fewer than 2 subtasks.
+    """
+    if not task_spec.subtasks:
+        raise ValueError("Task spec defines no subtasks.")
+
+    last_name = task_spec.subtasks[-1].name
+    if requested is None:
+        if len(task_spec.subtasks) < 2:
+            raise ValueError(
+                f"Task spec only defines one subtask ({last_name!r}); "
+                "its end is the episode end and has no interior boundary."
+            )
+        return [(idx + 1, item.name) for idx, item in enumerate(task_spec.subtasks[:-1])]
+
+    index_map = task_spec.subtask_index
+    resolved: list[tuple[int, str]] = []
+    seen: set[str] = set()
+    for name in requested:
+        if name not in index_map:
+            valid = list(task_spec.subtask_names[:-1])
+            raise ValueError(
+                f"Unknown subtask {name!r}; expected one of {valid} "
+                f"(all spec subtasks: {list(task_spec.subtask_names)})."
+            )
+        if name == last_name:
+            raise ValueError(
+                f"Subtask {name!r} is the last subtask in the task spec; "
+                "its end is the episode end and cannot be rendered with boundary-sheet."
+            )
+        if name not in seen:
+            seen.add(name)
+            resolved.append((index_map[name] + 1, name))
+    return resolved
+
+
+def select_end_frames(
+    rows: Sequence[AnnotationRow],
+    subtask: str,
+    *,
+    offset: int = -1,
+    episodes: Collection[int] | None = None,
+    episode_lengths: Mapping[int, int] | None = None,
+) -> list[EndFrame]:
+    """Select one boundary check frame per episode for ``subtask`` in ascending episode order.
+
+    Computes ``row.end + offset`` clamped into ``[row.start, episode_length)``. When
+    ``episode_lengths`` is not provided, each episode's length is inferred from the
+    maximum ``end`` across that episode's rows. Episodes without ``subtask`` are skipped.
+
+    Args:
+        rows: Annotation rows from an annotation CSV.
+        subtask: Target subtask name.
+        offset: Frame offset relative to ``row.end`` (default ``-1``, the last frame).
+        episodes: Optional collection of episode indices to include.
+        episode_lengths: Optional mapping ``episode_index -> episode_length``.
+
+    Returns:
+        List of ``EndFrame`` records ordered by ascending ``episode_index``.
+    """
+    by_episode: dict[int, list[AnnotationRow]] = defaultdict(list)
+    for row in rows:
+        by_episode[row.episode_index].append(row)
+
+    episode_filter = set(episodes) if episodes is not None else None
+    selected: list[EndFrame] = []
+    for ep_idx in sorted(by_episode):
+        if episode_filter is not None and ep_idx not in episode_filter:
+            continue
+        ep_rows = by_episode[ep_idx]
+        target_row = next((row for row in ep_rows if row.subtask == subtask), None)
+        if target_row is None:
+            continue
+
+        if episode_lengths is not None and ep_idx in episode_lengths:
+            ep_length = episode_lengths[ep_idx]
+        else:
+            ep_length = max(row.end for row in ep_rows)
+        if ep_length <= 0:
+            raise ValueError(f"Episode {ep_idx} has non-positive length {ep_length}.")
+
+        frame = min(max(target_row.end + offset, target_row.start), ep_length - 1)
+        selected.append(
+            EndFrame(
+                episode_index=ep_idx,
+                frame=frame,
+                annotator=target_row.annotator,
+            )
+        )
+
+    return selected
+
+
+def _crop_and_resize_height(
+    image: Image.Image,
+    *,
+    crop: tuple[int, int, int, int] | None,
+    tile_height: int | None,
+) -> Image.Image:
+    rgb = image.convert("RGB")
+    if crop is not None:
+        x0, y0, x1, y1 = crop
+        w, h = rgb.size
+        cx1 = min(x1, w)
+        cy1 = min(y1, h)
+        if x0 >= cx1 or y0 >= cy1:
+            raise ValueError(f"Crop box {crop} falls outside image size {w}x{h}.")
+        rgb = rgb.crop((x0, y0, cx1, cy1))
+
+    if tile_height is not None:
+        if tile_height <= 0:
+            raise ValueError(f"tile_height must be positive, got {tile_height}.")
+        src_w, src_h = rgb.size
+        if src_h != tile_height:
+            new_w = max(1, round(src_w * tile_height / src_h))
+            rgb = rgb.resize((new_w, tile_height), Image.Resampling.BILINEAR)
+    return rgb
+
+
+def compose_boundary_sheets(
+    cells: Sequence[BoundaryCell],
+    *,
+    columns: int = 2,
+    per_page: int = 12,
+    tile_height: int | None = None,
+) -> list[Image.Image]:
+    """Compose episode boundary cells into one or more RGB contact-sheet images.
+
+    Each episode cell stacks a label bar (``ep<idx> f<frame>`` plus a coloured ``H``
+    badge when ``annotator == "human"``) above the episode's camera images placed
+    side by side.
+
+    Args:
+        cells: Ordered sequence of ``BoundaryCell`` items to tile.
+        columns: Number of episode cells per row (must be >= 1).
+        per_page: Maximum episode cells per page, or ``0`` to put all cells on one page.
+        tile_height: Optional height to resize every camera image to while preserving
+            aspect ratio. When ``None``, images keep their input height.
+
+    Returns:
+        List of composed RGB ``PIL.Image`` pages.
+
+    Raises:
+        ValueError: If layout parameters are invalid or a cell has no images.
+    """
+    if columns <= 0:
+        raise ValueError(f"columns must be positive, got {columns}.")
+    if per_page < 0:
+        raise ValueError(f"per_page must be >= 0, got {per_page}.")
+    if tile_height is not None and tile_height <= 0:
+        raise ValueError(f"tile_height must be positive, got {tile_height}.")
+    if not cells:
+        return []
+
+    prepared: list[tuple[BoundaryCell, tuple[Image.Image, ...]]] = []
+    max_cam_w = 0
+    max_cam_h = 0
+    for cell in cells:
+        if not cell.images:
+            raise ValueError(f"Episode {cell.episode_index} cell has no images.")
+        target_h = tile_height if tile_height is not None else cell.images[0].height
+        resized = tuple(
+            _crop_and_resize_height(img, crop=None, tile_height=target_h) for img in cell.images
+        )
+        cam_w = sum(im.width for im in resized) + max(0, len(resized) - 1) * _BOUNDARY_CAM_GAP_PX
+        cam_h = max(im.height for im in resized)
+        max_cam_w = max(max_cam_w, cam_w)
+        max_cam_h = max(max_cam_h, cam_h)
+        prepared.append((cell, resized))
+
+    cell_w = max_cam_w
+    cell_h = _BOUNDARY_LABEL_HEIGHT + max_cam_h
+
+    if per_page == 0:
+        pages = [prepared]
+    else:
+        pages = [prepared[i : i + per_page] for i in range(0, len(prepared), per_page)]
+
+    font = _load_font(14)
+    sheets: list[Image.Image] = []
+    for page_items in pages:
+        num_rows = math.ceil(len(page_items) / columns)
+        sheet_w = columns * cell_w + (columns - 1) * _BOUNDARY_CELL_GAP_PX
+        sheet_h = num_rows * cell_h + (num_rows - 1) * _BOUNDARY_CELL_GAP_PX
+        canvas = Image.new("RGB", (sheet_w, sheet_h), color=_BG_COLOR)
+        draw = ImageDraw.Draw(canvas)
+
+        for idx, (cell, imgs) in enumerate(page_items):
+            row_idx, col_idx = divmod(idx, columns)
+            x0 = col_idx * (cell_w + _BOUNDARY_CELL_GAP_PX)
+            y0 = row_idx * (cell_h + _BOUNDARY_CELL_GAP_PX)
+
+            draw.rectangle(
+                [(x0, y0), (x0 + cell_w - 1, y0 + _BOUNDARY_LABEL_HEIGHT - 1)],
+                fill=_HEADER_BG,
+            )
+
+            label = f"ep{cell.episode_index} f{cell.frame}"
+            bbox = draw.textbbox((0, 0), label, font=font)
+            text_w = bbox[2] - bbox[0]
+            text_h = bbox[3] - bbox[1]
+            text_x = x0 + 6
+            text_y = y0 + (_BOUNDARY_LABEL_HEIGHT - text_h) // 2 - bbox[1]
+            draw.text((text_x, text_y), label, fill=_TEXT_COLOR, font=font)
+
+            if cell.annotator == "human":
+                marker = "H"
+                mbbox = draw.textbbox((0, 0), marker, font=font)
+                mw = mbbox[2] - mbbox[0]
+                mh = mbbox[3] - mbbox[1]
+                pad_x = 5
+                pad_y = 2
+                pill_w = mw + 2 * pad_x
+                pill_h = mh + 2 * pad_y
+                pill_x0 = text_x + text_w + 8
+                if pill_x0 + pill_w > x0 + cell_w - 2:
+                    pill_x0 = max(x0 + 2, x0 + cell_w - 2 - pill_w)
+                pill_y0 = y0 + max(2, (_BOUNDARY_LABEL_HEIGHT - pill_h) // 2)
+                pill_x1 = min(x0 + cell_w - 2, pill_x0 + pill_w)
+                pill_y1 = min(y0 + _BOUNDARY_LABEL_HEIGHT - 2, pill_y0 + pill_h)
+                draw.rectangle([(pill_x0, pill_y0), (pill_x1, pill_y1)], fill=_HUMAN_MARKER_BG)
+                draw.text(
+                    (pill_x0 + pad_x - mbbox[0], pill_y0 + pad_y - mbbox[1]),
+                    marker,
+                    fill=_HUMAN_MARKER_FG,
+                    font=font,
+                )
+
+            cx = x0
+            img_y0 = y0 + _BOUNDARY_LABEL_HEIGHT
+            for im in imgs:
+                canvas.paste(im, (cx, img_y0))
+                cx += im.width + _BOUNDARY_CAM_GAP_PX
+
+        sheets.append(canvas)
+
+    return sheets
+
+
+def render_boundary_sheets(
+    dataset: DatasetView,
+    end_frames: Sequence[EndFrame],
+    output_dir: Path,
+    *,
+    subtask_position: int,
+    subtask: str,
+    cameras: Sequence[str] = DEFAULT_CAMERAS,
+    crops: Mapping[str, tuple[int, int, int, int]] | None = None,
+    tile_height: int = 240,
+    columns: int = 2,
+    per_page: int = 12,
+    jpeg_quality: int = 85,
+) -> list[Path]:
+    """Decode one boundary frame per camera per episode and write JPEG contact sheets.
+
+    Args:
+        dataset: Open ``DatasetView``.
+        end_frames: Ordered ``EndFrame`` records selected for ``subtask``.
+        output_dir: Destination directory for JPEG files.
+        subtask_position: 1-based subtask index in the task spec.
+        subtask: Subtask name used in output filenames.
+        cameras: Camera keys or short names (default: head, left_wrist, right_wrist).
+        crops: Optional mapping ``camera_name -> (x0, y0, x1, y1)`` applied before resizing.
+        tile_height: Target camera tile height in pixels (default 240).
+        columns: Episode cells per row (default 2).
+        per_page: Episodes per JPEG image, or ``0`` for all episodes on one image.
+        jpeg_quality: JPEG encoding quality (default 85).
+
+    Returns:
+        List of written JPEG file paths.
+    """
+    if subtask_position < 1:
+        raise ValueError(f"subtask_position must be >= 1, got {subtask_position}.")
+    if tile_height <= 0:
+        raise ValueError(f"tile_height must be positive, got {tile_height}.")
+    if columns <= 0:
+        raise ValueError(f"columns must be positive, got {columns}.")
+    if per_page < 0:
+        raise ValueError(f"per_page must be >= 0, got {per_page}.")
+    if not end_frames:
+        return []
+
+    cells: list[BoundaryCell] = []
+    for ef in end_frames:
+        record = dataset.get_episode(ef.episode_index)
+        if not 0 <= ef.frame < record.length:
+            raise ValueError(
+                f"Frame {ef.frame} out of range for episode {ef.episode_index} "
+                f"(length={record.length})."
+            )
+        resolved_cameras = _resolve_camera_keys(cameras, record.videos)
+        missing_cams = [cam for cam in resolved_cameras if cam not in record.videos]
+        if missing_cams:
+            raise ValueError(
+                f"Episode {ef.episode_index} does not contain requested cameras: {missing_cams}"
+            )
+
+        cam_images: list[Image.Image] = []
+        for cam in resolved_cameras:
+            span = record.videos[cam]
+            target_ts = span.from_timestamp + ef.frame / dataset.fps
+            decoded = decode_video_frames_pyav(
+                span.path,
+                [(ef.frame, target_ts)],
+                fps=dataset.fps,
+            )
+            crop_box = None
+            if crops:
+                crop_box = crops.get(cam) or crops.get(_short_camera_name(cam))
+            cam_images.append(
+                _crop_and_resize_height(
+                    decoded[ef.frame],
+                    crop=crop_box,
+                    tile_height=tile_height,
+                )
+            )
+        cells.append(
+            BoundaryCell(
+                episode_index=ef.episode_index,
+                frame=ef.frame,
+                annotator=ef.annotator,
+                images=tuple(cam_images),
+            )
+        )
+
+    sheets = compose_boundary_sheets(
+        cells,
+        columns=columns,
+        per_page=per_page,
+        tile_height=tile_height,
+    )
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    for page_idx, sheet in enumerate(sheets, start=1):
+        dest = output_dir / f"{subtask_position}_{subtask}_end_p{page_idx:02d}.jpg"
+        sheet.save(dest, format="JPEG", quality=jpeg_quality)
+        written.append(dest)
+    return written

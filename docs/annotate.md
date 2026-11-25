@@ -121,13 +121,17 @@ uv run lerobot-check validate --dataset-root /path/to/dataset
 
 Exit code `0` means zero violations; fix all reported issues and re-run.
 
+### 6. Review End Frames Across Episodes (`boundary-sheet`)
+
+After writing and validating annotations, run the [Boundary self-check loop](#boundary-self-check-loop) with `lerobot-check boundary-sheet` to inspect every non-final subtask's end frame across all episodes before handing off to a human reviewer.
+
 ## Judgement Rules
 
 ### Subtask Boundary (`start`, `end`)
 
-- **Split at object release and settle (last arm in contact)**: pick and place of one object belong to the **same** subtask. A subtask ends at the **exact frame where its target object is placed and stable and the last arm in contact with that object lets go** (for `open_carton`, the moment the lid lies flat on the table and the flipping arm lets go; in bimanual tasks where a second arm presses or steadies the object flat after the primary arm releases, the boundary is when that last arm lets go).
+- **Default pick-and-place end rule (`end - 1`)**: pick and place of one object belong to the **same** subtask. A pick-and-place subtask's last frame (`end - 1`) is the first frame where the last gripper holding (or pressing/steadying) its object has opened and lifted clear of it, with its jaws in the air just above the settled object. Too early: the gripper still touches or presses the object. Too late: the arm has already retracted toward the next object.
 - **Subtask-specific end-rule overrides**: a subtask may define its own end rule in the task spec (written as a YAML comment directly above that subtask), which overrides the default release rule above — for example, `flip_lid` ends at the frame the flipped lid first lands on the box even if a hand still holds it. Always read the task spec comments before annotating.
-- **Retraction and next-stage prep**: arm retraction after the last arm lets go belongs to subtask $k+1$, **not** subtask $k$. Conversely, if the non-contacting arm begins moving toward the next subtask's object *before* the last arm lets go of the current object, those frames still belong to subtask $k$.
+- **Retraction and next-stage prep**: further arm retraction after the gripper has lifted clear and the approach toward the next object belong to subtask $k+1$, **not** subtask $k$. Conversely, if the non-contacting arm begins moving toward the next subtask's object *before* the last gripper lifts clear of the current object, those frames still belong to subtask $k$.
 - **Half-open intervals**: each row covers `[start, end)`. Sorted by `start`, rows within an episode must satisfy `start_0 = 0`, `start_{k+1} = end_k`, and `end_last = episode_length`. Prompts switch at `end_k`.
 - **Order and supplement episodes**: subtask names must come from the task spec and appear in task spec order as a contiguous subsequence. Single-stage or partial-stage supplement episodes are legal when they cover `[0, episode_length)`.
 - **Unannotated / bad episodes**: corrupted or unannotated episodes may be omitted from the table rather than fabricated.
@@ -143,3 +147,47 @@ Exit code `0` means zero violations; fix all reported issues and re-run.
 - Evaluate `success` independently for **each subtask** against that subtask's physical goal before `end`:
   - `true`: the subtask completes its goal cleanly.
   - `false`: the robot fails to complete the subtask, drops/displaces the object without recovering, or leaves the stage incomplete. Record a short reason in `note`.
+
+## Boundary self-check loop
+
+Reviewing every episode's subtask end frames side by side catches boundary drift much faster than checking episodes one at a time. Run this self-check loop before handing annotations to a human reviewer:
+
+1. **Render sheets for all non-final subtasks** with `lerobot-check boundary-sheet` (the last subtask runs to the episode end and is excluded automatically). For `pack_iphone_box`-style tabletop scenes, cropping the head camera (for example `--crop head=90,40,550,360`) keeps the active workspace legible alongside the wrist cameras:
+
+```bash
+uv run lerobot-check boundary-sheet \
+  --repo-id Xense/pack_iphone_box_1119 \
+  --crop head=90,40,550,360 \
+  -o /tmp/lerobot-check/boundary-sheets
+```
+
+2. **Judge every tile** on each `<k>_<subtask>_end_p<page>.jpg` sheet as `ok`, `early`, or `late` using the Subtask Boundary rule above and any subtask-specific override in the task spec. Wrist cameras often show jaw clearance more clearly than the head camera. Each tile is labeled `ep<idx> f<frame>`, with a coloured `H` marker when the row's `annotator` is `human`.
+3. **Fix bad `agent` rows only**: for each bad tile whose row has `annotator == agent`, update that row's `end` (delay `end` if `early`, advance `end` if `late`) and the next row's `start` in the same edit so intervals stay contiguous. **Never edit `human` rows** — if a `human`-marked tile looks off, leave the CSV untouched and report it to the human reviewer instead.
+4. **Re-render only the changed episodes** with `--episodes` (inclusive ranges supported) and re-check those tiles:
+
+```bash
+uv run lerobot-check boundary-sheet \
+  --repo-id Xense/pack_iphone_box_1119 \
+  --subtasks place_insert \
+  --episodes 5,9,20-28 \
+  --crop head=90,40,550,360 \
+  -o /tmp/lerobot-check/boundary-sheets-recheck
+```
+
+5. **Repeat steps 2–4** until every `agent` tile passes.
+6. **Validate** the updated CSV:
+
+```bash
+uv run lerobot-check validate --repo-id Xense/pack_iphone_box_1119
+```
+
+7. **Render final full sheets for human review** with all episodes per subtask on a single image (`--per-page 0 --columns 4`) so the human only has to scan the finished sheets:
+
+```bash
+uv run lerobot-check boundary-sheet \
+  --repo-id Xense/pack_iphone_box_1119 \
+  --crop head=90,40,550,360 \
+  --per-page 0 \
+  --columns 4 \
+  -o /tmp/lerobot-check/boundary-sheets-final
+```

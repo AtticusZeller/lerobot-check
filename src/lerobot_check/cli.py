@@ -60,13 +60,19 @@ from lerobot_check.relabel import (
     verify_relabel,
 )
 from lerobot_check.render import (
+    DEFAULT_CAMERAS,
     parse_boundary_spec,
+    parse_crop_specs,
+    parse_episode_spec,
     parse_frame_spec,
     render_boundary_exemplars,
+    render_boundary_sheets,
     render_episode_sheets,
+    resolve_boundary_subtasks,
     resolve_exemplar_cameras,
     resolve_render_cameras,
     select_boundary_exemplars,
+    select_end_frames,
     select_frames_around_events,
 )
 from lerobot_check.schema import (
@@ -344,6 +350,115 @@ def _cmd_exemplars(args: argparse.Namespace) -> int:
     print(f"boundary={boundary.raw} cameras=[{cam_names}] count={len(rendered)}")
     for ex, png_path in rendered:
         print(f"episode={ex.episode_index} frame={ex.frame} path={png_path}")
+    return 0
+
+
+def _cmd_boundary_sheet(args: argparse.Namespace) -> int:
+    if args.tile_height <= 0:
+        print(
+            f"[boundary-sheet] --tile-height must be positive, got {args.tile_height}",
+            file=sys.stderr,
+        )
+        return 1
+    if args.columns <= 0:
+        print(f"[boundary-sheet] --columns must be positive, got {args.columns}", file=sys.stderr)
+        return 1
+    if args.per_page < 0:
+        print(f"[boundary-sheet] --per-page must be >= 0, got {args.per_page}", file=sys.stderr)
+        return 1
+
+    try:
+        crops = parse_crop_specs(args.crop)
+    except ValueError as exc:
+        print(f"[crop] {exc}", file=sys.stderr)
+        return 1
+
+    episode_filter: list[int] | None = None
+    if args.episodes is not None:
+        try:
+            episode_filter = parse_episode_spec(args.episodes)
+        except ValueError as exc:
+            print(f"[episodes] {exc}", file=sys.stderr)
+            return 1
+
+    try:
+        root = resolve_dataset_root(args.dataset_root, args.repo_id)
+        dataset = DatasetView(root, repo_id=args.repo_id, revision=args.revision)
+    except (OSError, ValueError) as exc:
+        print(f"[dataset] {exc}", file=sys.stderr)
+        return 1
+
+    spec_path = (
+        args.task_spec
+        if args.task_spec is not None
+        else default_task_spec_path(root, repo_id=dataset.repo_id)
+    )
+    try:
+        task_spec = load_task_spec(spec_path)
+    except (OSError, ValueError) as exc:
+        print(f"[task-spec] {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        target_subtasks = resolve_boundary_subtasks(task_spec, args.subtasks)
+    except ValueError as exc:
+        print(f"[subtasks] {exc}", file=sys.stderr)
+        return 1
+
+    ann_path = (
+        args.annotations
+        if args.annotations is not None
+        else default_annotations_path(root, repo_id=dataset.repo_id, revision=dataset.revision)
+    )
+    try:
+        rows = load_annotations(ann_path)
+    except (OSError, ValueError) as exc:
+        print(f"[annotations] {exc}", file=sys.stderr)
+        return 1
+
+    cameras = tuple(args.cameras) if args.cameras else DEFAULT_CAMERAS
+    episode_lengths = getattr(dataset, "episode_lengths", None)
+
+    for subtask_pos, subtask_name in target_subtasks:
+        try:
+            end_frames = select_end_frames(
+                rows,
+                subtask_name,
+                offset=args.offset,
+                episodes=episode_filter,
+                episode_lengths=episode_lengths,
+            )
+        except ValueError as exc:
+            print(f"[boundary-sheet] {exc}", file=sys.stderr)
+            return 1
+
+        if not end_frames:
+            print(
+                f"No annotated episodes found for subtask '{subtask_name}' in {ann_path}.",
+                file=sys.stderr,
+            )
+            continue
+
+        try:
+            written = render_boundary_sheets(
+                dataset,
+                end_frames,
+                args.output,
+                subtask_position=subtask_pos,
+                subtask=subtask_name,
+                cameras=cameras,
+                crops=crops,
+                tile_height=args.tile_height,
+                columns=args.columns,
+                per_page=args.per_page,
+            )
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"[boundary-sheet] {exc}", file=sys.stderr)
+            return 1
+
+        for path in written:
+            print(path)
+
     return 0
 
 
@@ -1272,6 +1387,96 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output directory for exemplar PNGs (outside the repository).",
     )
     exemplars_parser.set_defaults(func=_cmd_exemplars)
+
+    boundary_sheet_parser = subparsers.add_parser(
+        "boundary-sheet",
+        help="Render per-subtask contact sheets of end frames across episodes.",
+    )
+    _add_dataset_args(boundary_sheet_parser)
+    boundary_sheet_parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        help="Override detected dataset revision when resolving default annotations path.",
+    )
+    boundary_sheet_parser.add_argument(
+        "--annotations",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the annotation CSV file "
+            "(default: <lerobot_root>/.xense-viewer/subtasks/<org>__<name>@<revision>.csv)."
+        ),
+    )
+    boundary_sheet_parser.add_argument(
+        "--task-spec",
+        type=Path,
+        default=None,
+        help=(
+            "Path to the YAML task spec file "
+            "(default: <lerobot_root>/.xense-viewer/subtasks/<org>__<name>.task_spec.yaml)."
+        ),
+    )
+    boundary_sheet_parser.add_argument(
+        "--subtasks",
+        nargs="+",
+        default=None,
+        help=("Subtask names to render (default: every subtask in the task spec except the last)."),
+    )
+    boundary_sheet_parser.add_argument(
+        "--episodes",
+        type=str,
+        default=None,
+        help="Optional episode filter with inclusive ranges, e.g. '5,9,20-28'. Default: all.",
+    )
+    boundary_sheet_parser.add_argument(
+        "--offset",
+        type=int,
+        default=-1,
+        help="Frame offset relative to row end (default: -1, the subtask's last frame).",
+    )
+    boundary_sheet_parser.add_argument(
+        "--cameras",
+        nargs="+",
+        default=None,
+        help=(
+            "Camera keys or short names to place side by side "
+            "(default: head left_wrist right_wrist)."
+        ),
+    )
+    boundary_sheet_parser.add_argument(
+        "--crop",
+        action="append",
+        default=None,
+        metavar="CAM=x0,y0,x1,y1",
+        help="Repeatable crop box in native pixels applied to CAM before resizing.",
+    )
+    boundary_sheet_parser.add_argument(
+        "--tile-height",
+        type=int,
+        default=240,
+        help="Height of each camera image in pixels, keeping aspect ratio (default: 240).",
+    )
+    boundary_sheet_parser.add_argument(
+        "--columns",
+        type=int,
+        default=2,
+        help="Number of episode cells per row (default: 2).",
+    )
+    boundary_sheet_parser.add_argument(
+        "--per-page",
+        type=int,
+        default=12,
+        help="Episodes per JPEG image, or 0 for all episodes on one image (default: 12).",
+    )
+    boundary_sheet_parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        required=True,
+        help="Output directory for boundary-sheet JPEGs (outside the repository).",
+    )
+    boundary_sheet_parser.set_defaults(func=_cmd_boundary_sheet)
 
     validate_parser = subparsers.add_parser(
         "validate",
