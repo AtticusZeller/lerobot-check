@@ -633,20 +633,20 @@ class DatasetView:
             return int(shape[1]), int(shape[0])
         raise ValueError(f"Could not determine image size for camera {camera_key!r}")
 
-    def load_arm_tcp_table(
+    def load_arm_calib_table(
         self,
         episodes: Sequence[int] | None = None,
-    ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
-        """Load per-arm 9D TCP poses across episodes in one pass per parquet file.
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray], dict[str, np.ndarray]]:
+        """Load per-arm 9D TCP poses and gripper positions across episodes in one pass.
 
         Args:
             episodes: Optional sequence of episode indices to load. Loads all
                 episodes when ``None``.
 
         Returns:
-            Tuple ``(episode_indices, frame_indices, tcp_by_arm)`` where each
-            ``tcp_by_arm[arm]`` is a float64 array of shape ``(N, 9)`` containing
-            ``[x, y, z, r1, r2, r3, r4, r5, r6]``.
+            Tuple ``(episode_indices, frame_indices, tcp_by_arm, gripper_by_arm)``
+            where ``tcp_by_arm[arm]`` has shape ``(N, 9)`` and ``gripper_by_arm[arm]``
+            has shape ``(N,)``.
         """
         selected = sorted(set(episodes)) if episodes is not None else sorted(self._episodes.keys())
         for ep_idx in selected:
@@ -689,6 +689,7 @@ class DatasetView:
                 empty_i,
                 empty_i,
                 {arm: np.empty((0, 9), dtype=np.float64) for arm in self.arm_indices},
+                {arm: np.empty((0,), dtype=np.float64) for arm in self.arm_indices},
             )
 
         all_ep = np.concatenate(ep_chunks)
@@ -700,9 +701,29 @@ class DatasetView:
         all_state = all_state[order]
 
         tcp_by_arm: dict[str, np.ndarray] = {}
+        gripper_by_arm: dict[str, np.ndarray] = {}
         for arm_name, idx in self.arm_indices.items():
             cols = [*idx.xyz, *idx.rot6d]
             tcp_by_arm[arm_name] = all_state[:, cols].copy()
+            gripper_by_arm[arm_name] = all_state[:, idx.gripper].copy()
+        return all_ep, all_frame, tcp_by_arm, gripper_by_arm
+
+    def load_arm_tcp_table(
+        self,
+        episodes: Sequence[int] | None = None,
+    ) -> tuple[np.ndarray, np.ndarray, dict[str, np.ndarray]]:
+        """Load per-arm 9D TCP poses across episodes in one pass per parquet file.
+
+        Args:
+            episodes: Optional sequence of episode indices to load. Loads all
+                episodes when ``None``.
+
+        Returns:
+            Tuple ``(episode_indices, frame_indices, tcp_by_arm)`` where each
+            ``tcp_by_arm[arm]`` is a float64 array of shape ``(N, 9)`` containing
+            ``[x, y, z, r1, r2, r3, r4, r5, r6]``.
+        """
+        all_ep, all_frame, tcp_by_arm, _ = self.load_arm_calib_table(episodes=episodes)
         return all_ep, all_frame, tcp_by_arm
 
     def load_episode_state_matrix(self, episode_index: int) -> np.ndarray:

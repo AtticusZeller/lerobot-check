@@ -375,8 +375,16 @@ def test_distribution_tool_point_with_tilted_gripper_and_rot6d() -> None:
     assert tcp_pose["rot6d"] == pytest.approx(rot6d_tilt.tolist())
 
     tcp_ep = dist_tcp["subtasks"][0]["arms"]["right"]["episodes"][0]
+    assert tcp_ep["start_frame"] == 4
+    assert tcp_ep["start_source"] == "grasp"
+    assert tcp_ep["end_frame"] is None
+    assert tcp_ep["end_pose"] is None
     assert tcp_ep["start_pose"]["rot6d"] == pytest.approx(rot6d_tilt.tolist())
-    assert tcp_ep["end_pose"]["rot6d"] == pytest.approx(rot6d_tilt.tolist())
+    assert [
+        tcp_ep["start_pose"]["x_m"],
+        tcp_ep["start_pose"]["y_m"],
+        tcp_ep["start_pose"]["z_m"],
+    ] == pytest.approx(raw_xyz[4].tolist())
     assert all("rot6d" not in pt for pt in tcp_ep["trajectory"])
 
     # With calibration tool_offset -> positions shift by R_tilt @ tool_offset; yaw/rot6d unchanged.
@@ -414,12 +422,80 @@ def test_distribution_tool_point_with_tilted_gripper_and_rot6d() -> None:
         tool_ep["start_pose"]["x_m"],
         tool_ep["start_pose"]["y_m"],
         tool_ep["start_pose"]["z_m"],
-    ] == pytest.approx((raw_xyz[0] + delta_base).tolist())
-    assert [
-        tool_ep["end_pose"]["x_m"],
-        tool_ep["end_pose"]["y_m"],
-        tool_ep["end_pose"]["z_m"],
-    ] == pytest.approx((raw_xyz[-1] + delta_base).tolist())
+    ] == pytest.approx((raw_xyz[4] + delta_base).tolist())
+    assert tool_ep["end_pose"] is None
     assert tool_ep["start_pose"]["yaw_deg"] == pytest.approx(tcp_ep["start_pose"]["yaw_deg"])
+    assert tool_ep["trajectory"][0]["x_m"] == pytest.approx(float(raw_xyz[0, 0] + delta_base[0]))
+    assert tool_ep["trajectory"][-1]["x_m"] == pytest.approx(float(raw_xyz[-1, 0] + delta_base[0]))
     assert tool_ep["trajectory"][2]["z_m"] == pytest.approx(float(raw_xyz[0, 2] + delta_base[2]))
     assert all("rot6d" not in pt for pt in tool_ep["trajectory"])
+
+
+def test_start_end_pose_grasp_fallback_and_last_subtask_null_end() -> None:
+    spec = TaskSpec(
+        name="three_stage",
+        subtasks=(
+            SubtaskSpec(name="stage_a", prompt="Stage A.", arms=("right",)),
+            SubtaskSpec(name="stage_b", prompt="Stage B.", arms=("right",)),
+            SubtaskSpec(name="stage_c", prompt="Stage C.", arms=("right",)),
+        ),
+        coverage=CoverageSpec(xy_bin_m=0.05, yaw_bin_deg=30.0, sparse_threshold=2),
+    )
+    # Ep 0: stage_a has grasp=6 (start_source="grasp"), stage_b has grasp=None (fallback="start"),
+    # stage_c is last subtask in spec -> end_frame=None, end_pose=None.
+    rows = [
+        _row(0, "stage_a", 0, 10, grasp=6),
+        _row(0, "stage_b", 10, 20, grasp=None),
+        _row(0, "stage_c", 20, 30, grasp=24),
+    ]
+    xyz = np.column_stack([np.arange(30, dtype=np.float64) * 0.01, np.zeros(30), np.full(30, -0.3)])
+    rot6d = np.vstack([_yaw_to_rot6d(float(i * 3)) for i in range(30)])
+    arm_states = {0: {"right": ArmState("right", xyz, rot6d, np.ones(30))}}
+
+    dist = compute_distribution_from_states(
+        repo_id="org/three",
+        revision="rev1",
+        fps=30.0,
+        episode_lengths={0: 30},
+        arm_states_by_episode=arm_states,
+        rows=rows,
+        task_spec=spec,
+        trajectory_samples=5,
+    )
+    by_st = {s["name"]: s["arms"]["right"] for s in dist["subtasks"]}
+
+    # stage_a: start uses grasp=6, end uses 9, trajectory still spans [0, 10) (frame 0 -> frame 9).
+    ep_a = by_st["stage_a"]["episodes"][0]
+    assert ep_a["start_frame"] == 6
+    assert ep_a["start_source"] == "grasp"
+    assert ep_a["start_pose"]["x_m"] == pytest.approx(0.06)
+    assert ep_a["end_frame"] == 9
+    assert ep_a["end_pose"] is not None
+    assert ep_a["end_pose"]["x_m"] == pytest.approx(0.09)
+    assert ep_a["trajectory"][0]["x_m"] == pytest.approx(0.00)
+    assert ep_a["trajectory"][-1]["x_m"] == pytest.approx(0.09)
+    assert by_st["stage_a"]["metrics"]["end_coverage"]["occupied_xy_cells"] == 1
+
+    # stage_b: grasp is empty -> falls back to row.start=10 with start_source="start".
+    ep_b = by_st["stage_b"]["episodes"][0]
+    assert ep_b["start_frame"] == 10
+    assert ep_b["start_source"] == "start"
+    assert ep_b["start_pose"]["x_m"] == pytest.approx(0.10)
+    assert ep_b["end_frame"] == 19
+    assert ep_b["end_pose"] is not None
+    assert ep_b["end_pose"]["x_m"] == pytest.approx(0.19)
+
+    # stage_c: last subtask -> start uses grasp=24, end_frame & end_pose are null,
+    # excluded from end_coverage, while trajectory still covers [20, 30).
+    ep_c = by_st["stage_c"]["episodes"][0]
+    assert ep_c["start_frame"] == 24
+    assert ep_c["start_source"] == "grasp"
+    assert ep_c["start_pose"]["x_m"] == pytest.approx(0.24)
+    assert ep_c["end_frame"] is None
+    assert ep_c["end_pose"] is None
+    assert ep_c["trajectory"][0]["x_m"] == pytest.approx(0.20)
+    assert ep_c["trajectory"][-1]["x_m"] == pytest.approx(0.29)
+    assert by_st["stage_c"]["metrics"]["end_coverage"] == {
+        "occupied_xy_cells": 0,
+        "yaw_span_deg": 0.0,
+    }

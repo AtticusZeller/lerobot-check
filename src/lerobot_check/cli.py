@@ -20,6 +20,7 @@ from lerobot_check.analysis import (
 from lerobot_check.calib import (
     DEFAULT_CALIB_CAMERA,
     DEFAULT_FRAMES_PER_ARM,
+    DEFAULT_MAX_GRIPPER_POS,
     HeadCalibration,
     calibrate_head_camera,
     compare_arm_extrinsics,
@@ -728,6 +729,7 @@ def _cmd_calib_frames(args: argparse.Namespace) -> int:
             existing=existing,
             append_per_arm=args.append,
             episodes=episodes,
+            max_gripper_pos=args.max_gripper,
         )
     except (KeyError, ValueError) as exc:
         print(f"[calib-frames] {exc}", file=sys.stderr)
@@ -805,10 +807,19 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
         offset_mm = [v * 1000.0 for v in entry["tool_offset"]]
         loo = entry["loo_rms_px"]
         loo_str = "n/a" if loo is None else f"{loo:.2f} px"
+        inlier_rms = entry.get("inlier_rms_px")
+        inlier_rms_str = "n/a" if inlier_rms is None else f"{inlier_rms:.2f} px"
+        inlier_loo = entry.get("inlier_loo_rms_px")
+        inlier_loo_str = "n/a" if inlier_loo is None else f"{inlier_loo:.2f} px"
+        n_inliers = entry.get("n_inliers", entry["n_points"])
+        flagged = [r["id"] for r in entry["residuals"] if r.get("outlier")]
+        outliers_str = ", ".join(flagged) if flagged else "none"
         print(
-            f"arm={arm_name}: n={entry['n_points']}, rms={entry['rms_px']:.2f} px, "
-            f"loo_rms={loo_str}, tool_offset=[{offset_mm[0]:.1f}, {offset_mm[1]:.1f}, "
-            f"{offset_mm[2]:.1f}] mm"
+            f"arm={arm_name}: n={entry['n_points']} (inliers={n_inliers}), "
+            f"rms={entry['rms_px']:.2f} px (inlier={inlier_rms_str}), "
+            f"loo_rms={loo_str} (inlier={inlier_loo_str}), "
+            f"tool_offset=[{offset_mm[0]:.1f}, {offset_mm[1]:.1f}, {offset_mm[2]:.1f}] mm, "
+            f"outliers=[{outliers_str}]"
         )
     diff = compare_arm_extrinsics(head_payload)
     if diff is not None:
@@ -1358,6 +1369,15 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Allow overwriting an existing frames.json (restarts frame IDs).",
+    )
+    calib_frames_parser.add_argument(
+        "--max-gripper",
+        type=float,
+        default=DEFAULT_MAX_GRIPPER_POS,
+        help=(
+            "Maximum gripper opening allowed for newly selected frames "
+            f"(default: {DEFAULT_MAX_GRIPPER_POS:g}, closed fingertips)."
+        ),
     )
     calib_frames_parser.add_argument(
         "--episodes",

@@ -19,6 +19,12 @@ from lerobot_check.dataset import DatasetView, rotation_6d_to_matrix
 CALIB_SCHEMA_VERSION = 1
 DEFAULT_CALIB_CAMERA = "observation.images.head"
 DEFAULT_FRAMES_PER_ARM = 15
+# Verified on bi_flexiv_rizon4_rt (pack_iphone_box_1119): 0.0 is closed, 1.0 is open;
+# gripper <= 0.05 keeps tightly closed fingertips while excluding visibly open jaws (>= 0.06).
+DEFAULT_MAX_GRIPPER_POS = 0.05
+ROBUST_LOSS_SCALE_PX = 3.0
+OUTLIER_MEDIAN_MULTIPLIER = 3.0
+OUTLIER_MIN_PX = 15.0
 # Weight balancing 10 cm TCP translation with ~29 deg rotation (||R1 - R2||_F = 1.0 at ~41 deg).
 _POS_SCALE_M = 0.10
 _ROT_SCALE = 0.50
@@ -77,11 +83,16 @@ class ArmCalibration:
         T_cam_base: 4x4 homogeneous transform mapping base-frame points into camera frame.
         tool_offset: 3-vector ``(ox, oy, oz)`` in the TCP frame (meters).
         n_points: Number of valid annotated points used to solve this arm.
-        rms_px: In-sample Euclidean reprojection RMS error in pixels.
-        loo_rms_px: Leave-one-out cross-validation Euclidean RMS error in pixels, or
-            ``None`` when fewer than 6 points are available.
+        rms_px: In-sample Euclidean reprojection RMS error over all points (pixels).
+        loo_rms_px: Leave-one-out cross-validation Euclidean RMS error over all points
+            (pixels), or ``None`` when fewer than 6 points are available.
         residuals: Per-point reprojection residuals ``(id, du, dv)`` where
             ``du = u_pred - u_obs`` and ``dv = v_pred - v_obs``.
+        inlier_rms_px: Euclidean reprojection RMS over non-outlier points (pixels).
+        inlier_loo_rms_px: Leave-one-out Euclidean RMS over non-outlier points (pixels).
+        n_inliers: Number of non-outlier points.
+        outlier_threshold_px: Threshold ``max(3 * median_err, 15.0)`` used to flag outliers.
+        outlier_ids: Tuple of frame IDs whose residual magnitude exceeded the threshold.
     """
 
     arm: str
@@ -91,6 +102,11 @@ class ArmCalibration:
     rms_px: float
     loo_rms_px: float | None
     residuals: tuple[tuple[str, float, float], ...]
+    inlier_rms_px: float | None = None
+    inlier_loo_rms_px: float | None = None
+    n_inliers: int | None = None
+    outlier_threshold_px: float | None = None
+    outlier_ids: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -191,7 +207,14 @@ def load_head_calibration(path: Path) -> HeadCalibration:
         residuals = tuple(
             (str(r["id"]), float(r["du"]), float(r["dv"])) for r in entry.get("residuals", [])
         )
+        outlier_ids = tuple(
+            str(r["id"]) for r in entry.get("residuals", []) if r.get("outlier") is True
+        )
         loo_val = entry.get("loo_rms_px")
+        inlier_rms_val = entry.get("inlier_rms_px")
+        inlier_loo_val = entry.get("inlier_loo_rms_px")
+        n_inliers_val = entry.get("n_inliers")
+        thr_val = entry.get("outlier_threshold_px")
         arms[str(arm_name)] = ArmCalibration(
             arm=str(arm_name),
             T_cam_base=T,
@@ -200,6 +223,11 @@ def load_head_calibration(path: Path) -> HeadCalibration:
             rms_px=float(entry["rms_px"]),
             loo_rms_px=float(loo_val) if loo_val is not None else None,
             residuals=residuals,
+            inlier_rms_px=float(inlier_rms_val) if inlier_rms_val is not None else None,
+            inlier_loo_rms_px=float(inlier_loo_val) if inlier_loo_val is not None else None,
+            n_inliers=int(n_inliers_val) if n_inliers_val is not None else None,
+            outlier_threshold_px=float(thr_val) if thr_val is not None else None,
+            outlier_ids=outlier_ids,
         )
     return HeadCalibration(
         repo_id=str(raw.get("repo_id", "")),
@@ -417,12 +445,15 @@ def select_calib_frames(
     existing: Mapping[str, Any] | None = None,
     append_per_arm: int | None = None,
     episodes: Sequence[int] | None = None,
+    max_gripper_pos: float | None = DEFAULT_MAX_GRIPPER_POS,
 ) -> dict[str, Any]:
     """Select diverse calibration frames per arm via farthest point sampling.
 
-    When ``existing`` and ``append_per_arm`` are provided, all existing entries
-    and IDs are preserved verbatim and ``append_per_arm`` new frames per arm are
-    appended maximizing distance to already-selected poses.
+    By default restricts newly selected frames to those where that arm's gripper
+    is closed (``gripper <= max_gripper_pos``) so the fingertip midpoint is
+    unambiguous to click. When ``existing`` and ``append_per_arm`` are provided,
+    all existing entries and IDs are preserved verbatim and ``append_per_arm``
+    new closed-gripper frames per arm are appended.
 
     Args:
         dataset: Open ``DatasetView``.
@@ -431,6 +462,8 @@ def select_calib_frames(
         existing: Previously saved ``frames.json`` mapping when appending.
         append_per_arm: Number of additional frames per arm to append to ``existing``.
         episodes: Optional subset of episodes to sample from (default all episodes).
+        max_gripper_pos: Maximum allowed gripper opening for newly selected frames
+            (default ``0.05``; pass ``None`` to disable filtering).
 
     Returns:
         JSON-serializable dictionary matching the ``frames.json`` v1 schema.
@@ -451,8 +484,17 @@ def select_calib_frames(
         existing_frames = []
         to_pick = count_per_arm
 
+    if max_gripper_pos is not None and max_gripper_pos < 0.0:
+        raise ValueError(f"max_gripper_pos must be non-negative, got {max_gripper_pos}")
+
     width, height = dataset.camera_image_size(camera)
-    ep_indices, frame_indices, tcp_by_arm = dataset.load_arm_tcp_table(episodes=episodes)
+    if hasattr(dataset, "load_arm_calib_table"):
+        ep_indices, frame_indices, tcp_by_arm, gripper_by_arm = dataset.load_arm_calib_table(
+            episodes=episodes
+        )
+    else:
+        ep_indices, frame_indices, tcp_by_arm = dataset.load_arm_tcp_table(episodes=episodes)
+        gripper_by_arm = {}
 
     frames_out: list[dict[str, Any]] = list(existing_frames)
     for arm_name, tcps in tcp_by_arm.items():
@@ -470,6 +512,14 @@ def select_calib_frames(
             ],
             dtype=bool,
         )
+        if max_gripper_pos is not None and arm_name in gripper_by_arm:
+            excluded |= gripper_by_arm[arm_name] > max_gripper_pos
+            if np.all(excluded):
+                raise ValueError(
+                    f"No eligible closed-gripper frames for arm {arm_name!r} with "
+                    f"gripper <= {max_gripper_pos:g}; adjust --max-gripper if needed."
+                )
+
         seed_feats: np.ndarray | None = None
         if arm_existing:
             seed_tcps = np.array([item["tcp"] for item in arm_existing], dtype=np.float64)
@@ -515,48 +565,86 @@ def _pose_to_transform(rvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:
     return T
 
 
-def _initial_pnp_pose(
+def _soft_l1_score(errs_px: np.ndarray, scale_px: float = 10.0) -> float:
+    scaled = errs_px / scale_px
+    return float(np.sum(2.0 * (np.sqrt(1.0 + scaled**2) - 1.0)))
+
+
+def _initial_pnp_candidates(
     p_tcp: np.ndarray,
     pixels: np.ndarray,
     intrinsics: CameraIntrinsics,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Estimate initial ``(rvec, tvec)`` with ``tool_offset = 0`` via ``cv2.solvePnP``."""
+) -> list[tuple[np.ndarray, np.ndarray]]:
+    """Estimate robust initial ``(rvec, tvec)`` candidates with ``tool_offset = 0``."""
     obj_pts = np.ascontiguousarray(p_tcp, dtype=np.float64).reshape(-1, 1, 3)
     img_pts = np.ascontiguousarray(pixels, dtype=np.float64).reshape(-1, 1, 2)
     K = intrinsics.camera_matrix
     dist = intrinsics.dist_coeffs
 
+    scored: list[tuple[float, np.ndarray, np.ndarray]] = []
+
+    def _record(ok: bool, rvec: Any, tvec: Any) -> None:
+        if not ok or rvec is None or tvec is None:
+            return
+        rvec_1d = np.asarray(rvec, dtype=np.float64).reshape(3)
+        tvec_1d = np.asarray(tvec, dtype=np.float64).reshape(3)
+        if not (np.all(np.isfinite(rvec_1d)) and np.all(np.isfinite(tvec_1d))):
+            return
+        R = _rodrigues_to_matrix(rvec_1d)
+        pts_cam = p_tcp @ R.T + tvec_1d
+        if np.any(pts_cam[:, 2] <= 1e-4):
+            return
+        pred = project_camera_points(pts_cam, intrinsics)
+        errs = np.linalg.norm(pred - pixels, axis=1)
+        scored.append((_soft_l1_score(errs, scale_px=10.0), rvec_1d, tvec_1d))
+
     methods = [cv2.SOLVEPNP_SQPNP, cv2.SOLVEPNP_EPNP]
     if len(p_tcp) >= 6:
         methods.append(cv2.SOLVEPNP_ITERATIVE)
 
-    best: tuple[float, np.ndarray, np.ndarray] | None = None
     for flag in methods:
         try:
             ok, rvec, tvec = cv2.solvePnP(obj_pts, img_pts, K, dist, flags=flag)
         except cv2.error:
             continue
-        if not ok:
-            continue
-        rvec_1d = np.asarray(rvec, dtype=np.float64).reshape(3)
-        tvec_1d = np.asarray(tvec, dtype=np.float64).reshape(3)
-        if not (np.all(np.isfinite(rvec_1d)) and np.all(np.isfinite(tvec_1d))):
-            continue
-        R = _rodrigues_to_matrix(rvec_1d)
-        pts_cam = p_tcp @ R.T + tvec_1d
-        if np.any(pts_cam[:, 2] <= 1e-4):
-            continue
-        pred = project_camera_points(pts_cam, intrinsics)
-        err = float(np.sqrt(np.mean(np.sum((pred - pixels) ** 2, axis=1))))
-        if best is None or err < best[0]:
-            best = (err, rvec_1d, tvec_1d)
+        _record(bool(ok), rvec, tvec)
 
-    if best is None:
+    if len(p_tcp) >= 6:
+        for reproj_err in (25.0, 50.0):
+            try:
+                ok, rvec, tvec, _ = cv2.solvePnPRansac(
+                    obj_pts,
+                    img_pts,
+                    K,
+                    dist,
+                    reprojectionError=reproj_err,
+                    iterationsCount=500,
+                    confidence=0.999,
+                    flags=cv2.SOLVEPNP_EPNP,
+                )
+            except cv2.error:
+                continue
+            _record(bool(ok), rvec, tvec)
+
+    if not scored:
         raise ValueError(
             "solvePnP failed to find a valid positive-depth initial pose; "
             "check point diversity, TCP coordinates, and intrinsics."
         )
-    return best[1], best[2]
+
+    scored.sort(key=lambda item: item[0])
+    # Deduplicate near-identical initializations while keeping up to 2 distinct starts.
+    unique: list[tuple[np.ndarray, np.ndarray]] = []
+    for _, rv, tv in scored:
+        if any(
+            np.linalg.norm(rv - urv) < 1e-2 and np.linalg.norm(tv - utv) < 1e-2
+            for urv, utv in unique
+        ):
+            continue
+        unique.append((rv, tv))
+        if len(unique) == 2:
+            break
+    return unique
 
 
 def _fit_extrinsic_and_offset(
@@ -564,10 +652,11 @@ def _fit_extrinsic_and_offset(
     R_tcp: np.ndarray,
     pixels: np.ndarray,
     intrinsics: CameraIntrinsics,
+    *,
+    f_scale: float = ROBUST_LOSS_SCALE_PX,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Solve ``(rvec, tvec, tool_offset)`` via solvePnP init + joint Levenberg-Marquardt."""
-    rvec0, tvec0 = _initial_pnp_pose(p_tcp, pixels, intrinsics)
-    x0 = np.concatenate([rvec0, tvec0, np.zeros(3, dtype=np.float64)])
+    """Solve ``(rvec, tvec, tool_offset)`` via PnP init + ``soft_l1``/``cauchy`` refinement."""
+    candidates = _initial_pnp_candidates(p_tcp, pixels, intrinsics)
 
     def residuals(params: np.ndarray) -> np.ndarray:
         rvec = params[0:3]
@@ -576,31 +665,56 @@ def _fit_extrinsic_and_offset(
         R_cb = _rodrigues_to_matrix(rvec)
         pts_base = p_tcp + np.einsum("nij,j->ni", R_tcp, offset)
         pts_cam = pts_base @ R_cb.T + tvec
-        # Penalize points drifting behind the camera plane smoothly during LM steps.
+        # Penalize points drifting behind the camera plane smoothly during TRF steps.
         if np.any(pts_cam[:, 2] <= 1e-4):
             return np.full(len(pixels) * 2, 1e6, dtype=np.float64)
         pred = project_camera_points(pts_cam, intrinsics)
         return (pred - pixels).reshape(-1)
 
-    res = least_squares(
-        residuals,
-        x0,
-        method="lm",
-        ftol=1e-12,
-        xtol=1e-12,
-        gtol=1e-12,
-        max_nfev=2000,
-    )
-    rvec_opt = res.x[0:3]
-    tvec_opt = res.x[3:6]
-    offset_opt = res.x[6:9]
+    def _has_positive_depth(params: np.ndarray) -> bool:
+        R_cb = _rodrigues_to_matrix(params[0:3])
+        pts_base = p_tcp + np.einsum("nij,j->ni", R_tcp, params[6:9])
+        pts_cam = pts_base @ R_cb.T + params[3:6]
+        return bool(np.all(pts_cam[:, 2] > 1e-4))
 
-    R_cb = _rodrigues_to_matrix(rvec_opt)
-    pts_base = p_tcp + np.einsum("nij,j->ni", R_tcp, offset_opt)
-    pts_cam = pts_base @ R_cb.T + tvec_opt
-    if np.any(pts_cam[:, 2] <= 1e-4):
+    best_sol: tuple[float, np.ndarray, np.ndarray, np.ndarray] | None = None
+    for rvec0, tvec0 in candidates:
+        x0 = np.concatenate([rvec0, tvec0, np.zeros(3, dtype=np.float64)])
+        # Stage 1: convex soft_l1 warm start for global stability.
+        res1 = least_squares(
+            residuals,
+            x0,
+            method="trf",
+            loss="soft_l1",
+            f_scale=f_scale,
+            ftol=1e-12,
+            xtol=1e-12,
+            gtol=1e-12,
+            max_nfev=2000,
+        )
+        # Stage 2: redescending cauchy refinement removes residual pull from gross outliers
+        # while retaining every point in the objective.
+        res2 = least_squares(
+            residuals,
+            res1.x,
+            method="trf",
+            loss="cauchy",
+            f_scale=f_scale,
+            ftol=1e-12,
+            xtol=1e-12,
+            gtol=1e-12,
+            max_nfev=2000,
+        )
+        chosen_x = res2.x if _has_positive_depth(res2.x) else res1.x
+        if not _has_positive_depth(chosen_x):
+            continue
+        cost = float(res2.cost if chosen_x is res2.x else res1.cost)
+        if best_sol is None or cost < best_sol[0]:
+            best_sol = (cost, chosen_x[0:3], chosen_x[3:6], chosen_x[6:9])
+
+    if best_sol is None:
         raise ValueError("Joint calibration converged to points behind the camera")
-    return rvec_opt, tvec_opt, offset_opt
+    return best_sol[1], best_sol[2], best_sol[3]
 
 
 def calibrate_arm(
@@ -610,12 +724,14 @@ def calibrate_arm(
     frame_ids: Sequence[str],
     intrinsics: CameraIntrinsics,
 ) -> ArmCalibration:
-    """Calibrate one arm's ``T_cam_base`` and ``tool_offset`` from annotated correspondences.
+    """Calibrate one arm's ``T_cam_base`` and ``tool_offset`` robustly against bad clicks.
 
     Model: ``pixel = project(K, dist, T_cam_base @ (p_tcp + R_tcp @ tool_offset))``.
-    Initializes with ``cv2.solvePnP`` (``tool_offset = 0``), refines jointly with
-    nonlinear least squares, and computes independent leave-one-out RMS when
-    ``len(tcps) >= 6``.
+    Initializes with ``solvePnP`` / ``solvePnPRansac`` (``tool_offset = 0``), refines
+    jointly with two-stage ``soft_l1`` warm-start + ``cauchy`` robust nonlinear least
+    squares (``f_scale = 3.0`` px), flags points with Euclidean residual
+    ``> max(3 * median, 15.0)`` px as outliers without dropping them, and reports RMS
+    over both all points and inliers.
 
     Args:
         arm: Arm name (``"left"`` or ``"right"``).
@@ -653,9 +769,20 @@ def calibrate_arm(
     pts_base = p_tcp + np.einsum("nij,j->ni", R_tcp, offset)
     pred_px = project_base_points(pts_base, T_cam_base, intrinsics)
     diff = pred_px - px_arr
-    rms_px = float(np.sqrt(np.mean(np.sum(diff**2, axis=1))))
+    sq_errs = np.sum(diff**2, axis=1)
+    errs_px = np.sqrt(sq_errs)
+    rms_px = float(np.sqrt(np.mean(sq_errs)))
+
+    median_err = float(np.median(errs_px))
+    outlier_threshold_px = max(OUTLIER_MEDIAN_MULTIPLIER * median_err, OUTLIER_MIN_PX)
+    is_outlier = errs_px > outlier_threshold_px
+    inlier_mask = ~is_outlier
+    n_inliers = int(np.count_nonzero(inlier_mask))
+    inlier_rms_px = float(np.sqrt(np.mean(sq_errs[inlier_mask]))) if n_inliers > 0 else None
+    outlier_ids = tuple(str(frame_ids[i]) for i in range(n) if bool(is_outlier[i]))
 
     loo_rms_px: float | None = None
+    inlier_loo_rms_px: float | None = None
     if n >= 6:
         loo_sq_errors: list[float] = []
         for hold_idx in range(n):
@@ -669,7 +796,10 @@ def calibrate_arm(
             pred_hold = project_base_points(pt_hold, T_cv, intrinsics)[0]
             err_vec = pred_hold - px_arr[hold_idx]
             loo_sq_errors.append(float(err_vec[0] ** 2 + err_vec[1] ** 2))
-        loo_rms_px = float(math.sqrt(sum(loo_sq_errors) / n))
+        loo_arr = np.asarray(loo_sq_errors, dtype=np.float64)
+        loo_rms_px = float(np.sqrt(np.mean(loo_arr)))
+        if n_inliers > 0:
+            inlier_loo_rms_px = float(np.sqrt(np.mean(loo_arr[inlier_mask])))
 
     residual_items = tuple(
         (str(fid), float(diff[i, 0]), float(diff[i, 1])) for i, fid in enumerate(frame_ids)
@@ -682,6 +812,11 @@ def calibrate_arm(
         rms_px=rms_px,
         loo_rms_px=loo_rms_px,
         residuals=residual_items,
+        inlier_rms_px=inlier_rms_px,
+        inlier_loo_rms_px=inlier_loo_rms_px,
+        n_inliers=n_inliers,
+        outlier_threshold_px=outlier_threshold_px,
+        outlier_ids=outlier_ids,
     )
 
 
@@ -731,13 +866,21 @@ def calibrate_head_camera(
         pixels = np.array([e["pixel"] for e in entries], dtype=np.float64)
         ids = [str(e["id"]) for e in entries]
         cal = calibrate_arm(arm_name, tcps, pixels, ids, intrinsics)
+        outlier_set = set(cal.outlier_ids)
         arms_out[arm_name] = {
             "T_cam_base": [[float(v) for v in row] for row in cal.T_cam_base],
             "tool_offset": [float(v) for v in cal.tool_offset],
             "n_points": cal.n_points,
+            "n_inliers": cal.n_inliers,
             "rms_px": cal.rms_px,
+            "inlier_rms_px": cal.inlier_rms_px,
             "loo_rms_px": cal.loo_rms_px,
-            "residuals": [{"id": fid, "du": du, "dv": dv} for fid, du, dv in cal.residuals],
+            "inlier_loo_rms_px": cal.inlier_loo_rms_px,
+            "outlier_threshold_px": cal.outlier_threshold_px,
+            "residuals": [
+                {"id": fid, "du": du, "dv": dv, "outlier": fid in outlier_set}
+                for fid, du, dv in cal.residuals
+            ],
         }
 
     image_size = points_payload.get("image_size", list(intrinsics.image_size))

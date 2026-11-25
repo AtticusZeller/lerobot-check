@@ -13,8 +13,8 @@ CLI 入口为 `lerobot-check`，提供以下子命令：
 - `relabel` / `verify-relabel`：按标注表与 task spec 逐帧重标 N 个 subtask 的 `task_index`（视频硬链接不重编码），并校验除 task 相关字段外与源数据零差异。
 - `distribution`：输出机读 `distribution.json`（含标注来源统计、各 subtask 帧占比、物体初始位姿与覆盖网格、各 subtask 参与臂的起终点与 0→1 进度重采样轨迹、起终点覆盖与轨迹离散度指标），支持 `--episodes` 过滤；存在 `calib/*.head.json`（或显式传 `--calib`）时自动将各臂位置换算到标定后的工具点 `p_tcp + R_tcp @ tool_offset`，并在 `provenance.position_point` 记录（`tool_point` 或 `tcp`）。
 - `suggest`：读取 `distribution.json`、头部图像像素空间目标多边形（`targets/*.json`）与头部相机外参（`calib/*.head.json`），将多边形反投到各物体所在平面（`z` 取事件帧工具点 `z` 中位数），在多边形内按空白优先、稀疏其次、yaw 分箱均衡的原则抽样 N 个补采摆放，并生成 `dense` / `edge` / `empty` 三类测试点（附带头部像素坐标与朝向箭头端点）；写出 `suggestions/*.json`，可选导出 CSV。未提供目标多边形时默认使用数据包围盒外扩 5 cm；若已有标定但 `distribution.json` 仍基于原始 `tcp` 计算，则拒绝混用并提示重跑 `distribution`。
-- `calib-frames`：跨全部 episode 对每条臂的 TCP 位置与姿态执行最远点采样（默认每臂 15 帧），写出 `calib/*.frames.json`；已有文件时默认拒绝覆盖（防止重置 ID 导致已点选数据失效），支持 `--append K` 保留已有条目与 ID 追加采样，或显式传 `--overwrite` 重新生成。
-- `calibrate`：读取 `calib/*.points.json` 与 `calib/*.intrinsics.json`，按臂独立执行 `solvePnP` 初始化与外参 + 工具偏移 `tool_offset` 联合最小二乘求解，输出 `calib/*.head.json`（含每点残差、RMS 与留一误差）。
+- `calib-frames`：跨全部 episode 筛选夹爪闭合帧（默认 `gripper <= 0.05`，可通过 `--max-gripper` 调整），对每条臂的 TCP 位置与姿态执行最远点采样（默认每臂 15 帧），写出 `calib/*.frames.json`；已有文件时默认拒绝覆盖（防止重置 ID 导致已点选数据失效），支持 `--append K` 保留已有条目与 ID 追加采样，或显式传 `--overwrite` 重新生成。
+- `calibrate`：读取 `calib/*.points.json` 与 `calib/*.intrinsics.json`，按臂独立执行 `solvePnP` / `solvePnPRansac` 初始化与 `soft_l1` 鲁棒外参 + 工具偏移 `tool_offset` 联合最小二乘求解，输出 `calib/*.head.json`（含每点残差与离群点标记 `outlier`、全点与内点 RMS/留一误差）。
 
 面向标注 agent 的操作规范见 [docs/annotate.md](docs/annotate.md)，`distribution.json`、`suggestions.json` 与标定文件的完整字段与指标公式见 [docs/distribution.md](docs/distribution.md)。
 

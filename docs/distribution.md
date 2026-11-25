@@ -93,10 +93,13 @@ In `task_spec.subtasks` order. Each entry:
   - `participating_arms` uses `subtask.arms` if explicitly configured in the task spec, otherwise the unique arms of `task_spec.objects` belonging to that subtask.
 - `arms`: mapping `arm_name -> {"metrics": ..., "episodes": [...]}`
   - `episodes` (sorted by `episode_index`):
-    - `episode_index` (`int`), `start_frame` (`int`, equals `row.start`), `end_frame` (`int`, equals `row.end - 1`)
+    - `episode_index` (`int`)
+    - `start_frame` (`int`): frame used for `start_pose` — equals `row.grasp` when `grasp` is annotated, otherwise falls back to `row.start`
+    - `start_source` (`"grasp" | "start"`): indicates whether `start_pose` came from `row.grasp` or fell back to `row.start`
+    - `end_frame` (`int | null`): equals `row.end - 1` for non-final subtasks; `null` for the last subtask in task-spec order (which runs to episode end including final retraction)
     - `start_pose`: `{"x_m": float, "y_m": float, "z_m": float, "yaw_deg": float, "rot6d": [r1..r6]}` at `start_frame`
-    - `end_pose`: `{"x_m": float, "y_m": float, "z_m": float, "yaw_deg": float, "rot6d": [r1..r6]}` at `end_frame`
-    - `trajectory`: `K` progress-resampled points `{"progress": float, "x_m": float, "y_m": float, "z_m": float, "yaw_deg": float}` (no `rot6d` per trajectory sample) at `progress_i = i / (K - 1)` for `i = 0 .. K-1`.
+    - `end_pose`: `{"x_m": float, "y_m": float, "z_m": float, "yaw_deg": float, "rot6d": [r1..r6]}` at `end_frame`, or `null` for the last subtask in task-spec order (excluded from end coverage and end yaw histograms)
+    - `trajectory`: `K` progress-resampled points `{"progress": float, "x_m": float, "y_m": float, "z_m": float, "yaw_deg": float}` (no `rot6d` per trajectory sample) covering the full subtask interval `[row.start, row.end)` at `progress_i = i / (K - 1)` for `i = 0 .. K-1`.
       - Positions `(x_m, y_m, z_m)` use the calibrated tool point `p_tcp + R_tcp @ tool_offset` when `position_point == "tool_point"`, otherwise raw `p_tcp`.
       - For segment length $L = \text{end} - \text{start} \ge 2$, let $t_i = \text{progress}_i \cdot (L - 1)$, $f_0 = \lfloor t_i \rfloor$, $f_1 = \min(f_0 + 1, L - 1)$, $\alpha = t_i - f_0$. Position `(x_m, y_m, z_m)` is linearly interpolated between `f0` and `f1`; `yaw_deg` uses shortest-arc linear interpolation in `(-180, 180]`. When $L = 1$, all $K$ points repeat frame `0`.
 
@@ -105,9 +108,9 @@ In `task_spec.subtasks` order. Each entry:
 When `xense-lerobot-viewer` recomputes metrics for any user-selected subset of episodes, it must match `lerobot-check distribution --episodes <subset>` using these exact formulas:
 
 1. **Start / End Occupied XY Cells (`occupied_xy_cells`)**:
-   - Count of distinct `(floor(x_m / xy_bin_m), floor(y_m / xy_bin_m))` pairs across the selected episodes' `start_pose` (or `end_pose`). `0` if 0 episodes.
+   - Count of distinct `(floor(x_m / xy_bin_m), floor(y_m / xy_bin_m))` pairs across the selected episodes' non-null `start_pose` (or `end_pose`). `0` if 0 non-null poses (including the last subtask where `end_pose` is `null`).
 2. **Start / End Yaw Span (`yaw_span_deg`)**:
-   - Circular span on $S^1$: `0.0` if $M \le 1$.
+   - Circular span on $S^1$ over non-null poses: `0.0` if $M \le 1$.
    - For $M \ge 2$, wrap each `yaw_deg` into $[0, 360)$ via `((yaw % 360) + 360) % 360`, sort ascending to $\theta_0 \le \dots \le \theta_{M-1}$, compute the $M$ consecutive gaps $g_i = \theta_{i+1} - \theta_i$ ($0 \le i < M-1$) and $g_{M-1} = (\theta_0 + 360) - \theta_{M-1}$.
    - `yaw_span_deg = max(0.0, 360.0 - max(g_0, ..., g_{M-1}))`.
 3. **Trajectory Dispersion (`trajectory_dispersion_cm`)**:
@@ -159,9 +162,10 @@ Every element in `placements` and `test_points` has identical keys:
 ## Calibration File Contracts (`calib/*.json`, Schema Version 1)
 
 - `intrinsics.json`: `version`, `camera`, `device`, `image_size` (`[W, H]`), `fx`, `fy`, `cx`, `cy`, `distortion_model`, `distortion` (`[k1, k2, p1, p2, k3]`). Always read from file; never hard-coded.
-- `frames.json`: `version`, `repo_id`, `revision`, `camera`, `image_size`, `frames: [{"id": "left-000", "arm": "left", "episode_index": int, "frame_index": int, "tcp": [x, y, z, r1..r6]}]`.
+- `frames.json`: `version`, `repo_id`, `revision`, `camera`, `image_size`, `frames: [{"id": "left-000", "arm": "left", "episode_index": int, "frame_index": int, "tcp": [x, y, z, r1..r6]}]`. Newly sampled frames are filtered to closed-gripper frames (`gripper <= 0.05` by default, configurable via `--max-gripper`) so fingertip midpoints are sharp to click.
 - `points.json`: identical to `frames.json`, adding `"pixel": [u, v]` (midpoint of fingertips) or `"skipped": true`.
-- `head.json`: `version`, `repo_id`, `revision`, `camera`, `image_size`, `intrinsics` (copied verbatim), `arms: {<arm>: {"T_cam_base": [[4x4]], "tool_offset": [ox, oy, oz], "n_points": int, "rms_px": float, "loo_rms_px": float | null, "residuals": [{"id": str, "du": float, "dv": float}]}}`.
+- `head.json`: `version`, `repo_id`, `revision`, `camera`, `image_size`, `intrinsics` (copied verbatim), `arms: {<arm>: {"T_cam_base": [[4x4]], "tool_offset": [ox, oy, oz], "n_points": int, "n_inliers": int, "rms_px": float, "inlier_rms_px": float | null, "loo_rms_px": float | null, "inlier_loo_rms_px": float | null, "outlier_threshold_px": float, "residuals": [{"id": str, "du": float, "dv": float, "outlier": bool}]}}`.
   - Forward model: `pixel = project(K, dist, T_cam_base @ (p_tcp + R_tcp @ tool_offset))`, where `R_tcp = rotation_6d_to_matrix(r1..r6)`.
-  - Residuals: `du = u_pred - u_obs`, `dv = v_pred - v_obs`.
-  - `rms_px = sqrt(mean(du^2 + dv^2))` (Euclidean pixel RMSE). `loo_rms_px` is computed by refitting independently on each leave-one-out fold (`N >= 6`).
+  - Joint least squares uses two-stage robust loss (`soft_l1` warm start followed by redescending `cauchy` refinement, `f_scale = 3.0` px), initialized from `solvePnP` / `solvePnPRansac`.
+  - Residuals: `du = u_pred - u_obs`, `dv = v_pred - v_obs`. Points with `hypot(du, dv) > max(3 * median_err, 15.0)` px are flagged `"outlier": true` without being dropped.
+  - `rms_px = sqrt(mean(du^2 + dv^2))` over all points; `inlier_rms_px` over non-outlier points. `loo_rms_px` and `inlier_loo_rms_px` are computed by refitting independently on each leave-one-out fold (`N >= 6`).

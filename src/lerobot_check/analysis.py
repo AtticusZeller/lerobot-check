@@ -903,6 +903,7 @@ def compute_distribution_from_states(
     participating_arms_by_subtask: dict[str, tuple[str, ...]] = {
         st.name: task_spec.arms_for(st.name) for st in task_spec.subtasks
     }
+    last_spec_subtask = task_spec.subtasks[-1].name
 
     for ep_idx in sorted(by_episode):
         ep_rows = sorted(by_episode[ep_idx], key=lambda r: (r.start, r.end))
@@ -938,6 +939,15 @@ def compute_distribution_from_states(
         all_skipped_objects.extend(ep_skipped)
 
         for row in ep_rows:
+            is_last_subtask = row.subtask == last_spec_subtask
+            if row.grasp is not None:
+                start_frame = row.grasp
+                start_source = "grasp"
+            else:
+                start_frame = row.start
+                start_source = "start"
+            start_offset = start_frame - row.start
+
             for arm_name in participating_arms_by_subtask[row.subtask]:
                 if arm_name not in arms_by_name:
                     continue
@@ -949,46 +959,62 @@ def compute_distribution_from_states(
                 resampled = resample_segment_pose(
                     seg_xyz, seg_rot6d, num_samples=trajectory_samples
                 )
-                first_pt = resampled[0]
-                last_pt = resampled[-1]
+
+                start_xyz = seg_xyz[start_offset]
+                start_rot6d_arr = seg_rot6d[start_offset]
+                start_yaw = rotation_matrix_to_yaw_deg(rotation_6d_to_matrix(start_rot6d_arr))
                 start_pose = PoseXYZYaw(
-                    x_m=first_pt.x_m,
-                    y_m=first_pt.y_m,
-                    z_m=first_pt.z_m,
-                    yaw_deg=first_pt.yaw_deg,
-                )
-                end_pose = PoseXYZYaw(
-                    x_m=last_pt.x_m,
-                    y_m=last_pt.y_m,
-                    z_m=last_pt.z_m,
-                    yaw_deg=last_pt.yaw_deg,
+                    x_m=float(start_xyz[0]),
+                    y_m=float(start_xyz[1]),
+                    z_m=float(start_xyz[2]),
+                    yaw_deg=start_yaw,
                 )
 
                 key = (row.subtask, arm_name)
                 subtask_arm_start_poses[key].append(start_pose)
-                subtask_arm_end_poses[key].append(end_pose)
                 subtask_arm_traj_xyz[key].append(
                     np.array([[pt.x_m, pt.y_m, pt.z_m] for pt in resampled], dtype=np.float64)
                 )
+
+                end_frame: int | None
+                end_pose_payload: dict[str, Any] | None
+                if is_last_subtask:
+                    end_frame = None
+                    end_pose_payload = None
+                else:
+                    end_frame = row.end - 1
+                    end_xyz = seg_xyz[-1]
+                    end_rot6d_arr = seg_rot6d[-1]
+                    end_yaw = rotation_matrix_to_yaw_deg(rotation_6d_to_matrix(end_rot6d_arr))
+                    end_pose = PoseXYZYaw(
+                        x_m=float(end_xyz[0]),
+                        y_m=float(end_xyz[1]),
+                        z_m=float(end_xyz[2]),
+                        yaw_deg=end_yaw,
+                    )
+                    subtask_arm_end_poses[key].append(end_pose)
+                    end_pose_payload = {
+                        "x_m": end_pose.x_m,
+                        "y_m": end_pose.y_m,
+                        "z_m": end_pose.z_m,
+                        "yaw_deg": end_pose.yaw_deg,
+                        "rot6d": [float(v) for v in end_rot6d_arr],
+                    }
+
                 subtask_arm_episodes[key].append(
                     {
                         "episode_index": ep_idx,
-                        "start_frame": row.start,
-                        "end_frame": row.end - 1,
+                        "start_frame": start_frame,
+                        "start_source": start_source,
+                        "end_frame": end_frame,
                         "start_pose": {
                             "x_m": start_pose.x_m,
                             "y_m": start_pose.y_m,
                             "z_m": start_pose.z_m,
                             "yaw_deg": start_pose.yaw_deg,
-                            "rot6d": [float(v) for v in seg_rot6d[0]],
+                            "rot6d": [float(v) for v in start_rot6d_arr],
                         },
-                        "end_pose": {
-                            "x_m": end_pose.x_m,
-                            "y_m": end_pose.y_m,
-                            "z_m": end_pose.z_m,
-                            "yaw_deg": end_pose.yaw_deg,
-                            "rot6d": [float(v) for v in seg_rot6d[-1]],
-                        },
+                        "end_pose": end_pose_payload,
                         "trajectory": [
                             {
                                 "progress": pt.progress,

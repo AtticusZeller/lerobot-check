@@ -435,3 +435,161 @@ def test_calibrate_cli_missing_points_json_reports_clean_error(tmp_path, capsys)
     err = capsys.readouterr().err
     assert "points.json not found" in err
     assert "Xense__demo_ds.points.json" in err
+
+
+def test_select_calib_frames_filters_open_grippers() -> None:
+    import pytest
+
+    ep_idx = np.zeros(20, dtype=np.int64)
+    fr_idx = np.arange(20, dtype=np.int64)
+    # Frames 0..9 have open grippers (0.20..1.00) with extreme TCP positions that naive FPS
+    # would pick first; frames 10..19 have closed grippers (0.00..0.04).
+    tcps = np.zeros((20, 9), dtype=np.float64)
+    for i in range(20):
+        scale = 5.0 if i < 10 else 0.05
+        tcps[i, 0:3] = [1.0 + i * scale, 0.0, -0.3]
+        tcps[i, 3:9] = [1.0, 0.0, 0.0, 0.0, 1.0, 0.0]
+    grippers = np.array([0.2 + 0.08 * i for i in range(10)] + [0.004 * (i + 1) for i in range(10)])
+
+    class _FakeCalibDataset:
+        repo_id = "Xense/grip_test"
+        revision = "rev1"
+
+        def camera_image_size(self, camera_key: str) -> tuple[int, int]:
+            return (640, 480)
+
+        def load_arm_calib_table(self, episodes=None):
+            return ep_idx, fr_idx, {"right": tcps}, {"right": grippers}
+
+    ds = _FakeCalibDataset()
+    selected = select_calib_frames(ds, count_per_arm=5)  # type: ignore[arg-type]
+    chosen_frames = [f["frame_index"] for f in selected["frames"]]
+    assert len(chosen_frames) == 5
+    assert all(grippers[f] <= 0.05 for f in chosen_frames)
+
+    # Appending preserves an existing open-gripper entry while only adding closed frames.
+    existing_with_open = {
+        "version": 1,
+        "repo_id": "Xense/grip_test",
+        "revision": "rev1",
+        "camera": "observation.images.head",
+        "image_size": [640, 480],
+        "frames": [
+            {
+                "id": "right-000",
+                "arm": "right",
+                "episode_index": 0,
+                "frame_index": 0,
+                "tcp": tcps[0].tolist(),
+            }
+        ],
+    }
+    appended = select_calib_frames(
+        ds,  # type: ignore[arg-type]
+        existing=existing_with_open,
+        append_per_arm=3,
+    )
+    assert appended["frames"][0]["frame_index"] == 0
+    new_frames = [f["frame_index"] for f in appended["frames"][1:]]
+    assert len(new_frames) == 3
+    assert all(grippers[f] <= 0.05 for f in new_frames)
+
+    # Error clearly when threshold excludes all frames.
+    with pytest.raises(ValueError, match="No eligible closed-gripper frames"):
+        select_calib_frames(ds, count_per_arm=2, max_gripper_pos=0.0)  # type: ignore[arg-type]
+
+
+def test_robust_calibration_flags_outliers_and_recovers_pose() -> None:
+    rng = np.random.default_rng(99)
+    intr = _make_intrinsics()
+
+    cam_pos = np.array([0.30, 0.02, 0.42], dtype=np.float64)
+    look_at = np.array([1.00, 0.02, -0.32], dtype=np.float64)
+    z_axis = look_at - cam_pos
+    z_axis /= np.linalg.norm(z_axis)
+    x_axis = np.cross(z_axis, np.array([0.0, 0.0, 1.0]))
+    x_axis /= np.linalg.norm(x_axis)
+    y_axis = np.cross(z_axis, x_axis)
+    R_true = np.vstack([x_axis, y_axis, z_axis])
+    t_true = -(R_true @ cam_pos)
+    T_true = np.eye(4, dtype=np.float64)
+    T_true[:3, :3] = R_true
+    T_true[:3, 3] = t_true
+    offset_true = np.array([0.015, -0.022, 0.180], dtype=np.float64)
+
+    frames = []
+    clean_frames = []
+    for i in range(18):
+        p_tcp = np.array(
+            [
+                rng.uniform(0.80, 1.20),
+                rng.uniform(-0.02, 0.26),
+                rng.uniform(-0.35, -0.05),
+            ],
+            dtype=np.float64,
+        )
+        R_tcp = _euler_to_rot(
+            float(rng.uniform(-45.0, 45.0)),
+            float(rng.uniform(-45.0, 45.0)),
+            float(rng.uniform(-120.0, 120.0)),
+        )
+        uv = project_base_points(p_tcp + R_tcp @ offset_true, T_true, intr)[0]
+        uv = uv + rng.normal(0.0, 1.0 / math.sqrt(2.0), size=2)
+        base_entry = {
+            "id": f"right-{i:03d}",
+            "arm": "right",
+            "episode_index": i,
+            "frame_index": i * 10,
+            "tcp": np.concatenate([p_tcp, _rot_to_6d(R_tcp)]).tolist(),
+            "pixel": uv.tolist(),
+        }
+        if i not in (3, 11):
+            clean_frames.append(base_entry)
+        uv_obs = uv.copy()
+        if i == 3:
+            uv_obs = uv_obs + np.array([80.0, -20.0])
+        elif i == 11:
+            uv_obs = uv_obs + np.array([-55.0, 35.0])
+        frames.append({**base_entry, "pixel": uv_obs.tolist()})
+
+    head = calibrate_head_camera(
+        {
+            "version": 1,
+            "repo_id": "Xense/robust_test",
+            "revision": "rev1",
+            "camera": "observation.images.head",
+            "image_size": [640, 480],
+            "frames": frames,
+        },
+        intr,
+    )
+    clean_head = calibrate_head_camera(
+        {
+            "version": 1,
+            "repo_id": "Xense/robust_test",
+            "revision": "rev1",
+            "camera": "observation.images.head",
+            "image_size": [640, 480],
+            "frames": clean_frames,
+        },
+        intr,
+    )
+    res = head["arms"]["right"]
+    clean_res = clean_head["arms"]["right"]
+    assert res["n_points"] == 18
+    assert res["n_inliers"] == 16
+    assert len(res["residuals"]) == 18
+    flagged = {r["id"] for r in res["residuals"] if r["outlier"]}
+    assert flagged == {"right-003", "right-011"}
+    assert res["inlier_rms_px"] < 2.5
+    assert res["inlier_loo_rms_px"] is not None and res["inlier_loo_rms_px"] < 3.5
+    assert res["rms_px"] > res["inlier_rms_px"]
+
+    T_est = np.asarray(res["T_cam_base"], dtype=np.float64)
+    offset_est = np.asarray(res["tool_offset"], dtype=np.float64)
+    T_clean = np.asarray(clean_res["T_cam_base"], dtype=np.float64)
+    offset_clean = np.asarray(clean_res["tool_offset"], dtype=np.float64)
+    assert float(np.linalg.norm(T_est[:3, 3] - t_true) * 1000.0) < 10.0
+    assert float(np.linalg.norm(offset_est - offset_true) * 1000.0) < 5.0
+    assert float(np.linalg.norm(T_est[:3, 3] - T_clean[:3, 3]) * 1000.0) < 2.0
+    assert float(np.linalg.norm(offset_est - offset_clean) * 1000.0) < 2.0
