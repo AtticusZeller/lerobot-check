@@ -1,8 +1,8 @@
 # Agent Annotation Guide
 
-This guide describes the **coarse-to-fine visual workflow** for an annotating agent producing and validating subtask annotations on a LeRobot v3.0 dataset with `lerobot-check`.
+This guide describes the visual workflow for an annotating agent producing and validating subtask annotations on a LeRobot v3.0 dataset with `lerobot-check`.
 
-Gripper signals alone are not reliable enough to determine subtask boundaries or grasps (for example, a gripper may flip a lid with open jaws or hold a tool that blocks finger closure). Annotation is therefore **visual first**: inspect rendered frames at a coarse stride using the subtask's configured camera(s), stop scanning as soon as every required boundary and `grasp` frame is localized, then zoom in around each candidate event.
+Gripper signals alone are not reliable enough to determine subtask boundaries or grasps (for example, a gripper may flip a lid with open jaws or hold a tool that blocks finger closure). Annotation is therefore **visual first**: place approximate boundaries from a fast single-camera coarse grid, then refine every boundary across all episodes with `boundary-sheet`.
 
 ## Shared Default Paths
 
@@ -13,107 +13,53 @@ When `--task-spec` or `--annotations` is omitted, `lerobot-check` reads and writ
 - Distribution JSON: `<lerobot_root>/.xense-viewer/distribution/<org>__<name>@<revision>.json`
 - Suggestions JSON: `<lerobot_root>/.xense-viewer/suggestions/<org>__<name>@<revision>.json`
 
-Explicit `--task-spec`, `--annotations`, and `-o` arguments remain supported and override defaults. Never write rendered PNGs, proposals, or annotation CSVs into the git repository.
+Explicit `--task-spec`, `--annotations`, and `-o` arguments remain supported and override defaults. Never write rendered images, proposals, or annotation CSVs into the git repository.
 
 ## Workflow
 
 Run commands from the repository root with `uv run`.
 
-### 0. Inspect Dataset Metadata (`info`)
+### 1. Inspect Dataset Metadata and Task Spec (`info`)
 
-Start by checking `repo_id`, `revision`, `fps`, available `cameras`, episode lengths, and default `.xense-viewer/` paths:
+Check `repo_id`, `revision`, `fps`, available `cameras`, episode lengths, and default `.xense-viewer/` paths:
 
 ```bash
 uv run lerobot-check info --dataset-root /path/to/dataset
 ```
 
-Use the exact `revision` printed by `info` in the annotation CSV.
+Read the task spec YAML comments for any subtask-specific boundary overrides, and note which subtasks have an `objects` entry with `event: grasp`. Use the exact `revision` printed by `info` in the annotation CSV.
 
-### 1. Coarse Pass (Per-Subtask Camera Grid, Stop Once Localized)
+### 2. Coarse Pass and Initial Table (`render --columns`)
 
-Use `--subtask <name>` so `render` selects the camera(s) configured for that subtask in the task spec (for example, `observation.images.right_wrist` for `open_carton`). Render at ~1 s spacing (`::30` at 30 fps) in a compact `--columns N` grid when the subtask uses a single camera:
+Render a single-camera (`head`) coarse grid at ~1 s spacing (`::30` at 30 fps) for each episode:
 
 ```bash
 uv run lerobot-check render \
   --dataset-root /path/to/dataset \
   --episode 0 \
-  --subtask open_carton \
   --frames ::30 \
   --columns 6 \
   --tile-width 240 \
   -o /tmp/lerobot-check/ep0000_coarse.png
 ```
 
-Inspect generated pages **in order** and **stop as soon as you have located every boundary and `grasp` you need**. Do not read trailing coarse-scan pages after the last target event is already localized (for example, when finding only the `open_carton` -> `place_eggs` boundary in a 2-subtask episode, stop on the page where the lid lies flat).
-
-If a subtask configures multiple cameras in the task spec, omit `--columns` to render them side by side, or pass `--cameras <cam>` explicitly for a single-camera coarse grid.
-
-### 2. Fine Pass (Compare Against Human Exemplars, ±1 s at 1–3 Frame Stride)
-
-Before placing a boundary (or `grasp`) in a new episode, render the user's own human-reviewed exemplars for that boundary so you match the **exact same physical event**:
-
-```bash
-uv run lerobot-check exemplars \
-  --repo-id Xense/pack_iphone_box_1119 \
-  --boundary place_phone:move_lid \
-  --max-episodes 3 \
-  --window-s 1.0 \
-  --stride 3 \
-  -o /tmp/lerobot-check/exemplars
-```
-
-For grasp frames, pass `--boundary <subtask>:grasp` (for example `--boundary place_phone:grasp`). Each exemplar PNG shows the subtask's configured cameras (the union of both subtasks' `cameras` for a transition boundary) over `[b - window, b + window)` with the human-reviewed frame highlighted by a red border and `BOUNDARY` / `GRASP` badge. If no human exemplars exist yet for that boundary, `exemplars` prints a message and exits `0` so you can proceed from the written rules.
-
-The task spec comments state the written rule; the exemplars show the user's standard. **If the exemplars and the written rule disagree, follow the exemplars and record the discrepancy in the row's `note`.**
-
-For each approximate frame found in the coarse pass, render a ±1 s window (`--window-s 1.0`) at 1–3 frame stride (`--stride 2` or `3`, or `--stride 1` when exact precision is needed) using `--subtask <name>`:
-
-```bash
-uv run lerobot-check render \
-  --dataset-root /path/to/dataset \
-  --episode 0 \
-  --subtask open_carton \
-  --events 411 \
-  --window-s 1.0 \
-  --stride 3 \
-  --tile-width 320 \
-  -o /tmp/lerobot-check/ep0000_fine_411.png
-```
-
-You can also pass an explicit **half-open** range `[start, end)` with `--frames 381:441:2` (frame `441` is excluded, matching the annotation table's `[start, end)` convention).
-
-Multi-camera stitching is **optional**: pass `--cameras head left_wrist right_wrist` only when the subtask's default camera(s) are occluded or ambiguous. Adjust `--tile-width` and `--max-frames-per-image` to stay within vision token budgets.
-
-### 3. Optional Hints (`propose`)
-
-If helpful for orienting on long episodes, you may run `lerobot-check propose` as an **optional hint** only:
-
-```bash
-uv run lerobot-check propose \
-  --dataset-root /path/to/dataset \
-  --episodes 0 \
-  -o /tmp/lerobot-check/proposals.csv
-```
-
-Proposed rows (`gripper_close`, `gripper_open`, `squeeze`, `low_speed`) are heuristic candidates, not ground truth. Always confirm every boundary and `grasp` visually on the rendered frames.
-
-### 4. Write the Annotation Table
-
-Write one CSV per `(repo_id, revision)` (by default at `<lerobot_root>/.xense-viewer/subtasks/<org>__<name>@<revision>.csv`) with the exact header:
+Place every boundary at its approximate frame from this coarse grid—do not run a per-boundary fine pass or render exemplars per boundary—and write one CSV per `(repo_id, revision)` (default `<lerobot_root>/.xense-viewer/subtasks/<org>__<name>@<revision>.csv`) with the exact header:
 
 ```text
 repo_id,revision,episode_index,subtask,start,end,contact,grasp,success,annotator,note
 ```
 
-- Set `revision` to the dataset's exact revision hash from `lerobot-check info`.
-- Set `annotator` to `agent` (human reviewers later review and adjust rows in `xense-lerobot-viewer`, which flips edited rows to `human`).
-- Set `success` to lowercase `true` or `false`.
-- **Leave `contact` empty** (`contact` is no longer annotated; the column stays in the CSV schema for compatibility and empty is legal).
-- Annotate `grasp` for every subtask that grasps or holds something, whether or not the task spec lists an `objects` entry for it (for example `flip_lid`); leave `grasp` empty when the subtask does not grasp. Leave `note` empty when not applicable.
+- Set `revision` to the exact hash from `lerobot-check info`, `annotator` to `agent`, and `success` to lowercase `true` or `false`.
+- **Leave `contact` empty** (legacy column kept for schema compatibility).
+- Fill `grasp` only for subtasks with an `objects` entry of `event: grasp` in the task spec; leave `grasp` empty for other subtasks. Leave `note` empty when not applicable.
 
-### 5. Validate Against Dataset Metadata
+### 3. Boundary Self-Check Loop (`boundary-sheet`)
 
-Validate the CSV before finishing (omitting `--task-spec` / `--annotations` uses the shared default paths):
+Precision comes from inspecting every non-final subtask's end frame across all episodes side by side. Run the [Boundary self-check loop](#boundary-self-check-loop) with `lerobot-check boundary-sheet` to refine every `agent` row's `end` until all tiles pass, then render the final full sheets (`--per-page 0 --columns 4`) for human review.
+
+### 4. Validate (`validate`)
+
+Validate the finished CSV against dataset metadata and the task spec:
 
 ```bash
 uv run lerobot-check validate --dataset-root /path/to/dataset
@@ -121,36 +67,7 @@ uv run lerobot-check validate --dataset-root /path/to/dataset
 
 Exit code `0` means zero violations; fix all reported issues and re-run.
 
-### 6. Review End Frames Across Episodes (`boundary-sheet`)
-
-After writing and validating annotations, run the [Boundary self-check loop](#boundary-self-check-loop) with `lerobot-check boundary-sheet` to inspect every non-final subtask's end frame across all episodes before handing off to a human reviewer.
-
-## Judgement Rules
-
-### Subtask Boundary (`start`, `end`)
-
-- **Default pick-and-place end rule (`end - 1`)**: pick and place of one object belong to the **same** subtask. A pick-and-place subtask's last frame (`end - 1`) is the first frame where the last gripper holding (or pressing/steadying) its object has opened and lifted clear of it, with its jaws in the air just above the settled object. Too early: the gripper still touches or presses the object. Too late: the arm has already retracted toward the next object.
-- **Subtask-specific end-rule overrides**: a subtask may define its own end rule in the task spec (written as a YAML comment directly above that subtask), which overrides the default release rule above — for example, `flip_lid` ends at the frame the flipped lid first lands on the box even if a hand still holds it. Always read the task spec comments before annotating.
-- **Retraction and next-stage prep**: further arm retraction after the gripper has lifted clear and the approach toward the next object belong to subtask $k+1$, **not** subtask $k$. Conversely, if the non-contacting arm begins moving toward the next subtask's object *before* the last gripper lifts clear of the current object, those frames still belong to subtask $k$.
-- **Half-open intervals**: each row covers `[start, end)`. Sorted by `start`, rows within an episode must satisfy `start_0 = 0`, `start_{k+1} = end_k`, and `end_last = episode_length`. Prompts switch at `end_k`.
-- **Order and supplement episodes**: subtask names must come from the task spec and appear in task spec order as a contiguous subsequence. Single-stage or partial-stage supplement episodes are legal when they cover `[0, episode_length)`.
-- **Unannotated / bad episodes**: corrupted or unannotated episodes may be omitted from the table rather than fabricated.
-
-### Grasp (`grasp`) and Legacy `contact` Column
-
-- **`contact`**: no longer annotated; leave empty. (Existing rows containing a `contact` value remain valid as long as `start <= contact <= grasp < end`.)
-- **`grasp`**: record the first frame within `[start, end)` where the gripper jaws have closed on the object, even when the lift starts some frames later; after a failed attempt, use the closure of the attempt that carries the object. It is required for any subtask that grasps something, not only those with an `event: grasp` object: `distribution` reads the TCP pose at this frame both as the object's initial pose (for `objects` entries) and as the subtask's trajectory start (`start_source: grasp`; without it the start falls back to the subtask's first frame). When the jaws never close on the object, such as an open-jaw hold that cradles or straddles it (human exemplars for `flip_lid` use this), record the frame where the hold is formed and the object then moves with the gripper.
-- **Nullable fields**: if a subtask completes without grasping (for example, only pushing or pressing), leave `grasp` empty. Never invent frame numbers.
-
-### Per-Subtask Outcome (`success`)
-
-- Evaluate `success` independently for **each subtask** against that subtask's physical goal before `end`:
-  - `true`: the subtask completes its goal cleanly.
-  - `false`: the robot fails to complete the subtask, drops/displaces the object without recovering, or leaves the stage incomplete. Record a short reason in `note`.
-
 ## Boundary self-check loop
-
-Reviewing every episode's subtask end frames side by side catches boundary drift much faster than checking episodes one at a time. Run this self-check loop before handing annotations to a human reviewer:
 
 1. **Render sheets for all non-final subtasks** with `lerobot-check boundary-sheet` (the last subtask runs to the episode end and is excluded automatically). For `pack_iphone_box`-style tabletop scenes, cropping the head camera (for example `--crop head=90,40,550,360`) keeps the active workspace legible alongside the wrist cameras:
 
@@ -161,8 +78,8 @@ uv run lerobot-check boundary-sheet \
   -o /tmp/lerobot-check/boundary-sheets
 ```
 
-2. **Judge every tile** on each `<k>_<subtask>_end_p<page>.jpg` sheet as `ok`, `early`, or `late` using the Subtask Boundary rule above and any subtask-specific override in the task spec. Wrist cameras often show jaw clearance more clearly than the head camera. Each tile is labeled `ep<idx> f<frame>`, with a coloured `H` marker when the row's `annotator` is `human`.
-3. **Fix bad `agent` rows only**: for each bad tile whose row has `annotator == agent`, update that row's `end` (delay `end` if `early`, advance `end` if `late`) and the next row's `start` in the same edit so intervals stay contiguous. **Never edit `human` rows** — if a `human`-marked tile looks off, leave the CSV untouched and report it to the human reviewer instead.
+2. **Judge every tile** on each `<k>_<subtask>_end_p<page>.jpg` sheet as `ok`, `early`, or `late` using the Subtask Boundary rule below and any subtask-specific override in the task spec. Wrist cameras often show jaw clearance more clearly than the head camera. Each tile is labeled `ep<idx> f<frame>`, with a coloured `H` marker when the row's `annotator` is `human`.
+3. **Fix bad `agent` rows only**: for each bad tile whose row has `annotator == agent`, update that row's `end` (delay `end` if `early`, advance `end` if `late`) and the next row's `start` in the same edit so intervals stay contiguous. **Never edit `human` rows**—if a `human`-marked tile looks off, leave the CSV untouched and report it to the human reviewer instead.
 4. **Re-render only the changed episodes** with `--episodes` (inclusive ranges supported) and re-check those tiles:
 
 ```bash
@@ -191,3 +108,33 @@ uv run lerobot-check boundary-sheet \
   --columns 4 \
   -o /tmp/lerobot-check/boundary-sheets-final
 ```
+
+## Optional Tools
+
+Use these only when a specific tile or event is unclear (for example, an occluded tile during the self-check loop or an `event: grasp` frame):
+
+- **Fine strip around one frame (`render`)**: render a ±1 s multi-camera strip around a candidate frame (`--events 411 --window-s 1.0 --stride 3`, or an explicit half-open `--frames 381:441:2`) using `--subtask <name>` or `--cameras head left_wrist right_wrist`.
+- **Human exemplars (`exemplars`)**: render human-reviewed reference strips for a boundary (`--boundary place_phone:move_lid`) or grasp (`--boundary place_phone:grasp`). Exits `0` if none exist yet. If human exemplars and task-spec comments disagree, follow the exemplars and record the discrepancy in `note`.
+- **Proprioceptive hints (`propose`)**: emit heuristic `gripper_close`, `gripper_open`, `squeeze`, and `low_speed` candidates for orienting on long episodes; always confirm visually.
+
+## Judgement Rules
+
+### Subtask Boundary (`start`, `end`)
+
+- **Default pick-and-place end rule (`end - 1`)**: pick and place of one object belong to the **same** subtask. A pick-and-place subtask's last frame (`end - 1`) is the first frame where the last gripper holding (or pressing/steadying) its object has opened and lifted clear of it, with its jaws in the air just above the settled object. Too early: the gripper still touches or presses the object. Too late: the arm has already retracted toward the next object.
+- **Subtask-specific end-rule overrides**: a subtask may define its own end rule in the task spec (written as a YAML comment directly above that subtask), which overrides the default release rule above—for example, `flip_lid` ends at the frame the flipped lid first lands on the box even if a hand still holds it. Always read the task spec comments before annotating.
+- **Retraction and next-stage prep**: further arm retraction after the gripper has lifted clear and the approach toward the next object belong to subtask $k+1$, **not** subtask $k$. Conversely, if the non-contacting arm begins moving toward the next subtask's object *before* the last gripper lifts clear of the current object, those frames still belong to subtask $k$.
+- **Half-open intervals**: each row covers `[start, end)`. Sorted by `start`, rows within an episode must satisfy `start_0 = 0`, `start_{k+1} = end_k`, and `end_last = episode_length`. Prompts switch at `end_k`.
+- **Order and supplement episodes**: subtask names must come from the task spec and appear in task spec order as a contiguous subsequence. Single-stage or partial-stage supplement episodes are legal when they cover `[0, episode_length)`.
+- **Unannotated / bad episodes**: corrupted or unannotated episodes may be omitted from the table rather than fabricated.
+
+### Grasp (`grasp`) and Legacy `contact` Column
+
+- **`contact`**: no longer annotated; leave empty. (Existing rows containing a `contact` value remain valid as long as `start <= contact <= grasp < end`.)
+- **`grasp`**: required only for subtasks that have an `objects` entry with `event: grasp` in the task spec (needed for object initial poses in `distribution`). For other subtasks, leave `grasp` empty (the trajectory start then falls back to the subtask's first frame). Where required, record the first frame within `[start, end)` where the gripper jaws have closed on the object, even when the lift starts some frames later; after a failed attempt, use the closure of the attempt that carries the object. When the jaws never close on the object, such as an open-jaw hold that cradles or straddles it, record the frame where the hold is formed and the object then moves with the gripper. Never invent frame numbers.
+
+### Per-Subtask Outcome (`success`)
+
+- Evaluate `success` independently for **each subtask** against that subtask's physical goal before `end`:
+  - `true`: the subtask completes its goal cleanly.
+  - `false`: the robot fails to complete the subtask, drops/displaces the object without recovering, or leaves the stage incomplete. Record a short reason in `note`.
