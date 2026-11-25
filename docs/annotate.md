@@ -109,7 +109,7 @@ repo_id,revision,episode_index,subtask,start,end,contact,grasp,success,annotator
 - Set `annotator` to `agent` (human reviewers later review and adjust rows in `xense-lerobot-viewer`, which flips edited rows to `human`).
 - Set `success` to lowercase `true` or `false`.
 - **Leave `contact` empty** (`contact` is no longer annotated; the column stays in the CSV schema for compatibility and empty is legal).
-- Annotate `grasp` whenever the subtask grasps an object whose initial pose is sampled at `event: grasp` in the task spec; leave `grasp` empty when the subtask does not grasp. Leave `note` empty when not applicable.
+- Annotate `grasp` for every subtask that grasps or holds something, whether or not the task spec lists an `objects` entry for it (for example `flip_lid`); leave `grasp` empty when the subtask does not grasp. Leave `note` empty when not applicable.
 
 ### 5. Validate Against Dataset Metadata
 
@@ -135,8 +135,8 @@ Exit code `0` means zero violations; fix all reported issues and re-run.
 ### Grasp (`grasp`) and Legacy `contact` Column
 
 - **`contact`**: no longer annotated; leave empty. (Existing rows containing a `contact` value remain valid as long as `start <= contact <= grasp < end`.)
-- **`grasp`**: required for any subtask that defines an `event: grasp` object in the task spec — record the first frame within `[start, end)` where the object is securely held and begins moving with the gripper. `distribution` reads the TCP pose at this frame as the object's initial pose.
-- **Nullable fields**: if a subtask completes without grasping (for example, pushing or flipping a lid with open jaws), leave `grasp` empty. Never invent frame numbers.
+- **`grasp`**: record the first frame within `[start, end)` where the object is securely held and begins moving with the gripper. It is required for any subtask that grasps something, not only those with an `event: grasp` object: `distribution` reads the TCP pose at this frame both as the object's initial pose (for `objects` entries) and as the subtask's trajectory start (`start_source: grasp`; without it the start falls back to the subtask's first frame). A hold with open jaws that cradles or straddles the object counts when the object then moves with the gripper (human exemplars for `flip_lid` use this).
+- **Nullable fields**: if a subtask completes without grasping (for example, only pushing or pressing), leave `grasp` empty. Never invent frame numbers.
 
 ### Per-Subtask Outcome (`success`)
 
