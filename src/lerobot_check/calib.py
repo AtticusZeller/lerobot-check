@@ -192,10 +192,17 @@ def load_intrinsics(path: Path) -> CameraIntrinsics:
 
 def load_head_calibration(path: Path) -> HeadCalibration:
     """Load a calibrated ``head.json`` file into a ``HeadCalibration``."""
-    raw = json.loads(path.read_text(encoding="utf-8"))
+    return parse_head_calibration(path.read_bytes(), source=str(path))
+
+
+def parse_head_calibration(content: bytes, *, source: str = "head.json") -> HeadCalibration:
+    try:
+        raw = json.loads(content.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Invalid head calibration JSON at {source}") from exc
     if not isinstance(raw, dict) or raw.get("version") != CALIB_SCHEMA_VERSION:
         raise ValueError(
-            f"Unsupported head calibration at {path} (expected version={CALIB_SCHEMA_VERSION})"
+            f"Unsupported head calibration at {source} (expected version={CALIB_SCHEMA_VERSION})"
         )
     intrinsics = parse_intrinsics(raw["intrinsics"])
     image_size_raw = raw["image_size"]

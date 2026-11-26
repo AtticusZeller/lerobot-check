@@ -61,6 +61,10 @@ uv run lerobot-check mask-overlays --suggestions "$SUGGESTIONS" --calib "$HEAD" 
 
 轮廓使用事件帧记录的工具点及 yaw 做锚，在 `suggest` 的平面拟合并变换到目标位置。工具并不测量真实物体中心、厚度或三维朝向。若已知可见面的高度不同，用 `--height-offset-m` 给一个相对建议平面的有符号偏移。更换标定或平面后重建模板，建议点变化后重新投影。`mask-overlays` 不装模型，不修改采样，也不改变 `suggestions.json`。
 
+## 补采轮次与进度
+
+`collection-plan` 将已审核模板和覆盖采样结果组合为按轮采集的便携 JSON，支持拒绝相交轮次、单轮审核、避开已采位置与回传进度。[补采计划 v1 契约](docs/collection-plan.md) 列出生成命令、字段以及采集端和自动对齐接入方式。
+
 ## 安装与环境
 
 要求 Python >= 3.12 与 [uv](https://docs.astral.sh/uv/)，依赖固定版本的 PyPI `lerobot==0.5.1`（不依赖 `lerobot-xense` 或任何硬件 SDK）：
