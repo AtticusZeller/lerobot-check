@@ -978,6 +978,8 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level argument parser for ``lerobot-check``."""
+    from lerobot_check.mask_cli import configure_overlays_parser, configure_template_parser
+
     parser = argparse.ArgumentParser(
         prog="lerobot-check",
         description=(
@@ -1683,6 +1685,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     calibrate_parser.set_defaults(func=_cmd_calibrate)
 
+    configure_template_parser(
+        subparsers.add_parser(
+            "mask-template", help="Prepare a reviewed head-camera object outline."
+        )
+    )
+    configure_overlays_parser(
+        subparsers.add_parser(
+            "mask-overlays", help="Project reviewed outlines onto collection targets."
+        )
+    )
     return parser
 
 

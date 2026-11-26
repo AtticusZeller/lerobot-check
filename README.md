@@ -32,6 +32,35 @@ CLI 入口为 `lerobot-check`，提供以下子命令：
 
 不传显式路径参数时自动读写上述默认路径；显式传参仍会覆盖默认路径。
 
+## 补采目标轮廓
+
+沿用已有的 calibrated `distribution.json`、`suggestions.json` 和 `head.json`。这些命令只读数据集。把生成物留在本地，不提交视频帧、标定或模板。
+
+```bash
+# 先按该物体的事件帧在附近找一个无遮挡、物体没有移动的头图。
+uv run lerobot-check mask-template --distribution "$DIST" --calib "$HEAD" \
+  --object iphone --episode 0 --frame 0 --preview /tmp/iphone-source.png --preview-only
+
+# 在原图像素坐标内框选物体；需要时可重复添加 --positive X Y / --negative X Y。
+uv run --extra mask-template lerobot-check mask-template \
+  --distribution "$DIST" --calib "$HEAD" --object iphone --episode 0 --frame 0 \
+  --box 351 184 397 252 --preview /tmp/iphone-mask.png --output /tmp/iphone.json
+
+# 检查预览：轮廓应覆盖物体且不包含夹爪或邻近物体，然后才把模板加入生成命令。
+# 不可用的模板也能显式写入原因，例如 box_base 的事件记录的是释放纸垫。
+uv run lerobot-check mask-template --distribution "$DIST" --calib "$HEAD" \
+  --object box_base --reject 'Release is not the box base pose' --output /tmp/box_base.json
+
+mkdir -p "$LOCAL_DATASET_ROOT/.xense-viewer/masks"
+uv run lerobot-check mask-overlays --suggestions "$SUGGESTIONS" --calib "$HEAD" \
+  --template /tmp/iphone.json --template /tmp/box_base.json \
+  --output "$LOCAL_DATASET_ROOT/.xense-viewer/masks/${SLUG}@${REVISION}.json"
+```
+
+`DIST`、`HEAD` 和 `SUGGESTIONS` 是上述默认目录里的已有文件路径；`SLUG` 为 `org__name`，`REVISION` 与建议文件同名。若数据集不在默认本地缓存，给 `mask-template` 加 `--dataset-root /path/to/dataset`。框示例针对 `Xense/pack_iphone_box_1119` 的参考帧，其他图必须重新框选。`mask-template --preview-only` 不需要模型。只有分割步骤使用可选的 Transformers 依赖和固定版本 SAM 2.1 Hiera Tiny（约 156 MB 权重，首次运行下载；缓存后可设 `HF_HUB_OFFLINE=1`）。默认 CPU，也可用 `--device cuda`。
+
+轮廓使用事件帧记录的工具点及 yaw 做锚，在 `suggest` 的平面拟合并变换到目标位置。工具并不测量真实物体中心、厚度或三维朝向。若已知可见面的高度不同，用 `--height-offset-m` 给一个相对建议平面的有符号偏移。更换标定或平面后重建模板，建议点变化后重新投影。`mask-overlays` 不装模型，不修改采样，也不改变 `suggestions.json`。
+
 ## 安装与环境
 
 要求 Python >= 3.12 与 [uv](https://docs.astral.sh/uv/)，依赖固定版本的 PyPI `lerobot==0.5.1`（不依赖 `lerobot-xense` 或任何硬件 SDK）：
