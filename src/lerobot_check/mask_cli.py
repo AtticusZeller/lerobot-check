@@ -4,7 +4,6 @@ import argparse
 import json
 import math
 import sys
-from importlib import import_module
 from pathlib import Path
 
 import numpy as np
@@ -19,9 +18,7 @@ from lerobot_check.masks import (
     read_head_frame,
     sha256_bytes,
 )
-
-MODEL = "facebook/sam2.1-hiera-tiny"
-MODEL_REVISION = "de431c4043854a71d8101e17995dfe596bf101a5"
+from lerobot_check.segmentation import MODEL, MODEL_REVISION, SamSegmenter
 
 
 def segment(
@@ -31,30 +28,7 @@ def segment(
     negative: list[list[float]],
     device: str,
 ) -> np.ndarray:
-    try:
-        transformers = import_module("transformers")
-    except ModuleNotFoundError as exc:
-        if exc.name != "transformers":
-            raise
-        raise ValueError(
-            "Install segmentation with: uv run --extra mask-template lerobot-check ..."
-        ) from exc
-    torch = import_module("torch")
-    processor = transformers.Sam2Processor.from_pretrained(MODEL, revision=MODEL_REVISION)
-    model = transformers.Sam2Model.from_pretrained(MODEL, revision=MODEL_REVISION).to(device).eval()
-    points = positive + negative
-    prompts = (
-        {"input_points": [[points]], "input_labels": [[[1] * len(positive) + [0] * len(negative)]]}
-        if points
-        else {}
-    )
-    inputs = processor(images=image, input_boxes=[[box]], return_tensors="pt", **prompts)
-    original_sizes = inputs.pop("original_sizes")
-    with torch.inference_mode():
-        result = model(**inputs.to(device))
-    masks = processor.post_process_masks(result.pred_masks.cpu(), original_sizes)[0]
-    best = int(result.iou_scores[0, 0].argmax().item())
-    return masks[0, best].numpy()
+    return SamSegmenter(device).predict(image, [box], positive=positive, negative=negative)[0]
 
 
 def read_json(path: Path, content: bytes) -> dict:

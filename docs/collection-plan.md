@@ -80,4 +80,4 @@ with plan_session(Path(explicit_plan_path)) as session:
 
 ## #2：自动对齐读取的字段
 
-[自动对齐](https://github.com/AtticusZeller/lerobot-check/issues/2) 输入是 reset 中的原生头部帧与当前 `targets`。用 `outline` 和可选 `pixel` 做分割提示并与实际轮廓比较交并比；需要由像素比较基座位置/朝向时，使用与 `calibration_sha256` 匹配的 `head.json`，按 `arm` 选外参，投回 `outline_plane_z_m`；使用 `x_m/y_m/z_m` 作为目标锚点，`yaw_deg` 与 `yaw_symmetry_deg` 定义目标朝向及周期。不要将实际轮廓质心直接与工具锚点相减；两者偏移不一定为零。轮廓为 `null` 的目标（包括当前的 `box_base`）仅供人工确认，不计算自动分数，不得当作自动对齐通过。计划不包含算法、阈值或现场标定；#2 独立提供这些，#5 只需在 reset 调用，不改变录制循环。
+[自动对齐](collection-alignment.md) 直接接受本模块读出的 `CollectionPlan`、当前轮次的 `targets` 和 reset 中的原生头部帧。第一版使用 `outline` 的扩边框做分割提示，并计算实际 mask 与目标的交并比。不使用基座位置、yaw 或 `outline_plane_z_m`，也不读取 `head.json`。`box_base` 和轮廓为 `null` 的目标只供人工确认。判定阈值独立于计划配置；#5 只在 reset 调用，不改变录制循环。
