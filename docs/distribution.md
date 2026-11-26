@@ -159,6 +159,14 @@ Every element in `placements` and `test_points` has identical keys:
 - When a target polygon is provided (via `--targets` or the default `targets/` path), `head.json` calibration is required; `suggest` fails with an error rather than silently falling back if calibration is absent.
 - When no target polygon exists, `suggest` emits a warning and uses each object's observed data bounding box expanded by 5 cm on each side (`region_source: "data_bbox_plus_5cm"`).
 
+## Collection mask bundle (`masks/<org>__<name>@<revision>.json`, v1)
+
+`mask-overlays` writes a separate JSON document without changing `suggestions.json`. The top-level keys are `version: 1`, `repo_id`, `revision`, `camera`, `image_size: [W, H]`, `calibration_sha256`, `suggestions_sha256` (hex digests of the source file bytes), `sources` (template provenance by object), and `targets`.
+
+Each `targets` row is uniquely identified by `(kind, object, tier, index)`. `kind` is `placement` or `test_point`; the other identity fields and `pixel` / `arrow_end_pixel` come from the suggestion row. The viewer and live preview infer the same display number: bare index for placements and `D`, `E`, or `X` followed by the index for dense, edge, or empty test points. `outline` is an implicitly closed exterior ring in native head image coordinates; it is `null` when unavailable. Exactly one of `outline` and a nonempty explanatory `reason` is present (the other is `null`).
+
+`mask-template` writes a separate per-object input JSON. Its source records the RGB image frame separately from its annotated pose-anchor frame (grasp or release), along with the event tool-point XY, raw yaw, model revision and prompts. The exterior is back-projected to the object's `z_plane_m + height_offset_m`, translated by the negative tool-point XY and unrotated by the reference yaw to store `outline_xy_m` in local meters. At each target the reverse transform uses the target XY and a per-period yaw equivalent nearest the reference yaw, the same height offset, and the object's calibrated arm. The original arrow retains the suggested folded yaw. A `--reject` template supplies a reason instead of local geometry.
+
 ## Calibration File Contracts (`calib/*.json`, Schema Version 1)
 
 - `intrinsics.json`: `version`, `camera`, `device`, `image_size` (`[W, H]`), `fx`, `fy`, `cx`, `cy`, `distortion_model`, `distortion` (`[k1, k2, p1, p2, k3]`). Always read from file; never hard-coded.
