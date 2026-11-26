@@ -144,8 +144,10 @@ def test_bundle_preserves_target_ids_and_explicit_failures(head):
 
     good, outside = bundle([template])["targets"]
     assert good["kind"] == "placement" and good["outline"] is not None
+    assert item["tier"] == "empty" and "tier" not in good
     assert good["arrow_end_pixel"] == item["arrow_end_pixel"]
     assert outside["kind"] == "test_point" and outside["outline"] is None
+    assert outside["tier"] == "dense"
     assert "beyond" in outside["reason"]
     assert bundle([])["targets"][0]["reason"] == "No reviewed template for this object"
     assert (

@@ -157,7 +157,8 @@ def make_bundle(
             targets.append(
                 {
                     "kind": kind,
-                    **{k: item[k] for k in ("object", "tier", "index", "pixel", "arrow_end_pixel")},
+                    **{k: item[k] for k in ("object", "index", "pixel", "arrow_end_pixel")},
+                    **({"tier": item["tier"]} if kind == "test_point" else {}),
                     "outline": outline,
                     "reason": reason,
                 }
