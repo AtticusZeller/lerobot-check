@@ -15,9 +15,11 @@ import numpy as np
 from lerobot_check.calib import HeadCalibration
 from lerobot_check.dataset import ArmState, DatasetView, rotation_6d_to_matrix
 from lerobot_check.object_pose import (
+    OBJECT_LAYER_NOT_MEASURED,
     OBJECT_LAYER_SOURCE,
     OBJECT_POSE_FRAME,
     object_yaw_period_deg,
+    parse_sidecar_object,
     validate_object_poses_sidecar,
 )
 from lerobot_check.schema import AnnotationRow, CoverageSpec, ObjectSpec, TaskSpec
@@ -846,57 +848,45 @@ def _serialize_object_coverage(cov: ObjectCoverage) -> dict[str, Any]:
 
 def _build_object_layer(
     obj: ObjectSpec,
-    sidecar_entry: Mapping[str, Any],
+    sidecar_entry: Any,
     *,
     coverage_spec: CoverageSpec,
     considered_episodes: Collection[int],
 ) -> dict[str, Any]:
-    sidecar_arm = str(sidecar_entry["arm"])
-    if sidecar_arm != obj.arm:
+    sidecar_obj = parse_sidecar_object(obj.name, sidecar_entry)
+    if sidecar_obj.arm != obj.arm:
         raise ValueError(
             f"Object-poses sidecar arm mismatch for {obj.name!r}: "
-            f"sidecar={sidecar_arm!r}, task_spec={obj.arm!r}"
+            f"sidecar={sidecar_obj.arm!r}, task_spec={obj.arm!r}"
         )
     yaw_period = object_yaw_period_deg(obj.yaw_symmetry_deg)
-    plane_z_raw = sidecar_entry.get("plane_z_m")
-    plane_z_m = float(plane_z_raw) if plane_z_raw is not None else None
+    records = {rec.episode_index: rec for rec in sidecar_obj.records}
 
     poses_out: list[dict[str, Any]] = []
     skipped_out: list[dict[str, Any]] = []
     cov_samples: list[ObjectPoseSample] = []
-
-    raw_episodes = sorted(
-        sidecar_entry.get("episodes", []),
-        key=lambda item: int(item["episode_index"]),
-    )
-    for ep_item in raw_episodes:
-        ep_idx = int(ep_item["episode_index"])
-        if ep_idx not in considered_episodes:
+    for ep_idx in sorted(considered_episodes):
+        rec = records.get(ep_idx)
+        if rec is None:
+            skipped_out.append({"episode_index": ep_idx, "reason": OBJECT_LAYER_NOT_MEASURED})
             continue
-        status = str(ep_item["status"])
-        if status != "ok":
-            skipped_out.append({"episode_index": ep_idx, "reason": status})
+        if rec.status != "ok" or rec.pose is None:
+            skipped_out.append({"episode_index": ep_idx, "reason": rec.status})
             continue
-        frame = int(ep_item.get("frame", OBJECT_POSE_FRAME))
-        x_m = float(ep_item["x_m"])
-        y_m = float(ep_item["y_m"])
-        z_m = float(ep_item["z_m"])
-        raw_yaw_deg = float(ep_item["raw_yaw_deg"])
-        folded_yaw_deg = fold_yaw_deg(raw_yaw_deg, yaw_period)
-        length_m = float(ep_item["length_m"])
-        width_m = float(ep_item["width_m"])
+        pose = rec.pose
+        folded_yaw_deg = fold_yaw_deg(pose.raw_yaw_deg, yaw_period)
         poses_out.append(
             {
                 "episode_index": ep_idx,
-                "frame": frame,
+                "frame": rec.frame,
                 "arm": obj.arm,
-                "x_m": x_m,
-                "y_m": y_m,
-                "z_m": z_m,
-                "raw_yaw_deg": raw_yaw_deg,
+                "x_m": pose.x_m,
+                "y_m": pose.y_m,
+                "z_m": pose.z_m,
+                "raw_yaw_deg": pose.raw_yaw_deg,
                 "folded_yaw_deg": folded_yaw_deg,
-                "length_m": length_m,
-                "width_m": width_m,
+                "length_m": pose.length_m,
+                "width_m": pose.width_m,
             }
         )
         cov_samples.append(
@@ -906,11 +896,11 @@ def _build_object_layer(
                 subtask=obj.subtask,
                 event=obj.event,
                 arm=obj.arm,
-                frame=frame,
-                x_m=x_m,
-                y_m=y_m,
-                z_m=z_m,
-                raw_yaw_deg=raw_yaw_deg,
+                frame=rec.frame,
+                x_m=pose.x_m,
+                y_m=pose.y_m,
+                z_m=pose.z_m,
+                raw_yaw_deg=pose.raw_yaw_deg,
                 folded_yaw_deg=folded_yaw_deg,
             )
         )
@@ -921,7 +911,7 @@ def _build_object_layer(
         "source": OBJECT_LAYER_SOURCE,
         "frame": OBJECT_POSE_FRAME,
         "arm": obj.arm,
-        "plane_z_m": plane_z_m,
+        "plane_z_m": sidecar_obj.plane_z_m,
         "yaw_period_deg": yaw_period,
         "poses": poses_out,
         "skipped": skipped_out,

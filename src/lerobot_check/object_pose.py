@@ -42,6 +42,7 @@ MIN_MEDIAN_SIZE_SAMPLES = 3
 SKIP_EMPTY_MASK = "empty mask"
 SKIP_DEGENERATE_OUTLINE = "degenerate mask outline"
 SKIP_BORDER_TOUCH = "mask touches layout box border"
+OBJECT_LAYER_NOT_MEASURED = "episode not in object-poses sidecar"
 
 _OBJECT_COLORS: tuple[tuple[int, int, int], ...] = (
     (34, 211, 238),
@@ -82,7 +83,14 @@ class EpisodeObjectMeasurement:
 def object_yaw_period_deg(yaw_symmetry_deg: float) -> float:
     if yaw_symmetry_deg <= 0.0 or yaw_symmetry_deg > 360.0:
         raise ValueError(f"yaw_symmetry_deg must be in (0, 360], got {yaw_symmetry_deg}")
-    return min(float(yaw_symmetry_deg), 180.0)
+    period = min(float(yaw_symmetry_deg), 180.0)
+    turns = 180.0 / period
+    if abs(turns - round(turns)) > 1e-9:
+        raise ValueError(
+            f"Object layer needs yaw_symmetry_deg >= 180 or a divisor of 180 because the "
+            f"rectangle long axis is only defined modulo 180, got {yaw_symmetry_deg}"
+        )
+    return period
 
 
 def fold_angle_deg(yaw_deg: float, period_deg: float) -> float:
@@ -438,6 +446,78 @@ def validate_object_poses_sidecar(
         )
     if not isinstance(sidecar.get("objects"), Mapping):
         raise ValueError("Object-poses sidecar is missing 'objects' mapping")
+
+
+@dataclass(frozen=True)
+class SidecarObject:
+    arm: str
+    plane_z_m: float | None
+    records: list[EpisodeObjectMeasurement]
+
+
+def _sidecar_number(item: Mapping[str, Any], key: str, context: str) -> float:
+    value = item.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{context}: {key} must be a number, got {value!r}")
+    if not math.isfinite(value):
+        raise ValueError(f"{context}: {key} must be finite, got {value!r}")
+    return float(value)
+
+
+def _sidecar_episode(item: Any, context: str) -> EpisodeObjectMeasurement:
+    if not isinstance(item, Mapping):
+        raise ValueError(f"{context}: episode entry must be an object, got {item!r}")
+    ep_idx = item.get("episode_index")
+    if isinstance(ep_idx, bool) or not isinstance(ep_idx, int):
+        raise ValueError(f"{context}: episode_index must be an integer, got {ep_idx!r}")
+    context = f"{context} episode {ep_idx}"
+    status = item.get("status")
+    if not isinstance(status, str) or not status:
+        raise ValueError(f"{context}: status must be a non-empty string, got {status!r}")
+    frame = item.get("frame", OBJECT_POSE_FRAME)
+    if isinstance(frame, bool) or not isinstance(frame, int):
+        raise ValueError(f"{context}: frame must be an integer, got {frame!r}")
+    pose = None
+    if status == "ok":
+        pose = ObjectPoseMeasurement(
+            *(
+                _sidecar_number(item, key, context)
+                for key in (
+                    "x_m",
+                    "y_m",
+                    "z_m",
+                    "raw_yaw_deg",
+                    "folded_yaw_deg",
+                    "length_m",
+                    "width_m",
+                )
+            )
+        )
+    return EpisodeObjectMeasurement(
+        episode_index=ep_idx, frame=frame, status=status, outline=item.get("outline"), pose=pose
+    )
+
+
+def parse_sidecar_object(name: str, entry: Any) -> SidecarObject:
+    context = f"Object-poses sidecar object {name!r}"
+    if not isinstance(entry, Mapping):
+        raise ValueError(f"{context} must be an object, got {entry!r}")
+    arm = entry.get("arm")
+    if not isinstance(arm, str) or not arm:
+        raise ValueError(f"{context}: arm must be a non-empty string, got {arm!r}")
+    plane_z_m = (
+        _sidecar_number(entry, "plane_z_m", context) if entry.get("plane_z_m") is not None else None
+    )
+    episodes = entry.get("episodes")
+    if not isinstance(episodes, list):
+        raise ValueError(f"{context}: episodes must be a list, got {episodes!r}")
+    records = [_sidecar_episode(item, context) for item in episodes]
+    seen = [rec.episode_index for rec in records]
+    if len(seen) != len(set(seen)):
+        raise ValueError(f"{context}: duplicate episode_index entries")
+    return SidecarObject(
+        arm=arm, plane_z_m=plane_z_m, records=sorted(records, key=lambda r: r.episode_index)
+    )
 
 
 def decode_frame_zero_images(
