@@ -65,6 +65,8 @@ uv run lerobot-check mask-overlays --suggestions "$SUGGESTIONS" --calib "$HEAD" 
 
 `collection-plan` 将已审核模板和覆盖采样结果组合为按轮采集的便携 JSON，支持拒绝相交轮次、单轮审核、避开已采位置与回传进度。[补采计划 v1 契约](docs/collection-plan.md) 列出生成命令、字段以及采集端和自动对齐接入方式。
 
+采集端可以把补采计划与头部相机帧交给 [实时轮廓重合判定 API](docs/collection-alignment.md)，在 reset 阶段显示实际轮廓和重合程度。
+
 ## 安装与环境
 
 要求 Python >= 3.12 与 [uv](https://docs.astral.sh/uv/)，依赖固定版本的 PyPI `lerobot==0.5.1`（不依赖 `lerobot-xense` 或任何硬件 SDK）：
