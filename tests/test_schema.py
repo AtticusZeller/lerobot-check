@@ -15,6 +15,7 @@ from lerobot_check.dataset import (
     default_calib_intrinsics_path,
     default_calib_points_path,
     default_distribution_path,
+    default_object_poses_path,
     default_suggestions_path,
     default_targets_path,
     default_task_spec_path,
@@ -263,6 +264,9 @@ def test_default_xense_viewer_paths_and_format_info(tmp_path: Path) -> None:
     )
     assert default_distribution_path(ds_root) == (
         viewer_root / "distribution" / f"Xense__my_dataset@{sha}.json"
+    )
+    assert default_object_poses_path(ds_root) == (
+        viewer_root / "object-poses" / f"Xense__my_dataset@{sha}.json"
     )
     assert default_suggestions_path(ds_root) == (
         viewer_root / "suggestions" / f"Xense__my_dataset@{sha}.json"

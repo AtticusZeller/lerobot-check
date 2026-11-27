@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import csv
+import math
 import warnings
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -72,6 +73,8 @@ class ObjectSpec:
     event: ObjectEvent
     arm: ArmSide
     yaw_symmetry_deg: float
+    layout_box: tuple[int, int, int, int] | None = None
+    object_plane_z_m: float | None = None
 
 
 @dataclass(frozen=True)
@@ -233,6 +236,35 @@ def _require_positive_int(value: Any, field_name: str) -> int:
     return value
 
 
+def _parse_layout_box(value: Any, field_name: str) -> tuple[int, int, int, int] | None:
+    if value is None:
+        return None
+    if not isinstance(value, list) or len(value) != 4:
+        raise ValueError(
+            f"{field_name} must be a list of 4 integers [x0, y0, x1, y1], got {value!r}"
+        )
+    coords: list[int] = []
+    for item in value:
+        if isinstance(item, bool) or not isinstance(item, int):
+            raise ValueError(f"{field_name} entries must be integers, got {value!r}")
+        coords.append(item)
+    x0, y0, x1, y1 = coords
+    if x0 < 0 or y0 < 0 or x0 >= x1 or y0 >= y1:
+        raise ValueError(f"{field_name} must satisfy 0 <= x0 < x1 and 0 <= y0 < y1, got {value!r}")
+    return (x0, y0, x1, y1)
+
+
+def _parse_optional_finite_float(value: Any, field_name: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{field_name} must be a finite number, got {value!r}")
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValueError(f"{field_name} must be finite, got {value!r}")
+    return parsed
+
+
 def parse_task_spec(raw: Any) -> TaskSpec:
     """Validate and convert a raw YAML mapping into a ``TaskSpec``.
 
@@ -348,6 +380,11 @@ def parse_task_spec(raw: Any) -> TaskSpec:
                 f"objects[{idx}].yaw_symmetry_deg must be <= 360, got {yaw_symmetry_deg}"
             )
 
+        layout_box = _parse_layout_box(entry.get("layout_box"), f"objects[{idx}].layout_box")
+        object_plane_z_m = _parse_optional_finite_float(
+            entry.get("object_plane_z_m"), f"objects[{idx}].object_plane_z_m"
+        )
+
         objects.append(
             ObjectSpec(
                 name=obj_name,
@@ -355,6 +392,8 @@ def parse_task_spec(raw: Any) -> TaskSpec:
                 event=event,
                 arm=arm,
                 yaw_symmetry_deg=yaw_symmetry_deg,
+                layout_box=layout_box,
+                object_plane_z_m=object_plane_z_m,
             )
         )
 
@@ -416,19 +455,25 @@ def save_task_spec(spec: TaskSpec, path: Path) -> None:
             entry["arms"] = list(s.arms)
         subtask_payloads.append(entry)
 
+    object_payloads: list[dict[str, Any]] = []
+    for o in spec.objects:
+        obj_entry: dict[str, Any] = {
+            "name": o.name,
+            "subtask": o.subtask,
+            "event": o.event,
+            "arm": o.arm,
+            "yaw_symmetry_deg": o.yaw_symmetry_deg,
+        }
+        if o.layout_box is not None:
+            obj_entry["layout_box"] = list(o.layout_box)
+        if o.object_plane_z_m is not None:
+            obj_entry["object_plane_z_m"] = o.object_plane_z_m
+        object_payloads.append(obj_entry)
+
     payload: dict[str, Any] = {
         "name": spec.name,
         "subtasks": subtask_payloads,
-        "objects": [
-            {
-                "name": o.name,
-                "subtask": o.subtask,
-                "event": o.event,
-                "arm": o.arm,
-                "yaw_symmetry_deg": o.yaw_symmetry_deg,
-            }
-            for o in spec.objects
-        ],
+        "objects": object_payloads,
         "coverage": {
             "xy_bin_m": spec.coverage.xy_bin_m,
             "yaw_bin_deg": spec.coverage.yaw_bin_deg,

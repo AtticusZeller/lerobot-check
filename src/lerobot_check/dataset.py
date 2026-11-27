@@ -287,6 +287,23 @@ def default_distribution_path(
     )
 
 
+def default_object_poses_path(
+    dataset_root: Path,
+    *,
+    repo_id: str | None = None,
+    revision: str | None = None,
+) -> Path:
+    resolved = dataset_root.expanduser().resolve()
+    rid = repo_id or infer_repo_id(resolved)
+    rev = revision or detect_dataset_revision(resolved)
+    return (
+        dataset_lerobot_root(resolved)
+        / ".xense-viewer"
+        / "object-poses"
+        / f"{dataset_slug(rid)}@{rev}.json"
+    )
+
+
 def default_suggestions_path(
     dataset_root: Path,
     *,
@@ -392,6 +409,9 @@ def format_dataset_info(dataset: DatasetView) -> str:
     dist_path = default_distribution_path(
         dataset.root, repo_id=dataset.repo_id, revision=dataset.revision
     )
+    object_poses_path = default_object_poses_path(
+        dataset.root, repo_id=dataset.repo_id, revision=dataset.revision
+    )
     sug_path = default_suggestions_path(
         dataset.root, repo_id=dataset.repo_id, revision=dataset.revision
     )
@@ -407,6 +427,7 @@ def format_dataset_info(dataset: DatasetView) -> str:
         f"default_task_spec: {default_task_spec_path(dataset.root, repo_id=dataset.repo_id)}",
         f"default_annotations: {ann_path}",
         f"default_distribution: {dist_path}",
+        f"default_object_poses: {object_poses_path}",
         f"default_suggestions: {sug_path}",
         f"default_calib_head: {calib_head_path}",
         "",

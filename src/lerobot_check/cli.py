@@ -38,6 +38,7 @@ from lerobot_check.dataset import (
     default_calib_intrinsics_path,
     default_calib_points_path,
     default_distribution_path,
+    default_object_poses_path,
     default_suggestions_path,
     default_targets_path,
     default_task_spec_path,
@@ -46,6 +47,8 @@ from lerobot_check.dataset import (
     infer_repo_id,
     resolve_dataset_root,
 )
+from lerobot_check.masks import sha256_bytes
+from lerobot_check.object_pose import configure_object_poses_parser, load_object_poses
 from lerobot_check.propose import (
     DEFAULT_RENDER_EVENT_TYPES,
     ProposeConfig,
@@ -907,12 +910,39 @@ def _cmd_distribution(args: argparse.Namespace) -> int:
 
     calibration: HeadCalibration | None = None
     calib_mtime: str | None = None
+    calib_sha256: str | None = None
     if calib_path is not None:
         try:
+            calib_bytes = calib_path.read_bytes()
             calibration = load_head_calibration(calib_path)
             calib_mtime = datetime.fromtimestamp(calib_path.stat().st_mtime, tz=UTC).isoformat()
+            calib_sha256 = sha256_bytes(calib_bytes)
         except (OSError, ValueError) as exc:
             print(f"[calib] {exc}", file=sys.stderr)
+            return 1
+
+    object_poses_path: Path | None = args.object_poses
+    if object_poses_path is not None:
+        if not object_poses_path.is_file():
+            print(
+                f"[object-poses] Object poses file does not exist: {object_poses_path}",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        candidate_poses = default_object_poses_path(
+            root, repo_id=dataset.repo_id, revision=dataset.revision
+        )
+        if candidate_poses.is_file():
+            object_poses_path = candidate_poses
+
+    object_poses = None
+    object_poses_sha256: str | None = None
+    if object_poses_path is not None:
+        try:
+            object_poses, object_poses_sha256 = load_object_poses(object_poses_path)
+        except (OSError, ValueError) as exc:
+            print(f"[object-poses] {exc}", file=sys.stderr)
             return 1
 
     try:
@@ -927,6 +957,9 @@ def _cmd_distribution(args: argparse.Namespace) -> int:
             calibration=calibration,
             calib_path=calib_path.resolve() if calib_path is not None else None,
             calib_mtime=calib_mtime,
+            calib_sha256=calib_sha256,
+            object_poses=object_poses,
+            object_poses_sha256=object_poses_sha256,
         )
     except (OSError, ValueError) as exc:
         print(f"[distribution] {exc}", file=sys.stderr)
@@ -1921,6 +1954,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     dist_parser.add_argument(
+        "--object-poses",
+        type=Path,
+        default=None,
+        help=(
+            "Optional object-poses sidecar JSON used to attach object_layer entries "
+            "(default: <lerobot_root>/.xense-viewer/object-poses/<org>__<name>@<revision>.json "
+            "if present)."
+        ),
+    )
+    dist_parser.add_argument(
         "-o",
         "--output",
         type=Path,
@@ -2157,6 +2200,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     configure_plan_parser(
         subparsers.add_parser("collection-plan", help="Generate and review collection rounds.")
+    )
+    configure_object_poses_parser(
+        subparsers.add_parser(
+            "object-poses",
+            help="Segment frame-0 head-camera object masks and derive initial object poses.",
+        )
     )
     return parser
 

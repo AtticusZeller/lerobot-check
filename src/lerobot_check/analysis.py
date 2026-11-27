@@ -6,7 +6,7 @@ import json
 import math
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -14,6 +14,12 @@ import numpy as np
 
 from lerobot_check.calib import HeadCalibration
 from lerobot_check.dataset import ArmState, DatasetView, rotation_6d_to_matrix
+from lerobot_check.object_pose import (
+    OBJECT_LAYER_SOURCE,
+    OBJECT_POSE_FRAME,
+    object_yaw_period_deg,
+    validate_object_poses_sidecar,
+)
 from lerobot_check.schema import AnnotationRow, CoverageSpec, ObjectSpec, TaskSpec
 
 DISTRIBUTION_SCHEMA_VERSION = 1
@@ -811,6 +817,118 @@ def compute_object_coverage(
     )
 
 
+def _serialize_object_coverage(cov: ObjectCoverage) -> dict[str, Any]:
+    return {
+        "sample_count": cov.sample_count,
+        "xy_bin_m": cov.coverage_spec.xy_bin_m,
+        "yaw_bin_deg": cov.coverage_spec.yaw_bin_deg,
+        "sparse_threshold": cov.coverage_spec.sparse_threshold,
+        "num_yaw_bins": cov.num_yaw_bins,
+        "ix_range": list(cov.ix_range) if cov.ix_range is not None else None,
+        "iy_range": list(cov.iy_range) if cov.iy_range is not None else None,
+        "bins": [
+            {
+                "ix": b.ix,
+                "iy": b.iy,
+                "yaw_bin": b.yaw_bin,
+                "x_min_m": b.x_min_m,
+                "x_max_m": b.x_max_m,
+                "y_min_m": b.y_min_m,
+                "y_max_m": b.y_max_m,
+                "yaw_min_deg": b.yaw_min_deg,
+                "yaw_max_deg": b.yaw_max_deg,
+                "count": b.count,
+            }
+            for b in cov.bins
+        ],
+    }
+
+
+def _build_object_layer(
+    obj: ObjectSpec,
+    sidecar_entry: Mapping[str, Any],
+    *,
+    coverage_spec: CoverageSpec,
+    considered_episodes: Collection[int],
+) -> dict[str, Any]:
+    sidecar_arm = str(sidecar_entry["arm"])
+    if sidecar_arm != obj.arm:
+        raise ValueError(
+            f"Object-poses sidecar arm mismatch for {obj.name!r}: "
+            f"sidecar={sidecar_arm!r}, task_spec={obj.arm!r}"
+        )
+    yaw_period = object_yaw_period_deg(obj.yaw_symmetry_deg)
+    plane_z_raw = sidecar_entry.get("plane_z_m")
+    plane_z_m = float(plane_z_raw) if plane_z_raw is not None else None
+
+    poses_out: list[dict[str, Any]] = []
+    skipped_out: list[dict[str, Any]] = []
+    cov_samples: list[ObjectPoseSample] = []
+
+    raw_episodes = sorted(
+        sidecar_entry.get("episodes", []),
+        key=lambda item: int(item["episode_index"]),
+    )
+    for ep_item in raw_episodes:
+        ep_idx = int(ep_item["episode_index"])
+        if ep_idx not in considered_episodes:
+            continue
+        status = str(ep_item["status"])
+        if status != "ok":
+            skipped_out.append({"episode_index": ep_idx, "reason": status})
+            continue
+        frame = int(ep_item.get("frame", OBJECT_POSE_FRAME))
+        x_m = float(ep_item["x_m"])
+        y_m = float(ep_item["y_m"])
+        z_m = float(ep_item["z_m"])
+        raw_yaw_deg = float(ep_item["raw_yaw_deg"])
+        folded_yaw_deg = fold_yaw_deg(raw_yaw_deg, yaw_period)
+        length_m = float(ep_item["length_m"])
+        width_m = float(ep_item["width_m"])
+        poses_out.append(
+            {
+                "episode_index": ep_idx,
+                "frame": frame,
+                "arm": obj.arm,
+                "x_m": x_m,
+                "y_m": y_m,
+                "z_m": z_m,
+                "raw_yaw_deg": raw_yaw_deg,
+                "folded_yaw_deg": folded_yaw_deg,
+                "length_m": length_m,
+                "width_m": width_m,
+            }
+        )
+        cov_samples.append(
+            ObjectPoseSample(
+                episode_index=ep_idx,
+                object_name=obj.name,
+                subtask=obj.subtask,
+                event=obj.event,
+                arm=obj.arm,
+                frame=frame,
+                x_m=x_m,
+                y_m=y_m,
+                z_m=z_m,
+                raw_yaw_deg=raw_yaw_deg,
+                folded_yaw_deg=folded_yaw_deg,
+            )
+        )
+
+    cov_obj = replace(obj, yaw_symmetry_deg=yaw_period)
+    cov = compute_object_coverage(cov_obj, cov_samples, coverage_spec)
+    return {
+        "source": OBJECT_LAYER_SOURCE,
+        "frame": OBJECT_POSE_FRAME,
+        "arm": obj.arm,
+        "plane_z_m": plane_z_m,
+        "yaw_period_deg": yaw_period,
+        "poses": poses_out,
+        "skipped": skipped_out,
+        "coverage": _serialize_object_coverage(cov),
+    }
+
+
 def compute_distribution_from_states(
     *,
     repo_id: str,
@@ -827,6 +945,9 @@ def compute_distribution_from_states(
     tool_offsets: Mapping[str, np.ndarray] | None = None,
     calib_path: Path | str | None = None,
     calib_mtime: str | None = None,
+    calib_sha256: str | None = None,
+    object_poses: Mapping[str, Any] | None = None,
+    object_poses_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Compute the complete ``distribution.json`` payload from in-memory arm states.
 
@@ -1028,63 +1149,58 @@ def compute_distribution_from_states(
                     }
                 )
 
+    sidecar_objects: Mapping[str, Any] = {}
+    if object_poses is not None:
+        validate_object_poses_sidecar(
+            object_poses,
+            repo_id=repo_id,
+            revision=revision,
+            calibration_sha256=calib_sha256,
+        )
+        sidecar_objects = object_poses["objects"]
+
     objects_payload: list[dict[str, Any]] = []
+    has_object_layer = False
     for obj in task_spec.objects:
         obj_poses = [p for p in all_object_poses if p.object_name == obj.name]
         obj_skipped = [s for s in all_skipped_objects if s.object_name == obj.name]
         cov = compute_object_coverage(obj, obj_poses, task_spec.coverage)
         median_z_m = float(np.median([p.z_m for p in obj_poses])) if obj_poses else None
-        objects_payload.append(
-            {
-                "name": obj.name,
-                "subtask": obj.subtask,
-                "event": obj.event,
-                "arm": obj.arm,
-                "yaw_symmetry_deg": obj.yaw_symmetry_deg,
-                "median_z_m": median_z_m,
-                "poses": [
-                    {
-                        "episode_index": p.episode_index,
-                        "frame": p.frame,
-                        "arm": p.arm,
-                        "x_m": p.x_m,
-                        "y_m": p.y_m,
-                        "z_m": p.z_m,
-                        "raw_yaw_deg": p.raw_yaw_deg,
-                        "folded_yaw_deg": p.folded_yaw_deg,
-                        "rot6d": list(p.rot6d),
-                    }
-                    for p in obj_poses
-                ],
-                "skipped": [
-                    {"episode_index": s.episode_index, "reason": s.reason} for s in obj_skipped
-                ],
-                "coverage": {
-                    "sample_count": cov.sample_count,
-                    "xy_bin_m": cov.coverage_spec.xy_bin_m,
-                    "yaw_bin_deg": cov.coverage_spec.yaw_bin_deg,
-                    "sparse_threshold": cov.coverage_spec.sparse_threshold,
-                    "num_yaw_bins": cov.num_yaw_bins,
-                    "ix_range": list(cov.ix_range) if cov.ix_range is not None else None,
-                    "iy_range": list(cov.iy_range) if cov.iy_range is not None else None,
-                    "bins": [
-                        {
-                            "ix": b.ix,
-                            "iy": b.iy,
-                            "yaw_bin": b.yaw_bin,
-                            "x_min_m": b.x_min_m,
-                            "x_max_m": b.x_max_m,
-                            "y_min_m": b.y_min_m,
-                            "y_max_m": b.y_max_m,
-                            "yaw_min_deg": b.yaw_min_deg,
-                            "yaw_max_deg": b.yaw_max_deg,
-                            "count": b.count,
-                        }
-                        for b in cov.bins
-                    ],
-                },
-            }
-        )
+        obj_entry: dict[str, Any] = {
+            "name": obj.name,
+            "subtask": obj.subtask,
+            "event": obj.event,
+            "arm": obj.arm,
+            "yaw_symmetry_deg": obj.yaw_symmetry_deg,
+            "median_z_m": median_z_m,
+            "poses": [
+                {
+                    "episode_index": p.episode_index,
+                    "frame": p.frame,
+                    "arm": p.arm,
+                    "x_m": p.x_m,
+                    "y_m": p.y_m,
+                    "z_m": p.z_m,
+                    "raw_yaw_deg": p.raw_yaw_deg,
+                    "folded_yaw_deg": p.folded_yaw_deg,
+                    "rot6d": list(p.rot6d),
+                }
+                for p in obj_poses
+            ],
+            "skipped": [
+                {"episode_index": s.episode_index, "reason": s.reason} for s in obj_skipped
+            ],
+            "coverage": _serialize_object_coverage(cov),
+        }
+        if obj.name in sidecar_objects:
+            obj_entry["object_layer"] = _build_object_layer(
+                obj,
+                sidecar_objects[obj.name],
+                coverage_spec=task_spec.coverage,
+                considered_episodes=considered_lengths,
+            )
+            has_object_layer = True
+        objects_payload.append(obj_entry)
 
     subtasks_payload: list[dict[str, Any]] = []
     for st in task_spec.subtasks:
@@ -1122,30 +1238,36 @@ def compute_distribution_from_states(
             }
         )
 
+    provenance_payload: dict[str, Any] = {
+        "repo_id": repo_id,
+        "revision": revision,
+        "task_name": task_spec.name,
+        "annotations_path": str(annotations_path) if annotations_path is not None else None,
+        "task_spec_path": str(task_spec_path) if task_spec_path is not None else None,
+        "position_point": position_point,
+        "calib_path": str(calib_path) if calib_path is not None else None,
+        "calib_mtime": calib_mtime,
+        "calibrated_arms": sorted(normalized_offsets.keys()),
+        "fps": fps,
+        "annotator_counts": {
+            "agent": provenance.agent,
+            "human": provenance.human,
+            "converted": provenance.converted,
+            "total": provenance.total,
+        },
+        "dataset_total_episodes": dataset_total_episodes,
+        "episode_filter": selected_eps,
+        "annotated_episodes": list(frame_shares.annotated_episodes),
+        "skipped_episodes": list(frame_shares.skipped_episodes),
+    }
+    if has_object_layer:
+        if not object_poses_sha256:
+            raise ValueError("object_poses_sha256 is required when object_layer is attached")
+        provenance_payload["object_poses_sha256"] = object_poses_sha256
+
     return {
         "version": DISTRIBUTION_SCHEMA_VERSION,
-        "provenance": {
-            "repo_id": repo_id,
-            "revision": revision,
-            "task_name": task_spec.name,
-            "annotations_path": str(annotations_path) if annotations_path is not None else None,
-            "task_spec_path": str(task_spec_path) if task_spec_path is not None else None,
-            "position_point": position_point,
-            "calib_path": str(calib_path) if calib_path is not None else None,
-            "calib_mtime": calib_mtime,
-            "calibrated_arms": sorted(normalized_offsets.keys()),
-            "fps": fps,
-            "annotator_counts": {
-                "agent": provenance.agent,
-                "human": provenance.human,
-                "converted": provenance.converted,
-                "total": provenance.total,
-            },
-            "dataset_total_episodes": dataset_total_episodes,
-            "episode_filter": selected_eps,
-            "annotated_episodes": list(frame_shares.annotated_episodes),
-            "skipped_episodes": list(frame_shares.skipped_episodes),
-        },
+        "provenance": provenance_payload,
         "coverage_config": {
             "xy_bin_m": task_spec.coverage.xy_bin_m,
             "yaw_bin_deg": task_spec.coverage.yaw_bin_deg,
@@ -1182,6 +1304,9 @@ def compute_distribution(
     calibration: HeadCalibration | None = None,
     calib_path: Path | str | None = None,
     calib_mtime: str | None = None,
+    calib_sha256: str | None = None,
+    object_poses: Mapping[str, Any] | None = None,
+    object_poses_sha256: str | None = None,
 ) -> dict[str, Any]:
     """Compute the ``distribution.json`` payload directly from a ``DatasetView``.
 
@@ -1234,6 +1359,9 @@ def compute_distribution(
         tool_offsets=tool_offsets,
         calib_path=calib_path,
         calib_mtime=calib_mtime,
+        calib_sha256=calib_sha256,
+        object_poses=object_poses,
+        object_poses_sha256=object_poses_sha256,
     )
 
 
