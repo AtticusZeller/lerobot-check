@@ -61,7 +61,7 @@ uv run --extra mask-template lerobot-check object-poses \
 uv run lerobot-check distribution --dataset-root /path/to/dataset
 ```
 
-`object-poses` 每帧只编码一次图像，利用每个 `layout_box` 内部的规则正点网格与多掩码筛选提取不触及框边界的单物体掩码（必要时回退框提示以保留跳过诊断），并剔除空掩码、触框掩码、缺失臂标定以及矩形尺寸偏离跨 episode 中位数过大的异常项。物体层角度取反投轮廓最小外接矩形的长轴方向，折叠周期为 `yaw_period_deg = min(yaw_symmetry_deg, 180)`。`--prompt-box EP:OBJECT=x0,y0,x1,y1` 仅对第 `EP` 条 episode 的 `OBJECT` 用给定框（第 0 帧头图原图像素）代替其 `layout_box` 作为分割提示和触框检查范围，其余 episode 仍使用固定布局；该框写入侧车中对应 episode 记录的 `prompt_box` 字段以便复现。物体必须在 task spec 中配置了 `layout_box`，episode 必须在本次处理的 episode 范围内，框必须满足 `0 <= x0 < x1 <= W`、`0 <= y0 < y1 <= H`，同一 episode 与物体重复指定会报错。复核联系表按多条 episode 拼页保存为 `object_poses_p01.jpg` 等 JPEG 文件，每格叠加标注各物体轮廓与名称，并在页底标注跳过物体的原因。
+`object-poses` 每帧只编码一次图像，利用每个 `layout_box` 内部的规则正点网格与多掩码筛选提取不触及框边界的单物体掩码（必要时回退框提示以保留跳过诊断），并剔除空掩码、触框掩码、缺失臂标定以及矩形尺寸偏离跨 episode 中位数过大的异常项。物体层角度取反投轮廓最小外接矩形的长轴方向，折叠周期为 `yaw_period_deg = min(yaw_symmetry_deg, 180)`。`--prompt-box EP:OBJECT=x0,y0,x1,y1` 仅对第 `EP` 条 episode 的 `OBJECT` 用给定框（第 0 帧头图原图像素）代替其 `layout_box` 作为分割提示和触框检查范围，其余 episode 仍使用固定布局；该框写入侧车中对应 episode 记录的 `prompt_box` 字段以便复现。物体必须在 task spec 中配置了 `layout_box`，episode 必须在本次处理的 episode 范围内，框必须满足 `0 <= x0 < x1 <= W`、`0 <= y0 < y1 <= H`，同一 episode 与物体重复指定会报错。若存在与数据集匹配的 calibrated `distribution.json`（`--distribution PATH`，或默认路径），`object-poses` 会在写出侧车后逐物体打印末端工具点相对物体的偏移：对每条同时有物体层位姿与末端执行器层位姿的 episode，把 `tool_xy - object_xy` 旋转 `-yaw` 变换到物体坐标系，输出均值与总体标准差（cm），并附基座坐标系下的标准差作对比。物体朝向只在 `yaw_period_deg`（矩形为 180°）内有定义，因此先求各 episode 朝向在该周期上的圆均值作参考，再把每条 episode 的朝向展开到参考值 `±period/2` 内后旋转，避免 0°/180° 附近的同一摆放被当成反向。物体在 episode 间旋转时，基座系标准差混入了旋转，物体系标准差才反映抓取点相对物体的一致性。复核联系表按多条 episode 拼页保存为 `object_poses_p01.jpg` 等 JPEG 文件，每格叠加标注各物体轮廓与名称，并在页底标注跳过物体的原因。
 
 ## 补采目标轮廓
 

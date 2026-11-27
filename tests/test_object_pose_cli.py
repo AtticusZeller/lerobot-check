@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,6 +25,7 @@ from lerobot_check.object_pose import (
     ObjectPoseMeasurement,
     apply_size_outlier_filter,
     extract_dataset_object_poses,
+    object_frame_tool_offsets,
     parse_prompt_box,
     parse_prompt_boxes,
 )
@@ -242,14 +244,54 @@ def cli_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     return SimpleNamespace(tmp=tmp_path, args=base_args, override=override)
 
 
-def test_cli_object_poses_with_prompt_box(cli_env, capsys: pytest.CaptureFixture[str]) -> None:
+def _distribution_file(tmp: Path, tool_local_xy: tuple[float, float]) -> Path:
+    poses = []
+    for ep, (x, y, yaw) in {**TRUTHS, 3: MOVED}.items():
+        c, s = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
+        lx, ly = tool_local_xy
+        poses.append(
+            {
+                "episode_index": ep,
+                "arm": "right",
+                "x_m": x + c * lx - s * ly,
+                "y_m": y + s * lx + c * ly,
+            }
+        )
+    path = tmp / "distribution.json"
+    path.write_text(
+        json.dumps(
+            {
+                "provenance": {
+                    "repo_id": "Org/demo",
+                    "revision": "rev1",
+                    "position_point": "tool_point",
+                },
+                "objects": [{"name": "phone", "median_z_m": PLANE_Z, "poses": poses}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_cli_object_poses_with_prompt_box_and_offsets(
+    cli_env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dist = _distribution_file(cli_env.tmp, (0.02, -0.01))
     box = ",".join(str(v) for v in cli_env.override)
-    rc = main([*cli_env.args, "--prompt-box", f"3:phone={box}"])
+    rc = main([*cli_env.args, "--prompt-box", f"3:phone={box}", "--distribution", str(dist)])
     out = capsys.readouterr().out
     assert rc == 0, out
     assert "phone: 4/4 ok" in out
     sidecar = json.loads((cli_env.tmp / "poses.json").read_text(encoding="utf-8"))
     assert sidecar["objects"]["phone"]["episodes"][3]["prompt_box"] == list(cli_env.override)
+    offsets = next(line for line in out.splitlines() if "tool offset in object frame" in line)
+    assert "n=4" in offsets
+    match = re.search(r"mean=\(([-+.\d]+), ([-+.\d]+)\) cm std=\(([.\d]+), ([.\d]+)\)", offsets)
+    assert match is not None
+    mean_x, mean_y, std_x, std_y = (float(v) for v in match.groups())
+    assert (mean_x, mean_y) == pytest.approx((2.0, -1.0), abs=0.1)
+    assert max(std_x, std_y) < 0.1
 
 
 @pytest.mark.parametrize(
@@ -282,3 +324,53 @@ def test_cli_object_poses_rejects_segmenter_failure(
     rc = main([*cli_env.args, "--device", "cuda"])
     assert rc == 1
     assert "[object-poses] no cuda device" in capsys.readouterr().err
+
+
+def test_cli_object_poses_rejects_distribution_for_other_dataset(
+    cli_env, capsys: pytest.CaptureFixture[str]
+) -> None:
+    dist = _distribution_file(cli_env.tmp, (0.0, 0.0))
+    payload = json.loads(dist.read_text(encoding="utf-8"))
+    payload["provenance"]["revision"] = "other"
+    dist.write_text(json.dumps(payload), encoding="utf-8")
+    rc = main([*cli_env.args, "--distribution", str(dist)])
+    assert rc == 1
+    assert "does not match dataset" in capsys.readouterr().err
+
+
+def _object_and_tool(ep: int, x: float, y: float, yaw: float, local: tuple[float, float]):
+    c, s = math.cos(math.radians(yaw)), math.sin(math.radians(yaw))
+    obj = {"episode_index": ep, "arm": "right", "x_m": x, "y_m": y, "raw_yaw_deg": yaw % 180.0}
+    tool = {
+        "episode_index": ep,
+        "arm": "right",
+        "x_m": x + c * local[0] - s * local[1],
+        "y_m": y + s * local[0] + c * local[1],
+    }
+    return obj, tool
+
+
+def test_object_frame_offsets_are_constant_across_rotation_and_wraparound() -> None:
+    local = (0.03, -0.012)
+    yaws = [-8.0, -2.0, 4.0, 25.0, 52.0]
+    pairs = [
+        _object_and_tool(ep, 0.8 + 0.01 * ep, 0.1 - 0.02 * ep, yaw, local)
+        for ep, yaw in enumerate(yaws)
+    ]
+    objects = [obj for obj, _ in pairs]
+    stray = {"episode_index": 99, "arm": "right", "x_m": 0, "y_m": 0}
+    tools = [tool for _, tool in pairs] + [stray]
+    stats = object_frame_tool_offsets(objects, tools, yaw_period_deg=180.0)
+    assert stats is not None
+    assert stats.count == 5
+    assert stats.mean_xy_m == pytest.approx(local, abs=1e-12)
+    assert stats.std_xy_m == pytest.approx((0.0, 0.0), abs=1e-12)
+    assert max(stats.base_frame_std_xy_m) > 0.005
+    assert -90.0 < ((stats.reference_yaw_deg + 90.0) % 180.0) - 90.0 < 52.0
+
+
+def test_object_frame_offsets_reject_arm_mismatch_and_handle_no_pairs() -> None:
+    obj, tool = _object_and_tool(0, 0.8, 0.1, 10.0, (0.01, 0.0))
+    assert object_frame_tool_offsets([obj], [], yaw_period_deg=180.0) is None
+    with pytest.raises(ValueError, match="arm"):
+        object_frame_tool_offsets([obj], [{**tool, "arm": "left"}], yaw_period_deg=180.0)

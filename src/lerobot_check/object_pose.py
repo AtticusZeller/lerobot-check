@@ -902,6 +902,99 @@ def validate_prompt_boxes(
             )
 
 
+@dataclass(frozen=True)
+class ObjectFrameOffsetStats:
+    count: int
+    reference_yaw_deg: float
+    mean_xy_m: tuple[float, float]
+    std_xy_m: tuple[float, float]
+    base_frame_std_xy_m: tuple[float, float]
+
+
+def object_frame_tool_offsets(
+    object_poses: Sequence[Mapping[str, Any]],
+    tool_poses: Sequence[Mapping[str, Any]],
+    *,
+    yaw_period_deg: float,
+) -> ObjectFrameOffsetStats | None:
+    tools_by_episode = {int(p["episode_index"]): p for p in tool_poses}
+    pairs = [
+        (obj, tools_by_episode[int(obj["episode_index"])])
+        for obj in object_poses
+        if int(obj["episode_index"]) in tools_by_episode
+    ]
+    for obj, tool in pairs:
+        if obj["arm"] != tool["arm"]:
+            raise ValueError(
+                f"Episode {obj['episode_index']}: object pose arm {obj['arm']!r} differs from "
+                f"tool pose arm {tool['arm']!r}"
+            )
+    if not pairs:
+        return None
+    period = float(yaw_period_deg)
+    yaws = np.array([fold_angle_deg(float(obj["raw_yaw_deg"]), period) for obj, _ in pairs])
+    phase = np.radians(yaws) * (360.0 / period)
+    reference = fold_angle_deg(
+        math.degrees(math.atan2(np.sin(phase).mean(), np.cos(phase).mean())) * period / 360.0,
+        period,
+    )
+    unwrapped = reference + (yaws - reference + period / 2.0) % period - period / 2.0
+    base_delta = np.array(
+        [
+            [float(tool["x_m"]) - float(obj["x_m"]), float(tool["y_m"]) - float(obj["y_m"])]
+            for obj, tool in pairs
+        ]
+    )
+    rad = np.radians(unwrapped)
+    cos, sin = np.cos(rad), np.sin(rad)
+    local = np.column_stack(
+        [
+            cos * base_delta[:, 0] + sin * base_delta[:, 1],
+            -sin * base_delta[:, 0] + cos * base_delta[:, 1],
+        ]
+    )
+    mean = local.mean(axis=0)
+    std = local.std(axis=0)
+    base_std = base_delta.std(axis=0)
+    return ObjectFrameOffsetStats(
+        count=len(pairs),
+        reference_yaw_deg=float(reference),
+        mean_xy_m=(float(mean[0]), float(mean[1])),
+        std_xy_m=(float(std[0]), float(std[1])),
+        base_frame_std_xy_m=(float(base_std[0]), float(base_std[1])),
+    )
+
+
+def format_object_frame_offsets(
+    sidecar: Mapping[str, Any],
+    distribution: Mapping[str, Any],
+) -> list[str]:
+    tool_objects = {str(obj["name"]): obj for obj in distribution.get("objects", [])}
+    lines: list[str] = []
+    for name, entry in sidecar["objects"].items():
+        tool_obj = tool_objects.get(name)
+        if tool_obj is None:
+            continue
+        object_poses = [
+            {**ep, "arm": entry["arm"]} for ep in entry["episodes"] if ep["status"] == "ok"
+        ]
+        stats = object_frame_tool_offsets(
+            object_poses, tool_obj.get("poses", []), yaw_period_deg=entry["yaw_period_deg"]
+        )
+        if stats is None:
+            lines.append(f"{name}: no episodes with both object and tool poses")
+            continue
+        mx, my = (v * 100 for v in stats.mean_xy_m)
+        sx, sy = (v * 100 for v in stats.std_xy_m)
+        bx, by = (v * 100 for v in stats.base_frame_std_xy_m)
+        lines.append(
+            f"{name}: tool offset in object frame n={stats.count} "
+            f"mean=({mx:+.2f}, {my:+.2f}) cm std=({sx:.2f}, {sy:.2f}) cm "
+            f"[base-frame std=({bx:.2f}, {by:.2f}) cm, ref yaw {stats.reference_yaw_deg:.1f} deg]"
+        )
+    return lines
+
+
 def extract_dataset_object_poses(
     dataset: DatasetView,
     task_spec: TaskSpec,
@@ -1053,6 +1146,21 @@ def run_object_poses_command(args: argparse.Namespace) -> int:
         print(f"[prompt-box] {exc}", file=sys.stderr)
         return 1
 
+    distribution_path = (
+        args.distribution
+        if args.distribution is not None
+        else default_distribution_path(root, repo_id=dataset.repo_id, revision=dataset.revision)
+    )
+    distribution: dict[str, Any] | None = None
+    if distribution_path.is_file():
+        try:
+            distribution = load_matching_distribution(
+                distribution_path, repo_id=dataset.repo_id, revision=dataset.revision
+            )
+        except (OSError, ValueError) as exc:
+            print(f"[distribution] {exc}", file=sys.stderr)
+            return 1
+
     try:
         plane_z_by_object = resolve_object_plane_z_map(
             task_spec,
@@ -1087,6 +1195,16 @@ def run_object_poses_command(args: argparse.Namespace) -> int:
         ok = sum(1 for item in eps if item["status"] == "ok")
         print(f"{name}: {ok}/{len(eps)} ok (skipped {len(eps) - ok})")
     print(f"Wrote object poses JSON: {out_path}")
+
+    if distribution is not None:
+        try:
+            offset_lines = format_object_frame_offsets(payload, distribution)
+        except (KeyError, ValueError) as exc:
+            print(f"[offsets] {exc}", file=sys.stderr)
+            return 1
+        print(f"Tool-point offsets from {distribution_path}:")
+        for line in offset_lines:
+            print(f"  {line}")
 
     if args.sheet is not None:
         try:
