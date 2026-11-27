@@ -74,7 +74,7 @@ def test_outline_order_batch_iou_and_threshold():
     assert manual.status == "manual" and not manual.passed and manual.iou is None
     assert boundary.iou == 0.60 and boundary.passed
     assert distant.iou == 0.0 and not distant.passed and distant.status == "misaligned"
-    assert "below" in distant.reason and "0.0%" in distant.reason
+    assert distant.reason == "Mask IoU 0.0% below 60.0%; move toward the target"
 
 
 def test_iou_uses_full_mask_not_rendered_exterior_ring():
@@ -137,6 +137,38 @@ def test_threshold_override_and_default(monkeypatch, tmp_path):
     assert AlignmentEvaluator.from_files(config, device="cpu").min_iou == 0.75
     constructor.assert_called_once_with("cpu", "fp32", local_files_only=True)
     assert AlignmentEvaluator.from_files().min_iou == 0.60
+
+
+def test_per_object_threshold_and_near_threshold_reason(monkeypatch, tmp_path):
+    rgb = np.zeros((24, 32, 3), dtype=np.uint8)
+    masks = np.zeros((2, 24, 32), dtype=bool)
+    masks[:, 8:12, 11:15] = True
+    segmenter = Mock(predict=Mock(return_value=masks))
+    monkeypatch.setattr("lerobot_check.alignment.SamSegmenter", Mock(return_value=segmenter))
+    config = tmp_path / "thresholds.json"
+    config.write_text(json.dumps({"version": 1, "min_iou": 0.65, "per_object": {"box_lid": 0.5}}))
+    evaluator = AlignmentEvaluator.from_files(config)
+    prepared = evaluator.prepare_round(PLAN, [target("box_lid"), target("iphone", 2)])
+
+    lid, phone = evaluator.evaluate(rgb, prepared)
+
+    assert lid.iou == phone.iou == 0.60
+    assert lid.passed and lid.reason == "Mask IoU 60.0% meets 50.0%"
+    assert not phone.passed and phone.status == "misaligned"
+    assert phone.reason == "Mask IoU 60.0% just below 65.0%; confirm placement visually"
+
+
+@pytest.mark.parametrize(
+    "override", [None, [], {"": 0.5}, {"box_lid": True}, {"box_lid": 0}, {"box_lid": "0.5"}]
+)
+def test_invalid_per_object_config_fails_before_model_load(override, monkeypatch, tmp_path):
+    constructor = Mock()
+    monkeypatch.setattr("lerobot_check.alignment.SamSegmenter", constructor)
+    config = tmp_path / "thresholds.json"
+    config.write_text(json.dumps({"version": 1, "min_iou": 0.6, "per_object": override}))
+    with pytest.raises(ValueError, match="per_object"):
+        AlignmentEvaluator.from_files(config)
+    constructor.assert_not_called()
 
 
 @pytest.mark.parametrize("value", [0, 1.1, True, "0.6", None])
