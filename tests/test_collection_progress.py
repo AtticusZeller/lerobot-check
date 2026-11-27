@@ -161,3 +161,27 @@ def test_plan_layer_validation(plan_file):
     validate_plan({**plan, "layer": "tool"})
     with pytest.raises(ValueError, match="layer"):
         validate_plan({**plan, "layer": "unknown"})
+
+
+@pytest.mark.parametrize(("local", "returned"), [("object", "tool"), ("object", None)])
+def test_import_rejects_returned_plan_with_other_layer(plan_file, tmp_path, local, returned):
+    from lerobot_check.collection_progress import atomic_write, json_bytes
+
+    plan = load_plan(plan_file)
+    atomic_write(plan_file, json_bytes({**plan, "layer": local}))
+    remote_plan = {**plan, **({"layer": returned} if returned else {})}
+    remote_plan["rounds"][0] = {**remote_plan["rounds"][0], "status": "skipped"}
+    remote = tmp_path / "returned.json"
+    atomic_write(remote, json_bytes(remote_plan))
+    with pytest.raises(ValueError, match="does not match this plan generation"):
+        import_progress(plan_file, remote)
+    assert load_plan(plan_file)["rounds"][0]["status"] == "pending"
+
+
+def test_mark_round_keeps_plan_layer(plan_file):
+    from lerobot_check.collection_progress import atomic_write, json_bytes
+
+    atomic_write(plan_file, json_bytes({**load_plan(plan_file), "layer": "object"}))
+    with plan_session(plan_file) as session:
+        session.mark_skipped(next_pending(session.read())["id"])
+    assert load_plan(plan_file)["layer"] == "object"

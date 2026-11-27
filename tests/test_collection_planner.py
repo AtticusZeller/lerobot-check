@@ -456,3 +456,57 @@ def test_plan_object_layer_provenance_template_mismatch_and_history(calibrated_i
         (first["x_m"], first["y_m"]),
         (first["x_m"] + 0.07, first["y_m"]),
     ]
+
+
+def test_legacy_plan_without_layer_extends_with_tool_layer(calibrated_inputs):
+    plan, _ = make_plan(calibrated_inputs, round_count=2, layer="tool")
+    legacy = {k: v for k, v in plan.items() if k != "layer"}
+    validate_plan(legacy)
+    legacy["rounds"][0]["status"], legacy["rounds"][0]["episode_index"] = "collected", 2
+
+    extended, _ = make_plan(calibrated_inputs, previous=cast(Any, legacy), layer="tool")
+    assert extended["layer"] == "tool"
+    assert extended["plan_id"] == legacy["plan_id"]
+    assert extended["rounds"][0] == legacy["rounds"][0]
+
+
+def test_replace_round_rejects_layer_switch(calibrated_inputs):
+    obj_inputs = _with_object_layer(calibrated_inputs)
+    plan, _ = make_plan(obj_inputs, round_count=2, layer="object")
+    round_id = plan["rounds"][1]["id"]
+    with pytest.raises(ValueError, match=r"Existing plan uses layer 'object'.*'tool'"):
+        make_plan(calibrated_inputs, previous=plan, layer="tool", replace_round_id=round_id)
+
+
+def test_object_layer_plan_names_only_objects_missing_layer(calibrated_inputs):
+    obj_dist, head, obj_templates = _with_object_layer(calibrated_inputs)
+    del obj_dist["objects"][1]["object_layer"]
+    with pytest.raises(ValueError, match=r"object\(s\): phone\. Run 'lerobot-check object-poses'"):
+        make_plan((obj_dist, head, obj_templates), layer="object")
+
+
+def test_object_layer_plan_excludes_object_with_empty_object_poses(calibrated_inputs):
+    obj_dist, head, obj_templates = _with_object_layer(calibrated_inputs)
+    obj_dist["objects"][1]["object_layer"]["poses"] = []
+    plan, _ = make_plan((obj_dist, head, obj_templates), objects_per_round=1, layer="object")
+    assert plan["excluded_objects"]["phone"] == "No calibrated placement candidates"
+    assert all(t["object"] != "phone" for r in plan["rounds"] for t in r["targets"])
+
+
+def test_coverage_history_tool_layer_ignores_object_poses(calibrated_inputs):
+    obj_dist, _, _ = _with_object_layer(calibrated_inputs)
+    lid = obj_dist["objects"][0]
+    lid["object_layer"]["poses"] = [{**lid["object_layer"]["poses"][0], "episode_index": 5}]
+    rounds = [
+        {
+            "id": 1,
+            "status": "collected",
+            "episode_index": 5,
+            "targets": [{"object": "lid", "x_m": 0.1, "y_m": 0.2, "yaw_deg": 30.0}],
+        }
+    ]
+    extra, _ = _coverage_history(obj_dist, cast(Any, rounds), layer="tool")
+    assert extra["lid"] == [{"x_m": 0.1, "y_m": 0.2, "folded_yaw_deg": 30.0}]
+    extra, avoid = _coverage_history(obj_dist, cast(Any, rounds), layer="object")
+    assert "lid" not in extra
+    assert len(avoid["lid"]) == 2

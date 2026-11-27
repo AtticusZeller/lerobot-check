@@ -708,3 +708,26 @@ def test_suggest_tool_layer_matches_existing_fixture_via_cli(tmp_path: Path) -> 
     for key in ("version", "objects", "omitted_objects", "placements", "test_points"):
         assert cli_out[key] == fixture_suggest[key]
     assert cli_out["provenance"]["layer"] == "tool"
+
+
+def test_suggest_object_layer_names_only_missing_objects_and_respects_filter() -> None:
+    dist = _make_distribution_with_tiers()
+    phone = _attach_object_layer({**dist["objects"][0], "name": "phone"})
+    dist["objects"].append(phone)
+
+    with pytest.raises(ValueError, match=r"object\(s\): box\. Run 'lerobot-check object-poses'"):
+        generate_suggestions(dist, count=2, test_per_tier=0)
+
+    with pytest.warns(UserWarning, match="No target polygon"):
+        res = generate_suggestions(dist, count=2, test_per_tier=0, object_filter=["phone"])
+    assert res["provenance"]["layer"] == "object"
+    assert {p["object"] for p in res["placements"]} == {"phone"}
+
+
+def test_suggest_object_layer_with_empty_poses_omits_object() -> None:
+    dist = _make_distribution_with_tiers()
+    _attach_object_layer(dist["objects"][0], poses=[])
+    with pytest.warns(UserWarning, match="No target polygon"):
+        res = generate_suggestions(dist, count=2, test_per_tier=1)
+    assert res["omitted_objects"] == ["box"]
+    assert res["placements"] == res["test_points"] == []
