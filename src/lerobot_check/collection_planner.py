@@ -123,8 +123,8 @@ def _candidates(
         additional_poses=additional_poses,
         seed=seed,
     )
-    meta = {obj["object"]: obj for obj in suggestions["objects"]}
-    without_placements = set(suggestions["omitted_objects"]) - meta.keys()
+    suggested_names = {obj["object"] for obj in suggestions["objects"]}
+    without_placements = set(suggestions["omitted_objects"]) - suggested_names
     bundle = make_bundle(
         suggestions,
         calibration,
@@ -132,6 +132,20 @@ def _candidates(
         calibration_sha256=calibration_sha256,
         suggestions_sha256=sha256_bytes(json_bytes(suggestions)),
     )
+    pools, exclusions = _build_candidate_pools(
+        distribution, calibration, suggestions, bundle, by_object
+    )
+    return pools, suggestions["provenance"]["region_source"], json_bytes(bundle), exclusions
+
+
+def _build_candidate_pools(
+    distribution: Mapping[str, Any],
+    calibration: HeadCalibration,
+    suggestions: Mapping[str, Any],
+    bundle: Mapping[str, Any],
+    templates: Mapping[str, Mapping[str, Any]],
+) -> tuple[dict[str, list[_Candidate]], dict[str, str]]:
+    meta = {obj["object"]: obj for obj in suggestions["objects"]}
     first_arm = min(calibration.arms)
     from_camera = np.linalg.inv(calibration.arms[first_arm].T_cam_base)
     to_common_base = {name: from_camera @ arm.T_cam_base for name, arm in calibration.arms.items()}
@@ -141,58 +155,71 @@ def _candidates(
     }
     manual: dict[str, str] = {}
     for item, mask in zip(suggestions["placements"], bundle["targets"], strict=True):
-        name, arm = item["object"], item["arm"]
-        template = by_object[name]
+        name = item["object"]
+        template = templates[name]
         reason = template.get("reason")
         if reason:
             manual[name] = reason
-        if not (
-            arm in calibration.arms
-            and item["pixel"] is not None
-            and all(
-                0 <= v < bound
-                for v, bound in zip(item["pixel"], calibration.image_size, strict=True)
-            )
-            and item["arrow_end_pixel"] is not None
-            and all(map(math.isfinite, item["arrow_end_pixel"]))
-        ):
-            continue
-        period = meta[name]["yaw_symmetry_deg"]
-        target: PlanTarget = {
-            "kind": "placement",
-            "object": name,
-            "index": item["index"],
-            "arm": arm,
-            "x_m": item["x_m"],
-            "y_m": item["y_m"],
-            "z_m": item["z_m"],
-            "yaw_deg": item["yaw_deg"],
-            "yaw_symmetry_deg": period,
-            "pixel": item["pixel"],
-            "arrow_end_pixel": item["arrow_end_pixel"],
-            "outline": mask["outline"],
-            "reason": mask["reason"],
-            "outline_plane_z_m": None,
-        }
-        if target["outline"] is None:
-            if reason:
-                pools[name].append(_Candidate(target, None, None))
-            continue
-        xyz = outline_base_points(template, item, period)
-        transform = to_common_base[arm]
-        base_xy = (xyz @ transform[:3, :3].T + transform[:3, 3])[:, :2]
-        try:
-            base_hull = _hull(base_xy)
-            image_hull = _hull(np.asarray(mask["outline"]))
-        except ValueError:
-            continue
-        target["outline_plane_z_m"] = item["z_m"] + template["height_offset_m"]
-        pools[name].append(_Candidate(target, base_hull, image_hull))
+        candidate = _placement_candidate(
+            item,
+            mask,
+            template,
+            meta[name]["yaw_symmetry_deg"],
+            calibration.image_size,
+            to_common_base.get(item["arm"]),
+        )
+        if candidate is not None:
+            pools[name].append(candidate)
     for obj in distribution["objects"]:
         name = obj["name"]
         if name not in pools and name not in missing:
             missing[name] = "No candidate fits the calibrated image"
-    return pools, suggestions["provenance"]["region_source"], json_bytes(bundle), missing | manual
+    return pools, missing | manual
+
+
+def _placement_candidate(
+    item: Mapping[str, Any],
+    mask: Mapping[str, Any],
+    template: Mapping[str, Any],
+    period: float,
+    image_size: tuple[int, int],
+    to_common_base: np.ndarray | None,
+) -> _Candidate | None:
+    if not (
+        to_common_base is not None
+        and item["pixel"] is not None
+        and all(0 <= v < bound for v, bound in zip(item["pixel"], image_size, strict=True))
+        and item["arrow_end_pixel"] is not None
+        and all(map(math.isfinite, item["arrow_end_pixel"]))
+    ):
+        return None
+    target: PlanTarget = {
+        "kind": "placement",
+        "object": item["object"],
+        "index": item["index"],
+        "arm": item["arm"],
+        "x_m": item["x_m"],
+        "y_m": item["y_m"],
+        "z_m": item["z_m"],
+        "yaw_deg": item["yaw_deg"],
+        "yaw_symmetry_deg": period,
+        "pixel": item["pixel"],
+        "arrow_end_pixel": item["arrow_end_pixel"],
+        "outline": mask["outline"],
+        "reason": mask["reason"],
+        "outline_plane_z_m": None,
+    }
+    if target["outline"] is None:
+        return _Candidate(target, None, None) if template.get("reason") else None
+    xyz = outline_base_points(template, item, period)
+    base_xy = (xyz @ to_common_base[:3, :3].T + to_common_base[:3, 3])[:, :2]
+    try:
+        base_hull = _hull(base_xy)
+        image_hull = _hull(np.asarray(target["outline"]))
+    except ValueError:
+        return None
+    target["outline_plane_z_m"] = item["z_m"] + template["height_offset_m"]
+    return _Candidate(target, base_hull, image_hull)
 
 
 def _options_for_round(
@@ -214,27 +241,22 @@ def _options_for_round(
     yield from search(0, [])
 
 
-def build_plan(
+def _validate_plan_request(
     distribution: Mapping[str, Any],
     calibration: HeadCalibration,
-    *,
     calibration_sha256: str,
-    templates: Sequence[Mapping[str, Any]],
-    source_episode_count: int,
-    targets: Mapping[str, Any] | None = None,
-    previous: CollectionPlan | None = None,
+    targets: Mapping[str, Any] | None,
+    previous: CollectionPlan | None,
     round_count: int,
     objects_per_round: int,
-    seed: int = 0,
-    replace_round_id: int | None = None,
-) -> tuple[CollectionPlan, bytes]:
-    repo_id, revision = calibration.repo_id, calibration.revision
+    seed: int,
+) -> None:
     if not calibration.arms or (calibration.camera, calibration.image_size) != (
         calibration.intrinsics.camera,
         calibration.intrinsics.image_size,
     ):
         raise ValueError("Expected head intrinsics and at least one calibrated arm")
-    identity = (repo_id, revision, calibration_sha256)
+    identity = (calibration.repo_id, calibration.revision, calibration_sha256)
     if previous and identity != (
         previous["repo_id"],
         previous["revision"],
@@ -250,6 +272,20 @@ def build_plan(
         raise ValueError("Request 1–500 rounds and 1–all objects per round")
     if not 0 <= seed <= 2**53 - 1:
         raise ValueError("Seed must be a nonnegative safe integer")
+
+
+@dataclass(frozen=True)
+class _PlanningHistory:
+    kept: list[PlanRound]
+    additional_poses: dict[str, list[Mapping[str, Any]]]
+    avoid: dict[str, list[tuple[float, float]]]
+    usage: Counter[str]
+    distance: float
+
+
+def _planning_history(
+    distribution: Mapping[str, Any], previous: CollectionPlan | None, replace_round_id: int | None
+) -> _PlanningHistory:
     old_rounds = [] if previous is None else previous["rounds"]
     additional_poses, avoid = _coverage_history(distribution, old_rounds)
     distance = float(distribution["coverage_config"]["xy_bin_m"]) / 2
@@ -268,18 +304,73 @@ def build_plan(
                     avoid[t["object"]].append((t["x_m"], t["y_m"]))
                     if r["id"] != replace_round_id:
                         usage[t["object"]] += 1
-        round_count = 1
-        objects_per_round = previous["settings"]["objects_per_round"]
-    pools, region, bundle, exclusions = _candidates(
-        distribution,
-        calibration,
-        templates,
-        calibration_sha256,
-        targets,
-        additional_poses,
-        round_count,
-        seed,
+    return _PlanningHistory(kept, additional_poses, avoid, usage, distance)
+
+
+def _select_round(
+    pools: Mapping[str, list[_Candidate]],
+    avoid: Mapping[str, Sequence[tuple[float, float]]],
+    usage: Counter[str],
+    order: Mapping[str, int],
+    distance: float,
+    objects_per_round: int,
+) -> list[PlanTarget] | None:
+    available = {
+        name: [
+            candidate
+            for candidate in pool
+            if all(
+                math.hypot(candidate.target["x_m"] - x, candidate.target["y_m"] - y) >= distance
+                for x, y in avoid.get(name, ())
+            )
+        ]
+        for name, pool in pools.items()
+    }
+    names = sorted(
+        (name for name in available if available[name]), key=lambda n: (usage[n], order[n])
     )
+    chosen = next(_options_for_round(names, available, objects_per_round, 24_000), None)
+    return None if chosen is None else [candidate.target for candidate in chosen]
+
+
+def _plan_rounds(
+    pools: Mapping[str, list[_Candidate]],
+    history: _PlanningHistory,
+    order: Mapping[str, int],
+    digest: str,
+    next_id: int,
+    round_count: int,
+    objects_per_round: int,
+) -> tuple[list[PlanRound], int]:
+    planned: list[PlanRound] = []
+    for _ in range(round_count):
+        selected = _select_round(
+            pools, history.avoid, history.usage, order, history.distance, objects_per_round
+        )
+        if selected is None:
+            raise ValueError(
+                f"Found {len(planned)}/{round_count} non-overlapping rounds with "
+                f"{objects_per_round} objects; try fewer rounds/objects or a larger target region"
+            )
+        for t in selected:
+            history.usage[t["object"]] += 1
+            history.avoid[t["object"]].append((t["x_m"], t["y_m"]))
+        planned.append(
+            {
+                "id": next_id,
+                "mask_bundle_sha256": digest,
+                "targets": selected,
+                "status": "pending",
+                "episode_index": None,
+            }
+        )
+        next_id += 1
+    return planned, next_id
+
+
+def _eligible_pools(
+    pools: dict[str, list[_Candidate]], exclusions: dict[str, str], objects_per_round: int
+) -> tuple[dict[str, list[_Candidate]], dict[str, str]]:
     if objects_per_round > 1:
         pools = {name: [c for c in pool if c.base_hull is not None] for name, pool in pools.items()}
         pools = {name: pool for name, pool in pools.items() if pool}
@@ -291,64 +382,79 @@ def build_plan(
             f"Requested {objects_per_round} objects per round; "
             f"only {len(pools)} are eligible. {reasons}"
         )
+    return pools, exclusions
+
+
+def build_plan(
+    distribution: Mapping[str, Any],
+    calibration: HeadCalibration,
+    *,
+    calibration_sha256: str,
+    templates: Sequence[Mapping[str, Any]],
+    source_episode_count: int,
+    targets: Mapping[str, Any] | None = None,
+    previous: CollectionPlan | None = None,
+    round_count: int,
+    objects_per_round: int,
+    seed: int = 0,
+    replace_round_id: int | None = None,
+) -> tuple[CollectionPlan, bytes]:
+    _validate_plan_request(
+        distribution,
+        calibration,
+        calibration_sha256,
+        targets,
+        previous,
+        round_count,
+        objects_per_round,
+        seed,
+    )
+    history = _planning_history(distribution, previous, replace_round_id)
+    if replace_round_id is not None and previous is not None:
+        round_count = 1
+        objects_per_round = previous["settings"]["objects_per_round"]
+    pools, region, bundle, exclusions = _candidates(
+        distribution,
+        calibration,
+        templates,
+        calibration_sha256,
+        targets,
+        history.additional_poses,
+        round_count,
+        seed,
+    )
+    pools, exclusions = _eligible_pools(pools, exclusions, objects_per_round)
     digest = sha256_bytes(bundle)
     next_id = 1 if previous is None else previous["next_round_id"]
     order = {obj["name"]: index for index, obj in enumerate(distribution["objects"])}
-    planned: list[PlanRound] = []
-    for _ in range(round_count):
-        available = {
-            name: [
-                candidate
-                for candidate in pool
-                if all(
-                    math.hypot(candidate.target["x_m"] - x, candidate.target["y_m"] - y) >= distance
-                    for x, y in avoid[name]
-                )
-            ]
-            for name, pool in pools.items()
-        }
-        names = sorted(
-            (name for name in available if available[name]), key=lambda n: (usage[n], order[n])
-        )
-        chosen = next(_options_for_round(names, available, objects_per_round, 24_000), None)
-        if chosen is None:
-            raise ValueError(
-                f"Found {len(planned)}/{round_count} non-overlapping rounds with "
-                f"{objects_per_round} objects; try fewer rounds/objects or a larger target region"
-            )
-        selected = [candidate.target for candidate in chosen]
-        for t in selected:
-            usage[t["object"]] += 1
-            avoid[t["object"]].append((t["x_m"], t["y_m"]))
-        planned.append(
-            {
-                "id": next_id,
-                "mask_bundle_sha256": digest,
-                "targets": selected,
-                "status": "pending",
-                "episode_index": None,
-            }
-        )
-        next_id += 1
+    planned, next_id = _plan_rounds(
+        pools,
+        history,
+        order,
+        digest,
+        next_id,
+        round_count,
+        objects_per_round,
+    )
     settings: PlanSettings = {
         "round_count": round_count,
         "objects_per_round": objects_per_round,
         "seed": seed,
-        "min_revisit_distance_m": distance,
+        "min_revisit_distance_m": history.distance,
         "region_source": region,
     }
-    rounds = kept + planned
+    rounds = history.kept + planned
     if replace_round_id is not None and previous is not None:
         settings = previous["settings"]
-        rounds = [planned[0] if r["id"] == replace_round_id else r for r in old_rounds]
+        rounds = [planned[0] if r["id"] == replace_round_id else r for r in previous["rounds"]]
     plan: CollectionPlan = {
         "format": "lerobot-collection-plan",
         "version": 1,
         "plan_id": previous["plan_id"] if previous else str(uuid4()),
         "generation": previous["generation"] + 1 if previous else 1,
         "next_round_id": next_id,
-        "repo_id": repo_id,
-        "revision": revision,
+        "repo_id": calibration.repo_id,
+        "revision": calibration.revision,
         "source_episode_count": previous["source_episode_count"]
         if previous
         else source_episode_count,

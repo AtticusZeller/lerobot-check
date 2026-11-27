@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import sys
 from pathlib import Path
@@ -11,6 +10,7 @@ from PIL import Image, ImageDraw
 
 from lerobot_check.calib import load_head_calibration, write_json
 from lerobot_check.dataset import DatasetView, resolve_dataset_root
+from lerobot_check.json_io import read_json
 from lerobot_check.masks import (
     make_bundle,
     make_local_outline,
@@ -28,16 +28,6 @@ def segment(
     device: str,
 ) -> np.ndarray:
     return SamSegmenter(device).predict(image, [box], positive=positive, negative=negative)[0]
-
-
-def read_json(path: Path, content: bytes) -> dict:
-    try:
-        result = json.loads(content)
-    except (ValueError, UnicodeError) as exc:
-        raise ValueError(f"{path}: {exc}") from exc
-    if not isinstance(result, dict):
-        raise ValueError(f"{path}: expected a JSON object")
-    return result
 
 
 def run_template(args: argparse.Namespace) -> None:

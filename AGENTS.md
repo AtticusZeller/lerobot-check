@@ -21,6 +21,8 @@ uv run ruff format --check .
 uv run ty check src/
 ```
 
+Enable the pre-commit hook for new comments and docstrings with `uvx pre-commit install`.
+
 ## Public Repository Data Policy
 
 This is a **public** repository. Never commit, stage, or add:
@@ -45,7 +47,15 @@ CLI commands take explicit input/output paths. Write all generated artifacts out
   - `analysis.py`: `distribution.json` computation (frame shares, object poses/coverage, resampled trajectories, subtask-arm metrics)
   - `calib.py`: head-camera calibration frame selection (`calib-frames` with `--max-gripper`, `--max-speed`, `--no-speed-filter`, `--append`, `--arms`), joint extrinsic+tool-offset solver (`calibrate`), and projection/back-projection geometry
   - `suggest.py`: target polygon back-projection, collection placement sampling, and three-tier test point generation
+  - `masks.py`: object mask template geometry and projected overlay bundles
+  - `mask_cli.py`: mask template extraction, rejection, and overlay commands
+  - `collection_planner.py`: placement candidates, overlap checks, and collection round selection
+  - `collection_plan_cli.py`: collection plan generation, editing, and progress commands
+  - `collection_progress.py`: collection plan schema, locking, persistence, and progress merging
+  - `segmentation.py`: SAM model loading, mask prediction, and exterior contours
+  - `alignment.py`: live mask overlap scoring and target-specific thresholds
+  - `json_io.py`: shared JSON object reading
   - `cli.py`: `lerobot-check` CLI entry point
-- Prefer small, single-responsibility functions with explicit type annotations and Google-style docstrings.
-- Write comments only to explain non-obvious *why* decisions, not to narrate code.
+- Express intent through names, explicit types, and small, single-responsibility functions instead of new comments or docstrings.
+- Use `KEEP:` comments only for unavoidable external constraints that code, types, and tests cannot express.
 - Commit with Conventional Commits (`type(scope): subject`).
