@@ -85,7 +85,9 @@ uv run lerobot-check window-sheet \
   -o /tmp/lerobot-check/window-r2
 ```
 
-From Round 2, each boundary agent outputs a CSV with header `episode_index,end` for its boundary, using each episode's first `"yes"` frame as `end`; Step 3 refines it to the exact frame.
+The predicate is not always monotone: a gripper can lift clear and then return to press or adjust the same object. Before accepting a first `"yes"` frame, confirm that a frame about 2 s later (`--windows` with `lo = hi`, or a short window after it) is still `"yes"`; if the gripper is back on the object, the boundary lies after that return, so search again from there.
+
+From Round 2, each boundary agent outputs a CSV with header `episode_index,end` for its boundary, using each episode's confirmed first `"yes"` frame as `end`; Step 3 refines it to the exact frame.
 
 5. **Assemble the initial annotation table**: the coordinator combines the per-boundary `episode_index,end` CSVs into one annotation CSV per `(repo_id, revision)` (default `<lerobot_root>/.xense-viewer/subtasks/<org>__<name>@<revision>.csv`), setting `start = 0` for the first subtask, each subsequent row's `start` to the previous row's `end`, and the final subtask's `end` to `episode_length`, with the exact header:
 
