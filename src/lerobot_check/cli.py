@@ -565,6 +565,13 @@ def _cmd_window_sheet(args: argparse.Namespace) -> int:
     else:
         assert windows_by_ep is not None
         if episode_filter is not None:
+            missing_rows = [ep for ep in episode_filter if ep not in windows_by_ep]
+            if missing_rows:
+                print(
+                    f"[windows] --episodes entries with no row in {args.windows}: {missing_rows}",
+                    file=sys.stderr,
+                )
+                return 1
             filter_set = set(episode_filter)
             episode_windows = [
                 (ep, lo, hi) for ep, (lo, hi) in windows_by_ep.items() if ep in filter_set

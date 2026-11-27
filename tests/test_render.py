@@ -1173,3 +1173,74 @@ def test_sample_window_invariants(lo: int, hi: int, samples: int, length: int) -
         assert max(diffs) - min(diffs) <= 1
     else:
         assert frames == list(range(clamped_lo, clamped_hi + 1))
+
+
+def test_cli_window_sheet_rejects_episodes_missing_from_windows_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ds_root = tmp_path / "Xense" / "demo_ds"
+    ds_root.mkdir(parents=True)
+
+    class _FakeDataset:
+        def __init__(self, root: Path, repo_id: str | None = None, revision: str | None = None):
+            self.fps = 30.0
+            self.camera_keys = DEFAULT_CAMERAS
+            self.episode_lengths = {0: 600, 1: 600, 2: 600, 3: 600}
+
+        def get_episode(self, episode_index: int) -> EpisodeRecord:
+            span = VideoSpan(path=tmp_path / "ep.mp4", from_timestamp=0.0, to_timestamp=20.0)
+            return EpisodeRecord(
+                episode_index=episode_index,
+                length=self.episode_lengths[episode_index],
+                data_path=tmp_path / "fake.parquet",
+                videos={cam: span for cam in DEFAULT_CAMERAS},
+            )
+
+    def _fake_decode(
+        path: Path, targets: list[tuple[int, float]], *, fps: float, **kwargs: object
+    ) -> dict[int, Image.Image]:
+        return {frame_id: Image.new("RGB", (64, 48)) for frame_id, _ in targets}
+
+    monkeypatch.setattr("lerobot_check.cli.DatasetView", _FakeDataset)
+    monkeypatch.setattr("lerobot_check.render.decode_video_frames_pyav", _fake_decode)
+
+    win_csv = tmp_path / "windows.csv"
+    win_csv.write_text("episode_index,lo,hi\n0,100,200\n2,300,400\n", encoding="utf-8")
+    out_dir = tmp_path / "out"
+
+    rc = main(
+        [
+            "window-sheet",
+            "--dataset-root",
+            str(ds_root),
+            "--windows",
+            str(win_csv),
+            "--episodes",
+            "0-3",
+            "-o",
+            str(out_dir),
+        ]
+    )
+    err = capsys.readouterr().err
+    assert rc == 1
+    assert "[1, 3]" in err
+    assert str(win_csv) in err
+    assert not out_dir.exists()
+
+    rc_subset = main(
+        [
+            "window-sheet",
+            "--dataset-root",
+            str(ds_root),
+            "--windows",
+            str(win_csv),
+            "--episodes",
+            "2",
+            "-o",
+            str(out_dir),
+        ]
+    )
+    assert rc_subset == 0
+    assert capsys.readouterr().out.split() == [str(out_dir / "window_p01.jpg")]
