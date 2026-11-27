@@ -49,11 +49,19 @@ uv run --extra mask-template lerobot-check object-poses \
   --device cuda \
   --sheet /tmp/object-poses-sheets
 
+# 1b. 个别 episode 的初始摆放偏离固定布局时，用 --prompt-box 只替换该 episode 中该物体的框（可重复）
+uv run --extra mask-template lerobot-check object-poses \
+  --dataset-root /path/to/dataset \
+  --device cuda \
+  --prompt-box 33:box_lid=300,40,470,170 \
+  --prompt-box 34:paper_insert=230,70,360,190 \
+  --sheet /tmp/object-poses-sheets
+
 # 2. 重新生成 distribution.json（自动读取默认路径的 object-poses 侧车，也可用 --object-poses 指定）
 uv run lerobot-check distribution --dataset-root /path/to/dataset
 ```
 
-`object-poses` 每帧只编码一次图像，利用每个 `layout_box` 内部的规则正点网格与多掩码筛选提取不触及框边界的单物体掩码（必要时回退框提示以保留跳过诊断），并剔除空掩码、触框掩码、缺失臂标定以及矩形尺寸偏离跨 episode 中位数过大的异常项。物体层角度取反投轮廓最小外接矩形的长轴方向，折叠周期为 `yaw_period_deg = min(yaw_symmetry_deg, 180)`。复核联系表按多条 episode 拼页保存为 `object_poses_p01.jpg` 等 JPEG 文件，每格叠加标注各物体轮廓与名称，并在页底标注跳过物体的原因。
+`object-poses` 每帧只编码一次图像，利用每个 `layout_box` 内部的规则正点网格与多掩码筛选提取不触及框边界的单物体掩码（必要时回退框提示以保留跳过诊断），并剔除空掩码、触框掩码、缺失臂标定以及矩形尺寸偏离跨 episode 中位数过大的异常项。物体层角度取反投轮廓最小外接矩形的长轴方向，折叠周期为 `yaw_period_deg = min(yaw_symmetry_deg, 180)`。`--prompt-box EP:OBJECT=x0,y0,x1,y1` 仅对第 `EP` 条 episode 的 `OBJECT` 用给定框（第 0 帧头图原图像素）代替其 `layout_box` 作为分割提示和触框检查范围，其余 episode 仍使用固定布局；该框写入侧车中对应 episode 记录的 `prompt_box` 字段以便复现。物体必须在 task spec 中配置了 `layout_box`，episode 必须在本次处理的 episode 范围内，框必须满足 `0 <= x0 < x1 <= W`、`0 <= y0 < y1 <= H`，同一 episode 与物体重复指定会报错。复核联系表按多条 episode 拼页保存为 `object_poses_p01.jpg` 等 JPEG 文件，每格叠加标注各物体轮廓与名称，并在页底标注跳过物体的原因。
 
 ## 补采目标轮廓
 

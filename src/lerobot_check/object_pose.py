@@ -4,7 +4,7 @@ import argparse
 import math
 import sys
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -60,6 +60,9 @@ _OK_TEXT_COLOR = (134, 239, 172)
 _WARN_TEXT_COLOR = (252, 165, 165)
 
 
+LayoutBox = tuple[int, int, int, int]
+
+
 @dataclass(frozen=True)
 class ObjectPoseMeasurement:
     x_m: float
@@ -78,6 +81,7 @@ class EpisodeObjectMeasurement:
     status: str
     outline: list[list[float]] | None
     pose: ObjectPoseMeasurement | None
+    prompt_box: LayoutBox | None = None
 
 
 def object_yaw_period_deg(yaw_symmetry_deg: float) -> float:
@@ -324,15 +328,7 @@ def apply_size_outlier_filter(
                 f"rectangle size ({rec.pose.length_m * 100:.1f}x{rec.pose.width_m * 100:.1f} cm) "
                 f"far from median ({med_len * 100:.1f}x{med_wid * 100:.1f} cm)"
             )
-            filtered.append(
-                EpisodeObjectMeasurement(
-                    episode_index=rec.episode_index,
-                    frame=rec.frame,
-                    status=reason,
-                    outline=rec.outline,
-                    pose=None,
-                )
-            )
+            filtered.append(replace(rec, status=reason, pose=None))
         else:
             filtered.append(rec)
     return filtered
@@ -364,21 +360,22 @@ def build_object_poses_payload(
         ep_entries: list[dict[str, Any]] = []
         for rec in records:
             pose = rec.pose if rec.status == "ok" else None
-            ep_entries.append(
-                {
-                    "episode_index": rec.episode_index,
-                    "frame": rec.frame,
-                    "status": rec.status,
-                    "outline": rec.outline,
-                    "x_m": pose.x_m if pose is not None else None,
-                    "y_m": pose.y_m if pose is not None else None,
-                    "z_m": pose.z_m if pose is not None else None,
-                    "raw_yaw_deg": pose.raw_yaw_deg if pose is not None else None,
-                    "folded_yaw_deg": pose.folded_yaw_deg if pose is not None else None,
-                    "length_m": pose.length_m if pose is not None else None,
-                    "width_m": pose.width_m if pose is not None else None,
-                }
-            )
+            ep_entry: dict[str, Any] = {
+                "episode_index": rec.episode_index,
+                "frame": rec.frame,
+                "status": rec.status,
+                "outline": rec.outline,
+                "x_m": pose.x_m if pose is not None else None,
+                "y_m": pose.y_m if pose is not None else None,
+                "z_m": pose.z_m if pose is not None else None,
+                "raw_yaw_deg": pose.raw_yaw_deg if pose is not None else None,
+                "folded_yaw_deg": pose.folded_yaw_deg if pose is not None else None,
+                "length_m": pose.length_m if pose is not None else None,
+                "width_m": pose.width_m if pose is not None else None,
+            }
+            if rec.prompt_box is not None:
+                ep_entry["prompt_box"] = list(rec.prompt_box)
+            ep_entries.append(ep_entry)
         objects_dict[obj.name] = {
             "arm": obj.arm,
             "layout_box": list(obj.layout_box),
@@ -569,12 +566,12 @@ def _median_z_from_annotations(
     return {name: (float(np.median(vals)) if vals else None) for name, vals in zs_by_obj.items()}
 
 
-def _median_z_from_distribution(
+def load_matching_distribution(
     distribution_path: Path,
     *,
     repo_id: str,
     revision: str,
-) -> dict[str, float | None]:
+) -> dict[str, Any]:
     payload = read_json(distribution_path, distribution_path.read_bytes())
     prov = payload.get("provenance", {})
     if prov.get("repo_id") != repo_id or prov.get("revision") != revision:
@@ -585,6 +582,16 @@ def _median_z_from_distribution(
         raise ValueError(
             f"Distribution file {distribution_path} must use calibrated tool_point positions"
         )
+    return payload
+
+
+def _median_z_from_distribution(
+    distribution_path: Path,
+    *,
+    repo_id: str,
+    revision: str,
+) -> dict[str, float | None]:
+    payload = load_matching_distribution(distribution_path, repo_id=repo_id, revision=revision)
     return {
         str(item["name"]): (
             float(item["median_z_m"]) if item.get("median_z_m") is not None else None
@@ -682,7 +689,7 @@ def _annotate_episode_frame(
     overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
     for name, color, obj_meta, ep_entry in object_entries:
-        box = obj_meta["layout_box"]
+        box = ep_entry.get("prompt_box") or obj_meta["layout_box"]
         x0, y0, x1, y1 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
         is_ok = ep_entry["status"] == "ok"
         outline = ep_entry.get("outline")
@@ -846,6 +853,55 @@ def render_object_pose_sheets(
     return written
 
 
+def parse_prompt_box(text: str) -> tuple[int, str, LayoutBox]:
+    usage = f"--prompt-box must look like EP:OBJECT=x0,y0,x1,y1, got {text!r}"
+    target, sep, coords = text.partition("=")
+    ep_text, colon, name = target.partition(":")
+    if not sep or not colon or not name.strip():
+        raise ValueError(usage)
+    try:
+        episode = int(ep_text)
+        values = [int(v) for v in coords.split(",")]
+    except ValueError as exc:
+        raise ValueError(usage) from exc
+    if len(values) != 4:
+        raise ValueError(usage)
+    return episode, name.strip(), (values[0], values[1], values[2], values[3])
+
+
+def parse_prompt_boxes(values: Sequence[str]) -> dict[tuple[int, str], LayoutBox]:
+    overrides: dict[tuple[int, str], LayoutBox] = {}
+    for text in values:
+        episode, name, box = parse_prompt_box(text)
+        if (episode, name) in overrides:
+            raise ValueError(f"Duplicate --prompt-box for episode {episode} object {name!r}")
+        overrides[(episode, name)] = box
+    return overrides
+
+
+def validate_prompt_boxes(
+    overrides: Mapping[tuple[int, str], LayoutBox],
+    *,
+    task_spec: TaskSpec,
+    episodes: Sequence[int],
+    image_size: tuple[int, int],
+) -> None:
+    layout_names = sorted(obj.name for obj in task_spec.objects if obj.layout_box is not None)
+    selected = set(episodes)
+    width, height = image_size
+    for (episode, name), (x0, y0, x1, y1) in sorted(overrides.items()):
+        label = f"--prompt-box {episode}:{name}"
+        if name not in layout_names:
+            raise ValueError(f"{label}: unknown object; objects with layout_box: {layout_names}")
+        if episode not in selected:
+            raise ValueError(f"{label}: episode {episode} is not among the processed episodes")
+        if not (0 <= x0 < x1 <= width and 0 <= y0 < y1 <= height):
+            raise ValueError(
+                f"{label}: box {[x0, y0, x1, y1]} must satisfy 0 <= x0 < x1 <= {width} "
+                f"and 0 <= y0 < y1 <= {height}"
+            )
+
+
 def extract_dataset_object_poses(
     dataset: DatasetView,
     task_spec: TaskSpec,
@@ -856,6 +912,7 @@ def extract_dataset_object_poses(
     plane_z_by_object: Mapping[str, float | None],
     segmenter: SamSegmenter,
     max_size_deviation: float = DEFAULT_MAX_SIZE_DEVIATION,
+    prompt_boxes: Mapping[tuple[int, str], LayoutBox] | None = None,
 ) -> tuple[dict[str, Any], dict[int, Image.Image]]:
     layout_objects = [obj for obj in task_spec.objects if obj.layout_box is not None]
     if not layout_objects:
@@ -871,6 +928,13 @@ def extract_dataset_object_poses(
                 f"image size {list(calibration.image_size)}"
             )
 
+    overrides = dict(prompt_boxes or {})
+    validate_prompt_boxes(
+        overrides,
+        task_spec=task_spec,
+        episodes=episodes,
+        image_size=calibration.image_size,
+    )
     images = decode_frame_zero_images(dataset, calibration.camera, episodes)
     calibrated_objects = [obj for obj in layout_objects if obj.arm in calibration.arms]
     uncalibrated_objects = [obj for obj in layout_objects if obj.arm not in calibration.arms]
@@ -878,7 +942,10 @@ def extract_dataset_object_poses(
     raw_by_object: dict[str, list[EpisodeObjectMeasurement]] = {
         obj.name: [] for obj in layout_objects
     }
-    boxes_for_sam = [obj.layout_box for obj in calibrated_objects if obj.layout_box is not None]
+
+    def episode_box(ep_idx: int, obj: ObjectSpec) -> LayoutBox:
+        assert obj.layout_box is not None
+        return overrides.get((ep_idx, obj.name), obj.layout_box)
 
     for ep_idx in episodes:
         image = images[ep_idx]
@@ -887,32 +954,23 @@ def extract_dataset_object_poses(
                 f"Episode {ep_idx} frame 0 size {image.size} differs from calibration "
                 f"image_size {calibration.image_size}"
             )
+        boxes_for_sam = [episode_box(ep_idx, obj) for obj in calibrated_objects]
         masks = segmenter.segment_layout_boxes(image, boxes_for_sam) if boxes_for_sam else []
-        for obj, mask in zip(calibrated_objects, masks, strict=True):
-            assert obj.layout_box is not None
-            raw_by_object[obj.name].append(
-                evaluate_mask_for_episode(
-                    ep_idx,
-                    mask,
-                    layout_box=obj.layout_box,
-                    plane_z_m=plane_z_by_object.get(obj.name),
-                    arm_name=obj.arm,
-                    calibration=calibration,
-                    yaw_symmetry_deg=obj.yaw_symmetry_deg,
-                )
+        masks_by_name: dict[str, np.ndarray | None] = {
+            obj.name: mask for obj, mask in zip(calibrated_objects, masks, strict=True)
+        }
+        for obj in [*calibrated_objects, *uncalibrated_objects]:
+            measurement = evaluate_mask_for_episode(
+                ep_idx,
+                masks_by_name.get(obj.name),
+                layout_box=episode_box(ep_idx, obj),
+                plane_z_m=plane_z_by_object.get(obj.name),
+                arm_name=obj.arm,
+                calibration=calibration,
+                yaw_symmetry_deg=obj.yaw_symmetry_deg,
             )
-        for obj in uncalibrated_objects:
-            assert obj.layout_box is not None
             raw_by_object[obj.name].append(
-                evaluate_mask_for_episode(
-                    ep_idx,
-                    None,
-                    layout_box=obj.layout_box,
-                    plane_z_m=plane_z_by_object.get(obj.name),
-                    arm_name=obj.arm,
-                    calibration=calibration,
-                    yaw_symmetry_deg=obj.yaw_symmetry_deg,
-                )
+                replace(measurement, prompt_box=overrides.get((ep_idx, obj.name)))
             )
 
     filtered_by_object = {
@@ -990,6 +1048,12 @@ def run_object_poses_command(args: argparse.Namespace) -> int:
         return 1
 
     try:
+        prompt_boxes = parse_prompt_boxes(args.prompt_box or [])
+    except ValueError as exc:
+        print(f"[prompt-box] {exc}", file=sys.stderr)
+        return 1
+
+    try:
         plane_z_by_object = resolve_object_plane_z_map(
             task_spec,
             dataset=dataset,
@@ -1006,6 +1070,7 @@ def run_object_poses_command(args: argparse.Namespace) -> int:
             episodes=episodes,
             plane_z_by_object=plane_z_by_object,
             segmenter=segmenter,
+            prompt_boxes=prompt_boxes,
         )
     except (KeyError, OSError, RuntimeError, ValueError) as exc:
         print(f"[object-poses] {exc}", file=sys.stderr)
@@ -1097,6 +1162,16 @@ def configure_object_poses_parser(parser: argparse.ArgumentParser) -> None:
         nargs="+",
         default=None,
         help="Episode indices or ranges (e.g. '0,5,10-20'). Default: all episodes.",
+    )
+    parser.add_argument(
+        "--prompt-box",
+        action="append",
+        default=None,
+        metavar="EP:OBJECT=x0,y0,x1,y1",
+        help=(
+            "Replace OBJECT's layout_box for episode EP only (native head pixels); repeatable. "
+            "Recorded as prompt_box on that episode's sidecar record."
+        ),
     )
     parser.add_argument(
         "--device",
