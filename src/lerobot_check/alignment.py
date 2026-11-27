@@ -137,7 +137,7 @@ def _read_threshold(path: Path) -> float:
 def _prepare(target: PlanTarget, size: tuple[int, int]) -> _Target | AlignmentResult:
     name, index = target["object"], target["index"]
     outline = target["outline"]
-    if name == "box_base" or outline is None:
+    if outline is None:
         return AlignmentResult(
             name,
             index,
