@@ -1540,7 +1540,9 @@ def load_windows_csv(path: Path) -> dict[int, tuple[int, int]]:
             )
 
         windows: dict[int, tuple[int, int]] = {}
-        for line_no, raw in enumerate(reader, start=2):
+        for raw in reader:
+            # DictReader skips blank lines, so enumerate() would misnumber later rows.
+            line_no = reader.line_num
             if None in raw:
                 raise ValueError(f"Line {line_no}: unexpected extra CSV columns: {raw[None]}.")
             ep_idx = _parse_window_csv_int(raw["episode_index"], "episode_index", line_no)

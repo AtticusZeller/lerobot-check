@@ -1126,3 +1126,50 @@ def test_cli_window_sheet_validation_and_rendering(
     assert rc_oob_crop == 1
     assert "640x480" in err_oob
     assert not out_dir.exists()
+
+
+def test_load_windows_csv_error_line_counts_blank_lines(tmp_path: Path) -> None:
+    path = tmp_path / "blank_lines.csv"
+    path.write_text("episode_index,lo,hi\n\n0,10,20\n\n1,30,20\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Line 5"):
+        load_windows_csv(path)
+
+
+def test_load_windows_csv_accepts_any_header_order_and_skips_blank_lines(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "reordered.csv"
+    path.write_text("hi,lo,episode_index\n20,10,0\n\n40,30,1\n", encoding="utf-8")
+    assert load_windows_csv(path) == {0: (10, 20), 1: (30, 40)}
+
+
+@pytest.mark.parametrize(
+    ("lo", "hi", "samples", "length"),
+    [
+        (0, 99, 8, 100),
+        (0, 1000, 8, 100),
+        (-5, 99, 8, 100),
+        (90, 120, 8, 100),
+        (99, 200, 8, 100),
+        (0, 7, 8, 100),
+        (0, 6, 8, 100),
+        (0, 1, 8, 100),
+        (0, 99, 2, 100),
+        (0, 99, 100, 100),
+        (0, 99, 1000, 100),
+        (0, 17999, 8, 18000),
+        (0, 5, 8, 1),
+    ],
+)
+def test_sample_window_invariants(lo: int, hi: int, samples: int, length: int) -> None:
+    frames = sample_window(lo, hi, samples, length)
+    clamped_lo, clamped_hi = max(0, lo), min(length - 1, hi)
+    assert frames[0] == clamped_lo
+    assert frames[-1] == clamped_hi
+    assert all(b > a for a, b in pairwise(frames))
+    if clamped_hi - clamped_lo >= samples - 1:
+        diffs = [b - a for a, b in pairwise(frames)]
+        assert len(frames) == samples
+        assert max(diffs) - min(diffs) <= 1
+    else:
+        assert frames == list(range(clamped_lo, clamped_hi + 1))
