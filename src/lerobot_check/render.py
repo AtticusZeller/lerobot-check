@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import csv
 import math
 from collections import defaultdict
 from collections.abc import Collection, Mapping, Sequence
@@ -36,6 +37,11 @@ _BOUNDARY_CAM_GAP_PX = 2
 _BOUNDARY_CELL_GAP_PX = 6
 _HUMAN_MARKER_BG = (22, 163, 74)
 _HUMAN_MARKER_FG = (255, 255, 255)
+_WINDOW_ROW_LABEL_WIDTH = 72
+_WINDOW_CELL_LABEL_HEIGHT = 24
+_WINDOW_CAM_GAP_PX = 2
+_WINDOW_CELL_GAP_PX = 6
+_WINDOW_ROW_GAP_PX = 6
 
 
 @dataclass(frozen=True)
@@ -1443,6 +1449,402 @@ def render_boundary_sheets(
     written: list[Path] = []
     for page_idx, sheet in enumerate(sheets, start=1):
         dest = output_dir / f"{subtask_position}_{subtask}_end_p{page_idx:02d}.jpg"
+        sheet.save(dest, format="JPEG", quality=jpeg_quality)
+        written.append(dest)
+    return written
+
+
+_WINDOWS_CSV_COLUMNS: tuple[str, ...] = ("episode_index", "lo", "hi")
+
+
+@dataclass(frozen=True)
+class WindowCell:
+    """Decoded camera images and metadata for one sampled frame cell in a window sheet."""
+
+    frame: int
+    time_s: float
+    images: tuple[Image.Image, ...]
+
+
+@dataclass(frozen=True)
+class WindowRow:
+    """One episode row of sampled frame cells on a window sheet."""
+
+    episode_index: int
+    cells: tuple[WindowCell, ...]
+
+
+def parse_window_seconds(spec: str) -> tuple[float, float]:
+    """Parse a ``LO:HI`` time window in seconds.
+
+    Args:
+        spec: Raw ``--window-s`` argument such as ``"10:42"`` or ``"8.5:24.0"``.
+
+    Returns:
+        Tuple ``(lo_s, hi_s)`` with ``0 <= lo_s < hi_s``.
+
+    Raises:
+        ValueError: If ``spec`` is malformed, non-finite, negative, or has ``lo >= hi``.
+    """
+    parts = [part.strip() for part in spec.split(":")]
+    if len(parts) != 2 or not parts[0] or not parts[1]:
+        raise ValueError(f"Invalid window {spec!r}; expected 'LO:HI' in seconds.")
+    try:
+        lo = float(parts[0])
+        hi = float(parts[1])
+    except ValueError as exc:
+        raise ValueError(f"Invalid numeric value in window {spec!r}; expected 'LO:HI'.") from exc
+    if not (math.isfinite(lo) and math.isfinite(hi)):
+        raise ValueError(f"Window bounds must be finite numbers in {spec!r}.")
+    if lo < 0.0 or hi < 0.0:
+        raise ValueError(f"Window bounds must be non-negative in {spec!r}.")
+    if lo >= hi:
+        raise ValueError(f"Window start must be less than end (LO < HI) in {spec!r}.")
+    return lo, hi
+
+
+def _parse_window_csv_int(value: str | None, field: str, line_no: int) -> int:
+    text = "" if value is None else value.strip()
+    if not text:
+        raise ValueError(f"Line {line_no}: missing integer value for '{field}'.")
+    try:
+        return int(text)
+    except ValueError as exc:
+        raise ValueError(f"Line {line_no}: non-integer value for '{field}': {value!r}.") from exc
+
+
+def load_windows_csv(path: Path) -> dict[int, tuple[int, int]]:
+    """Read a per-episode frame window CSV with header ``episode_index,lo,hi``.
+
+    Both ``lo`` and ``hi`` are inclusive frame indices.
+
+    Args:
+        path: Path to the windows CSV file.
+
+    Returns:
+        Mapping ``episode_index -> (lo, hi)`` in file order.
+
+    Raises:
+        ValueError: If the header is missing a required column, any value is not a
+            non-negative integer, ``lo > hi``, or an episode appears more than once.
+    """
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        if reader.fieldnames is None:
+            raise ValueError(f"Line 1: windows CSV {path} is empty (no header row).")
+
+        missing = [col for col in _WINDOWS_CSV_COLUMNS if col not in reader.fieldnames]
+        if missing:
+            raise ValueError(
+                f"Line 1: windows CSV {path} is missing required column(s): {missing}."
+            )
+
+        windows: dict[int, tuple[int, int]] = {}
+        for line_no, raw in enumerate(reader, start=2):
+            if None in raw:
+                raise ValueError(f"Line {line_no}: unexpected extra CSV columns: {raw[None]}.")
+            ep_idx = _parse_window_csv_int(raw["episode_index"], "episode_index", line_no)
+            lo = _parse_window_csv_int(raw["lo"], "lo", line_no)
+            hi = _parse_window_csv_int(raw["hi"], "hi", line_no)
+
+            if ep_idx < 0:
+                raise ValueError(f"Line {line_no}: negative episode_index {ep_idx}.")
+            if lo < 0 or hi < 0:
+                raise ValueError(
+                    f"Line {line_no}: negative window bound (lo={lo}, hi={hi}) "
+                    f"for episode {ep_idx}."
+                )
+            if lo > hi:
+                raise ValueError(f"Line {line_no}: lo ({lo}) > hi ({hi}) for episode {ep_idx}.")
+            if ep_idx in windows:
+                raise ValueError(f"Line {line_no}: duplicate episode_index {ep_idx}.")
+            windows[ep_idx] = (lo, hi)
+
+    return windows
+
+
+def sample_window(
+    lo: int,
+    hi: int,
+    samples: int,
+    episode_length: int,
+    *,
+    episode_index: int | None = None,
+) -> list[int]:
+    """Sample evenly spaced inclusive frame indices inside ``[lo, hi]``.
+
+    Clamps ``[lo, hi]`` to ``[0, episode_length - 1]``, includes both clamped
+    endpoints, rounds intermediate positions, and removes duplicates so the
+    returned indices are strictly increasing.
+
+    Args:
+        lo: Inclusive lower frame bound.
+        hi: Inclusive upper frame bound.
+        samples: Target number of samples (must be >= 2).
+        episode_length: Total number of frames in the episode (must be > 0).
+        episode_index: Optional episode index included in error messages.
+
+    Returns:
+        Strictly increasing list of sampled frame indices within
+        ``[0, episode_length - 1]``.
+
+    Raises:
+        ValueError: If parameters are invalid, ``lo > hi``, ``hi < 0``, or
+            ``lo >= episode_length``.
+    """
+    ep_prefix = f"Episode {episode_index}: " if episode_index is not None else ""
+    if episode_length <= 0:
+        raise ValueError(f"{ep_prefix}episode_length must be positive, got {episode_length}.")
+    if samples < 2:
+        raise ValueError(f"samples must be >= 2, got {samples}.")
+    if lo > hi:
+        raise ValueError(f"{ep_prefix}window lo ({lo}) > hi ({hi}).")
+    if hi < 0:
+        raise ValueError(f"{ep_prefix}window [{lo}, {hi}] ends before frame 0.")
+    if lo >= episode_length:
+        raise ValueError(
+            f"{ep_prefix}window [{lo}, {hi}] lies at or beyond episode end "
+            f"(length={episode_length})."
+        )
+
+    clamped_lo = max(0, lo)
+    clamped_hi = min(episode_length - 1, hi)
+    if clamped_lo == clamped_hi:
+        return [clamped_lo]
+
+    span = clamped_hi - clamped_lo
+    sampled: list[int] = []
+    for idx in range(samples):
+        if idx == 0:
+            frame = clamped_lo
+        elif idx == samples - 1:
+            frame = clamped_hi
+        else:
+            frame = round(clamped_lo + idx * span / (samples - 1))
+        if not sampled or frame > sampled[-1]:
+            sampled.append(frame)
+    return sampled
+
+
+def compose_window_sheets(
+    rows: Sequence[WindowRow],
+    *,
+    per_page: int = 8,
+    tile_height: int | None = None,
+) -> list[Image.Image]:
+    """Compose episode window rows into one or more RGB contact-sheet images.
+
+    Each row starts with an ``ep<idx>`` label column followed by one cell per
+    sampled frame. Multiple cameras inside a cell are stacked vertically beneath
+    the cell label ``f<frame> <seconds:.1f>s``.
+
+    Args:
+        rows: Ordered sequence of ``WindowRow`` items.
+        per_page: Maximum episode rows per page, or ``0`` to put all rows on one page.
+        tile_height: Optional height to resize every camera image to while preserving
+            aspect ratio. When ``None``, images keep their input height.
+
+    Returns:
+        List of composed RGB ``PIL.Image`` pages.
+
+    Raises:
+        ValueError: If layout parameters are invalid or a row/cell has no images.
+    """
+    if per_page < 0:
+        raise ValueError(f"per_page must be >= 0, got {per_page}.")
+    if tile_height is not None and tile_height <= 0:
+        raise ValueError(f"tile_height must be positive, got {tile_height}.")
+    if not rows:
+        return []
+
+    prepared_rows: list[tuple[WindowRow, list[tuple[WindowCell, tuple[Image.Image, ...]]]]] = []
+    max_cam_w = 0
+    max_cam_h = 0
+    for row in rows:
+        if not row.cells:
+            raise ValueError(f"Episode {row.episode_index} row has no cells.")
+        prepared_cells: list[tuple[WindowCell, tuple[Image.Image, ...]]] = []
+        for cell in row.cells:
+            if not cell.images:
+                raise ValueError(
+                    f"Episode {row.episode_index} frame {cell.frame} cell has no images."
+                )
+            resized = tuple(
+                _crop_and_resize_height(img, crop=None, tile_height=tile_height)
+                for img in cell.images
+            )
+            cam_w = max(im.width for im in resized)
+            cam_h = sum(im.height for im in resized) + max(0, len(resized) - 1) * _WINDOW_CAM_GAP_PX
+            max_cam_w = max(max_cam_w, cam_w)
+            max_cam_h = max(max_cam_h, cam_h)
+            prepared_cells.append((cell, resized))
+        prepared_rows.append((row, prepared_cells))
+
+    cell_w = max_cam_w
+    cell_h = _WINDOW_CELL_LABEL_HEIGHT + max_cam_h
+
+    if per_page == 0:
+        pages = [prepared_rows]
+    else:
+        pages = [prepared_rows[i : i + per_page] for i in range(0, len(prepared_rows), per_page)]
+
+    row_font = _load_font(14)
+    cell_font = _load_font(13)
+    sheets: list[Image.Image] = []
+    for page_items in pages:
+        num_rows = len(page_items)
+        num_cols = max(len(cells) for _, cells in page_items)
+        sheet_w = (
+            _WINDOW_ROW_LABEL_WIDTH
+            + _WINDOW_CELL_GAP_PX
+            + num_cols * cell_w
+            + max(0, num_cols - 1) * _WINDOW_CELL_GAP_PX
+        )
+        sheet_h = num_rows * cell_h + max(0, num_rows - 1) * _WINDOW_ROW_GAP_PX
+        canvas = Image.new("RGB", (sheet_w, sheet_h), color=_BG_COLOR)
+        draw = ImageDraw.Draw(canvas)
+
+        for row_idx, (row, cells) in enumerate(page_items):
+            y0 = row_idx * (cell_h + _WINDOW_ROW_GAP_PX)
+            draw.rectangle(
+                [(0, y0), (_WINDOW_ROW_LABEL_WIDTH - 1, y0 + cell_h - 1)],
+                fill=_HEADER_BG,
+            )
+            ep_label = f"ep{row.episode_index}"
+            ep_bbox = draw.textbbox((0, 0), ep_label, font=row_font)
+            ep_w = ep_bbox[2] - ep_bbox[0]
+            ep_h = ep_bbox[3] - ep_bbox[1]
+            ep_x = max(4, (_WINDOW_ROW_LABEL_WIDTH - ep_w) // 2) - ep_bbox[0]
+            ep_y = y0 + (cell_h - ep_h) // 2 - ep_bbox[1]
+            draw.text((ep_x, ep_y), ep_label, fill=_TEXT_COLOR, font=row_font)
+
+            for col_idx, (cell, imgs) in enumerate(cells):
+                x0 = (
+                    _WINDOW_ROW_LABEL_WIDTH
+                    + _WINDOW_CELL_GAP_PX
+                    + col_idx * (cell_w + _WINDOW_CELL_GAP_PX)
+                )
+                draw.rectangle(
+                    [(x0, y0), (x0 + cell_w - 1, y0 + _WINDOW_CELL_LABEL_HEIGHT - 1)],
+                    fill=_HEADER_BG,
+                )
+                cell_label = f"f{cell.frame} {cell.time_s:.1f}s"
+                cbbox = draw.textbbox((0, 0), cell_label, font=cell_font)
+                ch = cbbox[3] - cbbox[1]
+                cx = x0 + 6 - cbbox[0]
+                cy_text = y0 + (_WINDOW_CELL_LABEL_HEIGHT - ch) // 2 - cbbox[1]
+                draw.text((cx, cy_text), cell_label, fill=_TEXT_COLOR, font=cell_font)
+
+                cy = y0 + _WINDOW_CELL_LABEL_HEIGHT
+                for im in imgs:
+                    canvas.paste(im, (x0, cy))
+                    cy += im.height + _WINDOW_CAM_GAP_PX
+
+        sheets.append(canvas)
+
+    return sheets
+
+
+def render_window_sheets(
+    dataset: DatasetView,
+    episode_windows: Sequence[tuple[int, int, int]],
+    output_dir: Path,
+    *,
+    samples: int = 8,
+    cameras: Sequence[str] = (DEFAULT_CAMERAS[0],),
+    crops: Mapping[str, tuple[int, int, int, int]] | None = None,
+    tile_height: int = 200,
+    per_page: int = 8,
+    name: str = "window",
+    jpeg_quality: int = 85,
+) -> list[Path]:
+    """Decode sampled window frames per episode and write JPEG contact sheets.
+
+    Each camera's frames for an episode are decoded in a single
+    ``decode_video_frames_pyav`` call.
+
+    Args:
+        dataset: Open ``DatasetView``.
+        episode_windows: Ordered ``(episode_index, lo, hi)`` inclusive frame windows.
+        output_dir: Destination directory for JPEG files.
+        samples: Target number of evenly spaced frames per window (default 8, >= 2).
+        cameras: Camera keys or short names (default: head).
+        crops: Optional mapping ``camera_name -> (x0, y0, x1, y1)`` applied before resizing.
+        tile_height: Target camera tile height in pixels (default 200).
+        per_page: Episodes per JPEG image, or ``0`` for all episodes on one image.
+        name: Output filename prefix; writes ``<name>_p<page:02d>.jpg``.
+        jpeg_quality: JPEG encoding quality (default 85).
+
+    Returns:
+        List of written JPEG file paths.
+    """
+    if samples < 2:
+        raise ValueError(f"samples must be >= 2, got {samples}.")
+    if tile_height <= 0:
+        raise ValueError(f"tile_height must be positive, got {tile_height}.")
+    if per_page < 0:
+        raise ValueError(f"per_page must be >= 0, got {per_page}.")
+    if not name or not name.strip():
+        raise ValueError("name must not be empty.")
+    if not episode_windows:
+        return []
+
+    planned: list[
+        tuple[int, EpisodeRecord, list[int], tuple[str, ...], dict[str, tuple[int, int, int, int]]]
+    ] = []
+    for ep_idx, lo, hi in episode_windows:
+        record = dataset.get_episode(ep_idx)
+        sampled_frames = sample_window(
+            lo,
+            hi,
+            samples,
+            record.length,
+            episode_index=ep_idx,
+        )
+        resolved_cameras = _resolve_camera_keys(cameras, record.videos)
+        missing_cams = [cam for cam in resolved_cameras if cam not in record.videos]
+        if missing_cams:
+            raise ValueError(f"Episode {ep_idx} does not contain requested cameras: {missing_cams}")
+        resolved_crops = resolve_crop_keys(crops, resolved_cameras)
+        planned.append((ep_idx, record, sampled_frames, resolved_cameras, resolved_crops))
+
+    rows: list[WindowRow] = []
+    for ep_idx, record, sampled_frames, resolved_cameras, resolved_crops in planned:
+        decoded_per_cam: dict[str, dict[int, Image.Image]] = {}
+        for cam in resolved_cameras:
+            span = record.videos[cam]
+            targets = [(f, span.from_timestamp + f / dataset.fps) for f in sampled_frames]
+            decoded = decode_video_frames_pyav(
+                span.path,
+                targets,
+                fps=dataset.fps,
+            )
+            crop_box = resolved_crops.get(cam)
+            decoded_per_cam[cam] = {
+                f: _crop_and_resize_height(
+                    decoded[f],
+                    crop=crop_box,
+                    tile_height=tile_height,
+                    camera=cam,
+                )
+                for f in sampled_frames
+            }
+
+        cells = tuple(
+            WindowCell(
+                frame=f,
+                time_s=f / dataset.fps,
+                images=tuple(decoded_per_cam[cam][f] for cam in resolved_cameras),
+            )
+            for f in sampled_frames
+        )
+        rows.append(WindowRow(episode_index=ep_idx, cells=cells))
+
+    sheets = compose_window_sheets(rows, per_page=per_page, tile_height=tile_height)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    written: list[Path] = []
+    for page_idx, sheet in enumerate(sheets, start=1):
+        dest = output_dir / f"{name}_p{page_idx:02d}.jpg"
         sheet.save(dest, format="JPEG", quality=jpeg_quality)
         written.append(dest)
     return written

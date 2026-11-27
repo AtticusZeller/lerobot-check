@@ -42,7 +42,7 @@ CLI commands take explicit input/output paths. Write all generated artifacts out
   - `validate.py`: annotation contract validation
   - `dataset.py`: LeRobot v3.0 metadata/state loading, shared `.xense-viewer/` default paths, and 6D rotation helpers
   - `propose.py`: proprioceptive gripper event and TCP low-speed proposal
-  - `render.py`: low-memory PyAV frame decoding and multi-camera PNG tiling
+  - `render.py`: low-memory PyAV frame decoding, multi-camera PNG tiling, and `boundary-sheet` / `window-sheet` JPEG contact sheets
   - `relabel.py`: N-stage `task_index` relabeling and verification
   - `analysis.py`: `distribution.json` computation (frame shares, object poses/coverage, resampled trajectories, subtask-arm metrics)
   - `calib.py`: head-camera calibration frame selection (`calib-frames` with `--max-gripper`, `--max-speed`, `--no-speed-filter`, `--append`, `--arms`), joint extrinsic+tool-offset solver (`calibrate`), and projection/back-projection geometry

@@ -10,6 +10,7 @@ CLI 入口为 `lerobot-check`，提供以下子命令：
 - `propose`：基于相对幅度迟滞检测各臂夹爪开合运动、基于 `action - state` 差值检测夹紧区间（`squeeze`），并计算 TCP 低速段，输出候选事件 CSV（可选辅助提示）。
 - `render`：低内存解码并输出带帧号与时间戳的 PNG 拼图。支持按 `--subtask` 使用 task spec 配置的相机、`--frames a:b:s` 半开区间 `[a, b)`、单相机网格粗扫（`--columns N`）以及自定义多路拼接（`--cameras`）。
 - `exemplars`：从标注 CSV 中筛选人工复核（`annotator=human`）的边界（`<prev>:<next>`）或抓取帧（`<subtask>:grasp`）示范，按 `[b - window, b + window)` 与给定步长渲染带红框及 `BOUNDARY`/`GRASP` 标记的单 episode 条带 PNG，供标注 agent 在精标阶段对齐人工标准。
+- `window-sheet`：按统一时间窗口（`--window-s LO:HI`）或每条 episode 独立的帧窗口 CSV（`--windows FILE`）在窗口内均匀采样帧（默认 8 帧、每页 8 条 episode），输出每行一条 episode、多路相机纵向堆叠的 JPEG 联系表，用于按边界由粗到精定位阶段切换帧。
 - `boundary-sheet`：按非末尾 subtask 汇总全部（或 `--episodes` 指定的）episode 的边界检查帧（默认 `end - 1`，可用 `--offset` 调整），将多路相机（默认 `head left_wrist right_wrist`，支持 `--crop` 裁剪）并排拼接为带 `ep<idx> f<frame>` 与人工 `H` 标记的 JPEG 联系表，用于 agent 自检循环与最终人工复核。
 - `validate`：对照数据集元数据中的 episode 长度、数据集 revision 与 task spec 校验标注表，逐条输出违规并以非零状态码退出。标注表中 `contact` 不再要求标注（留空合法），`grasp` 仍用于提取 `event: grasp` 物体的初始位姿。
 - `relabel` / `verify-relabel`：按标注表与 task spec 逐帧重标 N 个 subtask 的 `task_index`（视频硬链接不重编码），并校验除 task 相关字段外与源数据零差异。

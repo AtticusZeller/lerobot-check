@@ -2,7 +2,7 @@
 
 This guide describes the visual workflow for an annotating agent producing and validating subtask annotations on a LeRobot v3.0 dataset with `lerobot-check`.
 
-Gripper signals alone are not reliable enough to determine subtask boundaries or grasps (for example, a gripper may flip a lid with open jaws or hold a tool that blocks finger closure). Annotation is therefore **visual first**: place approximate boundaries from a fast single-camera coarse grid, then refine every boundary across all episodes with `boundary-sheet`.
+Gripper signals alone are not reliable enough to determine subtask boundaries or grasps (for example, a gripper may flip a lid with open jaws or hold a tool that blocks finger closure). Annotation is therefore **visual first**: locate each boundary coarse-to-fine across episodes with `window-sheet`, then refine every boundary across all episodes with `boundary-sheet`.
 
 ## Shared Default Paths
 
@@ -29,21 +29,42 @@ uv run lerobot-check info --dataset-root /path/to/dataset
 
 Read the task spec YAML comments for any subtask-specific boundary overrides, and note which subtasks have an `objects` entry with `event: grasp`. Use the exact `revision` printed by `info` in the annotation CSV.
 
-### 2. Coarse Pass and Initial Table (`render --columns`)
+### 2. Coarse Pass and Initial Table (`window-sheet`)
 
-Render a single-camera (`head`) coarse grid at ~1 s spacing (`::30` at 30 fps) for each episode:
+Search each non-final subtask boundary separately, coarse to fine, using `lerobot-check window-sheet`:
+
+1. **One agent per non-final boundary**: assign one annotating agent to each non-final boundary `k` (`1 .. N-1`). Each agent judges only its own boundary across all episodes.
+2. **Choose the search window**: if an earlier annotation of the same task already established a time window for boundary `k`, reuse it. Otherwise, first run `window-sheet` over the full episode length at ~4 s spacing on ~8 episodes (for example `--episodes 0,15,30,45,60,75,90,100 --window-s 0:60 --samples 16`) and choose a window covering the observed boundary times with margin.
+3. **Round 1 (`--window-s`, ~4 s spacing)**: render 8 evenly spaced frames inside the window with 8 episodes per sheet (`--per-page 8`, default). Crop `head` to the active workspace when helpful:
 
 ```bash
-uv run lerobot-check render \
+uv run lerobot-check window-sheet \
   --dataset-root /path/to/dataset \
-  --episode 0 \
-  --frames ::30 \
-  --columns 6 \
-  --tile-width 240 \
-  -o /tmp/lerobot-check/ep0000_coarse.png
+  --window-s 10:42 \
+  --samples 8 \
+  --crop head=90,40,550,360 \
+  --name b1_r1 \
+  -o /tmp/lerobot-check/window-r1
 ```
 
-Place every boundary at its approximate frame from this coarse grid—do not run a per-boundary fine pass or render exemplars per boundary—and write one CSV per `(repo_id, revision)` (default `<lerobot_root>/.xense-viewer/subtasks/<org>__<name>@<revision>.csv`) with the exact header:
+For every cell in each episode row, answer one monotone yes/no question: **"Has subtask `k` ended at this frame?"** Judge from the **object's state** (whether the object has been placed, seated, or flipped into its target state), not gripper opening—gripper motion is not monotone due to regrasps, closing in the air, or open-jaw pushes. Record the last `"no"` frame and the first `"yes"` frame for each episode.
+
+4. **Round 2 (`--windows`, ~0.5 s spacing)**: write a CSV with header `episode_index,lo,hi` containing each episode's `(last_no_frame, first_yes_frame)` from Round 1. If an episode row was all `"no"` (boundary occurs after the window) or all `"yes"` (boundary occurs before the window), widen its window on that side and render again before narrowing. Render Round 2 with `--windows` (adding wrist cameras if helpful):
+
+```bash
+uv run lerobot-check window-sheet \
+  --dataset-root /path/to/dataset \
+  --windows /tmp/lerobot-check/b1_windows.csv \
+  --samples 8 \
+  --cameras head left_wrist right_wrist \
+  --crop head=90,40,550,360 \
+  --name b1_r2 \
+  -o /tmp/lerobot-check/window-r2
+```
+
+From Round 2, each boundary agent outputs a CSV with header `episode_index,end` for its boundary.
+
+5. **Assemble the initial annotation table**: the coordinator combines the per-boundary `episode_index,end` CSVs into one annotation CSV per `(repo_id, revision)` (default `<lerobot_root>/.xense-viewer/subtasks/<org>__<name>@<revision>.csv`), setting `start = 0` for the first subtask, each subsequent row's `start` to the previous row's `end`, and the final subtask's `end` to `episode_length`, with the exact header:
 
 ```text
 repo_id,revision,episode_index,subtask,start,end,contact,grasp,success,annotator,note
@@ -52,6 +73,7 @@ repo_id,revision,episode_index,subtask,start,end,contact,grasp,success,annotator
 - Set `revision` to the exact hash from `lerobot-check info`, `annotator` to `agent`, and `success` to lowercase `true` or `false`.
 - **Leave `contact` empty** (legacy column kept for schema compatibility).
 - Fill `grasp` only for subtasks with an `objects` entry of `event: grasp` in the task spec; leave `grasp` empty for other subtasks. Leave `note` empty when not applicable.
+- Once assembled, run Step 3 (`boundary-sheet`) to fix exact boundary frames across all episodes.
 
 ### 3. Boundary Self-Check Loop (`boundary-sheet`)
 
@@ -113,6 +135,7 @@ uv run lerobot-check boundary-sheet \
 
 Use these only when a specific tile or event is unclear (for example, an occluded tile during the self-check loop or an `event: grasp` frame):
 
+- **Single-episode coarse grid (`render --frames ::30`)**: render a 1 s-spaced single-camera grid (`--frames ::30 --columns 6 --tile-width 240`) for an episode that does not fit the window search.
 - **Fine strip around one frame (`render`)**: render a ±1 s multi-camera strip around a candidate frame (`--events 411 --window-s 1.0 --stride 3`, or an explicit half-open `--frames 381:441:2`) using `--subtask <name>` or `--cameras head left_wrist right_wrist`.
 - **Human exemplars (`exemplars`)**: render human-reviewed reference strips for a boundary (`--boundary place_phone:move_lid`) or grasp (`--boundary place_phone:grasp`). Exits `0` if none exist yet. If human exemplars and task-spec comments disagree, follow the exemplars and record the discrepancy in `note`.
 - **Proprioceptive hints (`propose`)**: emit heuristic `gripper_close`, `gripper_open`, `squeeze`, and `low_speed` candidates for orienting on long episodes; always confirm visually.

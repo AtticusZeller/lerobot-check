@@ -17,18 +17,29 @@ from lerobot_check.render import (
     _BOUNDARY_CELL_GAP_PX,
     _BOUNDARY_LABEL_HEIGHT,
     _HUMAN_MARKER_BG,
+    _WINDOW_CAM_GAP_PX,
+    _WINDOW_CELL_GAP_PX,
+    _WINDOW_CELL_LABEL_HEIGHT,
+    _WINDOW_ROW_GAP_PX,
+    _WINDOW_ROW_LABEL_WIDTH,
     DEFAULT_CAMERAS,
     BoundaryCell,
+    WindowCell,
+    WindowRow,
     _crop_and_resize_height,
     compose_boundary_sheets,
+    compose_window_sheets,
+    load_windows_csv,
     parse_boundary_spec,
     parse_crop_specs,
     parse_episode_spec,
     parse_frame_spec,
+    parse_window_seconds,
     render_contact_sheet,
     resolve_crop_keys,
     resolve_exemplar_cameras,
     resolve_render_cameras,
+    sample_window,
     select_boundary_exemplars,
     select_end_frames,
     select_frames_around_events,
@@ -788,4 +799,330 @@ def test_cli_boundary_sheet_rejects_unknown_crop_camera_and_out_of_bounds_crop(
     assert "observation.images.head" in captured_oob.err
     assert "(600,400,900,900)" in captured_oob.err
     assert "640x480" in captured_oob.err
+    assert not out_dir.exists()
+
+
+def test_sample_window_spacing_clamping_dedupe_and_errors() -> None:
+    frames = sample_window(300, 1260, 8, episode_length=2000)
+    assert len(frames) == 8
+    assert frames[0] == 300
+    assert frames[-1] == 1260
+    assert all(b > a for a, b in pairwise(frames))
+    diffs = [b - a for a, b in pairwise(frames)]
+    assert max(diffs) - min(diffs) <= 1
+
+    clamped_start = sample_window(-50, 100, 5, episode_length=200)
+    assert clamped_start == [0, 25, 50, 75, 100]
+
+    clamped_end = sample_window(150, 300, 4, episode_length=200)
+    assert clamped_end == [150, 166, 183, 199]
+
+    narrow = sample_window(10, 13, 8, episode_length=100)
+    assert narrow == [10, 11, 12, 13]
+
+    single = sample_window(42, 42, 8, episode_length=100)
+    assert single == [42]
+
+    with pytest.raises(ValueError, match="Episode 7"):
+        sample_window(200, 250, 8, episode_length=200, episode_index=7)
+
+    with pytest.raises(ValueError, match="Episode 3"):
+        sample_window(-20, -1, 8, episode_length=200, episode_index=3)
+
+    with pytest.raises(ValueError, match="samples"):
+        sample_window(0, 100, 1, episode_length=200)
+
+    with pytest.raises(ValueError, match="lo"):
+        sample_window(50, 40, 4, episode_length=200)
+
+
+def test_parse_window_seconds_valid_and_errors() -> None:
+    assert parse_window_seconds("10:42") == (10.0, 42.0)
+    assert parse_window_seconds(" 0 : 12.5 ") == (0.0, 12.5)
+    assert parse_window_seconds("1.25:3.75") == (1.25, 3.75)
+
+    for bad in (
+        "",
+        "10",
+        "10:20:30",
+        ":42",
+        "10:",
+        "abc:42",
+        "10:xyz",
+        "nan:10",
+        "10:inf",
+        "-1:10",
+        "10:-1",
+        "-5:-1",
+        "10:10",
+        "42:10",
+    ):
+        with pytest.raises(ValueError):
+            parse_window_seconds(bad)
+
+
+def test_load_windows_csv_valid_and_errors(tmp_path: Path) -> None:
+    good = tmp_path / "good.csv"
+    good.write_text(
+        "episode_index,lo,hi\n0,300,1260\n15,450,450\n30,0,900\n",
+        encoding="utf-8",
+    )
+    assert load_windows_csv(good) == {0: (300, 1260), 15: (450, 450), 30: (0, 900)}
+
+    missing_col = tmp_path / "missing_col.csv"
+    missing_col.write_text("episode_index,lo\n0,100\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Line 1"):
+        load_windows_csv(missing_col)
+
+    non_int = tmp_path / "non_int.csv"
+    non_int.write_text("episode_index,lo,hi\n0,100,200\n1,10.5,200\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Line 3"):
+        load_windows_csv(non_int)
+
+    lo_gt_hi = tmp_path / "lo_gt_hi.csv"
+    lo_gt_hi.write_text("episode_index,lo,hi\n0,100,200\n2,300,250\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Line 3"):
+        load_windows_csv(lo_gt_hi)
+
+    negative = tmp_path / "negative.csv"
+    negative.write_text("episode_index,lo,hi\n0,-5,100\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Line 2"):
+        load_windows_csv(negative)
+
+    neg_ep = tmp_path / "neg_ep.csv"
+    neg_ep.write_text("episode_index,lo,hi\n-1,10,100\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Line 2"):
+        load_windows_csv(neg_ep)
+
+    duplicate = tmp_path / "duplicate.csv"
+    duplicate.write_text("episode_index,lo,hi\n0,10,20\n5,30,40\n0,50,60\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="Line 4"):
+        load_windows_csv(duplicate)
+
+
+def test_compose_window_sheets_pagination_and_dimensions() -> None:
+    def _make_row(ep: int, num_samples: int, num_cams: int) -> WindowRow:
+        cells = tuple(
+            WindowCell(
+                frame=100 + s * 30,
+                time_s=(100 + s * 30) / 30.0,
+                images=tuple(
+                    Image.new("RGB", (160, 120), color=(30 + c * 40, 60, 90))
+                    for c in range(num_cams)
+                ),
+            )
+            for s in range(num_samples)
+        )
+        return WindowRow(episode_index=ep, cells=cells)
+
+    rows = [_make_row(ep, num_samples=8, num_cams=2) for ep in range(17)]
+    paged = compose_window_sheets(rows, per_page=8)
+    assert len(paged) == 3
+
+    expected_cell_w = 160
+    expected_cell_h = _WINDOW_CELL_LABEL_HEIGHT + 2 * 120 + _WINDOW_CAM_GAP_PX
+    expected_w = (
+        _WINDOW_ROW_LABEL_WIDTH
+        + _WINDOW_CELL_GAP_PX
+        + 8 * expected_cell_w
+        + 7 * _WINDOW_CELL_GAP_PX
+    )
+    assert paged[0].size == (expected_w, 8 * expected_cell_h + 7 * _WINDOW_ROW_GAP_PX)
+    assert paged[2].size == (expected_w, expected_cell_h)
+
+    single = compose_window_sheets(rows, per_page=0)
+    assert len(single) == 1
+    assert single[0].size == (expected_w, 17 * expected_cell_h + 16 * _WINDOW_ROW_GAP_PX)
+
+    resized = compose_window_sheets(rows[:2], per_page=8, tile_height=60)
+    resized_cell_w = round(160 * 60 / 120)
+    resized_cell_h = _WINDOW_CELL_LABEL_HEIGHT + 2 * 60 + _WINDOW_CAM_GAP_PX
+    resized_w = (
+        _WINDOW_ROW_LABEL_WIDTH + _WINDOW_CELL_GAP_PX + 8 * resized_cell_w + 7 * _WINDOW_CELL_GAP_PX
+    )
+    assert resized[0].size == (resized_w, 2 * resized_cell_h + _WINDOW_ROW_GAP_PX)
+
+
+def test_cli_window_sheet_validation_and_rendering(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ds_root = tmp_path / "Xense" / "demo_ds"
+    ds_root.mkdir(parents=True)
+
+    decode_calls: list[tuple[Path, list[tuple[int, float]]]] = []
+
+    class _FakeDataset:
+        def __init__(self, root: Path, repo_id: str | None = None, revision: str | None = None):
+            self.root = root
+            self.repo_id = repo_id or "Xense/demo_ds"
+            self.revision = revision or "rev1"
+            self.fps = 30.0
+            self.camera_keys = DEFAULT_CAMERAS
+            self.episode_lengths = {0: 600, 1: 600, 2: 600}
+
+        def get_episode(self, episode_index: int) -> EpisodeRecord:
+            if episode_index not in self.episode_lengths:
+                raise KeyError(f"Episode {episode_index} not found")
+            span = VideoSpan(
+                path=tmp_path / f"ep{episode_index}.mp4",
+                from_timestamp=episode_index * 20.0,
+                to_timestamp=(episode_index + 1) * 20.0,
+            )
+            return EpisodeRecord(
+                episode_index=episode_index,
+                length=self.episode_lengths[episode_index],
+                data_path=tmp_path / "fake.parquet",
+                videos={cam: span for cam in DEFAULT_CAMERAS},
+            )
+
+    def _fake_decode(
+        path: Path,
+        targets: list[tuple[int, float]],
+        *,
+        fps: float,
+        **kwargs: object,
+    ) -> dict[int, Image.Image]:
+        decode_calls.append((path, list(targets)))
+        return {
+            frame_id: Image.new("RGB", (640, 480), color=(25, 50, 75)) for frame_id, _ in targets
+        }
+
+    monkeypatch.setattr("lerobot_check.cli.DatasetView", _FakeDataset)
+    monkeypatch.setattr("lerobot_check.render.decode_video_frames_pyav", _fake_decode)
+
+    win_csv = tmp_path / "windows.csv"
+    win_csv.write_text("episode_index,lo,hi\n0,100,200\n2,300,400\n", encoding="utf-8")
+
+    out_dir = tmp_path / "out_err"
+
+    # Neither --window-s nor --windows -> rejected
+    rc_neither = main(["window-sheet", "--dataset-root", str(ds_root), "-o", str(out_dir)])
+    assert rc_neither != 0
+    assert "exactly one" in capsys.readouterr().err
+
+    # Both --window-s and --windows -> rejected
+    rc_both = main(
+        [
+            "window-sheet",
+            "--dataset-root",
+            str(ds_root),
+            "--window-s",
+            "1:5",
+            "--windows",
+            str(win_csv),
+            "-o",
+            str(out_dir),
+        ]
+    )
+    assert rc_both != 0
+    assert "exactly one" in capsys.readouterr().err
+
+    # Unknown episode via --episodes -> rejected
+    rc_unknown_ep = main(
+        [
+            "window-sheet",
+            "--dataset-root",
+            str(ds_root),
+            "--window-s",
+            "1:5",
+            "--episodes",
+            "0,99",
+            "-o",
+            str(out_dir),
+        ]
+    )
+    assert rc_unknown_ep != 0
+    assert "99" in capsys.readouterr().err
+
+    # Unknown episode inside --windows CSV -> rejected
+    bad_win_csv = tmp_path / "bad_windows.csv"
+    bad_win_csv.write_text("episode_index,lo,hi\n0,100,200\n42,100,200\n", encoding="utf-8")
+    rc_unknown_csv_ep = main(
+        [
+            "window-sheet",
+            "--dataset-root",
+            str(ds_root),
+            "--windows",
+            str(bad_win_csv),
+            "-o",
+            str(out_dir),
+        ]
+    )
+    assert rc_unknown_csv_ep != 0
+    assert "42" in capsys.readouterr().err
+    assert not out_dir.exists()
+
+    # Happy path with --windows filtered by --episodes and multiple cameras
+    out_ok = tmp_path / "out_ok"
+    rc_ok = main(
+        [
+            "window-sheet",
+            "--dataset-root",
+            str(ds_root),
+            "--windows",
+            str(win_csv),
+            "--episodes",
+            "2",
+            "--samples",
+            "4",
+            "--cameras",
+            "head",
+            "left_wrist",
+            "--crop",
+            "head=80,40,560,360",
+            "--name",
+            "b1_r2",
+            "-o",
+            str(out_ok),
+        ]
+    )
+    captured = capsys.readouterr()
+    assert rc_ok == 0
+    expected_file = out_ok / "b1_r2_p01.jpg"
+    assert str(expected_file) in captured.out
+    assert expected_file.is_file()
+    # One decode_video_frames_pyav call per camera for episode 2 (2 calls), each with 4 frames.
+    assert len(decode_calls) == 2
+    assert [f for f, _ in decode_calls[0][1]] == [300, 333, 367, 400]
+    assert decode_calls[0][1][0][1] == pytest.approx(40.0 + 300 / 30.0)
+
+    # Unknown crop camera and out-of-bounds crop match boundary-sheet errors.
+    rc_bad_crop_cam = main(
+        [
+            "window-sheet",
+            "--dataset-root",
+            str(ds_root),
+            "--window-s",
+            "1:5",
+            "--episodes",
+            "0",
+            "--crop",
+            "nocam=0,0,10,10",
+            "-o",
+            str(out_dir),
+        ]
+    )
+    assert rc_bad_crop_cam == 1
+    assert "nocam" in capsys.readouterr().err
+
+    rc_oob_crop = main(
+        [
+            "window-sheet",
+            "--dataset-root",
+            str(ds_root),
+            "--window-s",
+            "1:5",
+            "--episodes",
+            "0",
+            "--crop",
+            "head=600,400,900,900",
+            "-o",
+            str(out_dir),
+        ]
+    )
+    err_oob = capsys.readouterr().err
+    assert rc_oob_crop == 1
+    assert "640x480" in err_oob
     assert not out_dir.exists()

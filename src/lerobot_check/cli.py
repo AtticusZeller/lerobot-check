@@ -62,13 +62,16 @@ from lerobot_check.relabel import (
 from lerobot_check.render import (
     DEFAULT_CAMERAS,
     _resolve_camera_keys,
+    load_windows_csv,
     parse_boundary_spec,
     parse_crop_specs,
     parse_episode_spec,
     parse_frame_spec,
+    parse_window_seconds,
     render_boundary_exemplars,
     render_boundary_sheets,
     render_episode_sheets,
+    render_window_sheets,
     resolve_boundary_subtasks,
     resolve_crop_keys,
     resolve_exemplar_cameras,
@@ -473,6 +476,153 @@ def _cmd_boundary_sheet(args: argparse.Namespace) -> int:
         for path in written:
             print(path)
 
+    return 0
+
+
+def _cmd_window_sheet(args: argparse.Namespace) -> int:
+    if (args.window_s is None) == (args.windows is None):
+        print(
+            "[window-sheet] Provide exactly one of --window-s or --windows.",
+            file=sys.stderr,
+        )
+        return 1
+    if args.samples < 2:
+        print(f"[window-sheet] --samples must be >= 2, got {args.samples}", file=sys.stderr)
+        return 1
+    if args.tile_height <= 0:
+        print(
+            f"[window-sheet] --tile-height must be positive, got {args.tile_height}",
+            file=sys.stderr,
+        )
+        return 1
+    if args.per_page < 0:
+        print(f"[window-sheet] --per-page must be >= 0, got {args.per_page}", file=sys.stderr)
+        return 1
+    if not args.name or not args.name.strip():
+        print("[window-sheet] --name must not be empty.", file=sys.stderr)
+        return 1
+
+    try:
+        crops = parse_crop_specs(args.crop)
+    except ValueError as exc:
+        print(f"[crop] {exc}", file=sys.stderr)
+        return 1
+
+    episode_filter: list[int] | None = None
+    if args.episodes is not None:
+        try:
+            episode_filter = parse_episode_spec(args.episodes)
+        except ValueError as exc:
+            print(f"[episodes] {exc}", file=sys.stderr)
+            return 1
+
+    window_seconds: tuple[float, float] | None = None
+    windows_by_ep: dict[int, tuple[int, int]] | None = None
+    if args.window_s is not None:
+        try:
+            window_seconds = parse_window_seconds(args.window_s)
+        except ValueError as exc:
+            print(f"[window-s] {exc}", file=sys.stderr)
+            return 1
+    else:
+        try:
+            windows_by_ep = load_windows_csv(args.windows)
+        except (OSError, ValueError) as exc:
+            print(f"[windows] {exc}", file=sys.stderr)
+            return 1
+
+    try:
+        root = resolve_dataset_root(args.dataset_root, args.repo_id)
+        dataset = DatasetView(root, repo_id=args.repo_id)
+    except (OSError, ValueError) as exc:
+        print(f"[dataset] {exc}", file=sys.stderr)
+        return 1
+
+    episode_lengths = getattr(dataset, "episode_lengths", None)
+    if episode_lengths is not None:
+        known_episodes = set(episode_lengths)
+        all_episodes = sorted(episode_lengths)
+    else:
+        total = getattr(dataset, "total_episodes", 0)
+        known_episodes = set(range(total))
+        all_episodes = list(range(total))
+
+    if episode_filter is not None:
+        unknown_filter = [ep for ep in episode_filter if ep not in known_episodes]
+        if unknown_filter:
+            print(
+                f"[episodes] Episode index not in dataset: {unknown_filter}",
+                file=sys.stderr,
+            )
+            return 1
+
+    if window_seconds is not None:
+        lo_s, hi_s = window_seconds
+        lo_frame = round(lo_s * dataset.fps)
+        hi_frame = round(hi_s * dataset.fps)
+        target_episodes = episode_filter if episode_filter is not None else all_episodes
+        episode_windows = [(ep, lo_frame, hi_frame) for ep in target_episodes]
+    else:
+        assert windows_by_ep is not None
+        if episode_filter is not None:
+            filter_set = set(episode_filter)
+            episode_windows = [
+                (ep, lo, hi) for ep, (lo, hi) in windows_by_ep.items() if ep in filter_set
+            ]
+        else:
+            episode_windows = [(ep, lo, hi) for ep, (lo, hi) in windows_by_ep.items()]
+        unknown_win = [ep for ep, _, _ in episode_windows if ep not in known_episodes]
+        if unknown_win:
+            print(
+                f"[windows] Episode index not in dataset: {unknown_win}",
+                file=sys.stderr,
+            )
+            return 1
+
+    if not episode_windows:
+        print("[window-sheet] No episodes selected to render.", file=sys.stderr)
+        return 1
+
+    cameras = tuple(args.cameras) if args.cameras else (DEFAULT_CAMERAS[0],)
+    dataset_camera_keys = getattr(dataset, "camera_keys", ())
+    resolved_cameras = (
+        _resolve_camera_keys(cameras, dict.fromkeys(dataset_camera_keys))
+        if dataset_camera_keys
+        else cameras
+    )
+    if dataset_camera_keys:
+        missing_cams = [cam for cam in resolved_cameras if cam not in dataset_camera_keys]
+        if missing_cams:
+            print(
+                f"[cameras] Unknown camera(s): {missing_cams}; "
+                f"available: {list(dataset_camera_keys)}.",
+                file=sys.stderr,
+            )
+            return 1
+    try:
+        resolved_crops = resolve_crop_keys(crops, resolved_cameras)
+    except ValueError as exc:
+        print(f"[crop] {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        written = render_window_sheets(
+            dataset,
+            episode_windows,
+            args.output,
+            samples=args.samples,
+            cameras=resolved_cameras,
+            crops=resolved_crops,
+            tile_height=args.tile_height,
+            per_page=args.per_page,
+            name=args.name,
+        )
+    except (KeyError, OSError, RuntimeError, ValueError) as exc:
+        print(f"[window-sheet] {exc}", file=sys.stderr)
+        return 1
+
+    for path in written:
+        print(path)
     return 0
 
 
@@ -1491,6 +1641,80 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output directory for boundary-sheet JPEGs (outside the repository).",
     )
     boundary_sheet_parser.set_defaults(func=_cmd_boundary_sheet)
+
+    window_sheet_parser = subparsers.add_parser(
+        "window-sheet",
+        help="Render multi-episode contact sheets sampled across a time or frame window.",
+    )
+    _add_dataset_args(window_sheet_parser)
+    window_sheet_parser.add_argument(
+        "--window-s",
+        type=str,
+        default=None,
+        metavar="LO:HI",
+        help="Absolute time window in seconds (LO:HI) applied to every selected episode.",
+    )
+    window_sheet_parser.add_argument(
+        "--windows",
+        type=Path,
+        default=None,
+        metavar="FILE",
+        help=(
+            "CSV file with header episode_index,lo,hi (inclusive frame numbers), "
+            "one row per episode."
+        ),
+    )
+    window_sheet_parser.add_argument(
+        "--episodes",
+        type=str,
+        default=None,
+        help="Optional episode filter with inclusive ranges, e.g. '0,15,30-35'. Default: all.",
+    )
+    window_sheet_parser.add_argument(
+        "--samples",
+        type=int,
+        default=8,
+        help="Number of evenly spaced frames sampled per window (default: 8, must be >= 2).",
+    )
+    window_sheet_parser.add_argument(
+        "--cameras",
+        nargs="+",
+        default=None,
+        help="Camera keys or short names stacked vertically per cell (default: head).",
+    )
+    window_sheet_parser.add_argument(
+        "--crop",
+        action="append",
+        default=None,
+        metavar="CAM=x0,y0,x1,y1",
+        help="Repeatable crop box in native pixels applied to CAM before resizing.",
+    )
+    window_sheet_parser.add_argument(
+        "--tile-height",
+        type=int,
+        default=200,
+        help="Height of each camera image in pixels, keeping aspect ratio (default: 200).",
+    )
+    window_sheet_parser.add_argument(
+        "--per-page",
+        type=int,
+        default=8,
+        help="Episodes per JPEG image, or 0 for all episodes on one image (default: 8).",
+    )
+    window_sheet_parser.add_argument(
+        "--name",
+        type=str,
+        default="window",
+        help="Output filename prefix; writes <name>_p<page:02d>.jpg (default: window).",
+    )
+    window_sheet_parser.add_argument(
+        "-o",
+        "--output",
+        type=Path,
+        required=True,
+        help="Output directory for window-sheet JPEGs (outside the repository).",
+    )
+    window_sheet_parser.set_defaults(func=_cmd_window_sheet)
 
     validate_parser = subparsers.add_parser(
         "validate",
