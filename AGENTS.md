@@ -49,7 +49,7 @@ CLI commands take explicit input/output paths. Write all generated artifacts out
   - `suggest.py`: target polygon back-projection, collection placement sampling, and three-tier test point generation
   - `masks.py`: object mask template geometry and projected overlay bundles
   - `mask_cli.py`: mask template extraction, rejection, and overlay commands
-  - `object_pose.py`: frame-0 head-camera object mask segmentation, back-projection pose derivation, `object-poses` sidecar I/O, and review contact sheets
+  - `object_pose.py`: frame-0 head-camera object mask segmentation with per-episode `--prompt-box` overrides, back-projection pose derivation, `object-poses` sidecar I/O and validation, object-frame tool-point offset statistics, and review contact sheets
   - `collection_planner.py`: placement candidates, overlap checks, and collection round selection
   - `collection_plan_cli.py`: collection plan generation, editing, and progress commands
   - `collection_progress.py`: collection plan schema, locking, persistence, and progress merging

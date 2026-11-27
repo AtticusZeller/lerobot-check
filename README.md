@@ -53,8 +53,8 @@ uv run --extra mask-template lerobot-check object-poses \
 uv run --extra mask-template lerobot-check object-poses \
   --dataset-root /path/to/dataset \
   --device cuda \
-  --prompt-box 33:box_lid=300,40,470,170 \
-  --prompt-box 34:paper_insert=230,70,360,190 \
+  --prompt-box 33:box_lid=415,62,505,158 \
+  --prompt-box 34:paper_insert=318,105,387,163 \
   --sheet /tmp/object-poses-sheets
 
 # 2. 重新生成 distribution.json（自动读取默认路径的 object-poses 侧车，也可用 --object-poses 指定）
