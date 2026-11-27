@@ -25,24 +25,37 @@ if TYPE_CHECKING:
         relabel_dataset,
         verify_relabel,
     )
+    from lerobot_check.tcp_retarget import (
+        RetargetTcpResult,
+        VerifyTcpResult,
+        retarget_calib_payload,
+        retarget_tcp_dataset,
+        verify_tcp_retarget,
+    )
 
-_RELABEL_EXPORTS = {
-    "RelabelResult",
-    "RelabelValidationError",
-    "VerifyResult",
-    "relabel_dataset",
-    "verify_relabel",
+_LAZY_EXPORTS = {
+    "RelabelResult": ".relabel",
+    "RelabelValidationError": ".relabel",
+    "VerifyResult": ".relabel",
+    "relabel_dataset": ".relabel",
+    "verify_relabel": ".relabel",
+    "RetargetTcpResult": ".tcp_retarget",
+    "VerifyTcpResult": ".tcp_retarget",
+    "retarget_calib_payload": ".tcp_retarget",
+    "retarget_tcp_dataset": ".tcp_retarget",
+    "verify_tcp_retarget": ".tcp_retarget",
 }
 
 
 def __getattr__(name: str) -> Any:
-    if name not in _RELABEL_EXPORTS:
+    submodule = _LAZY_EXPORTS.get(name)
+    if submodule is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    return getattr(import_module(".relabel", __name__), name)
+    return getattr(import_module(submodule, __name__), name)
 
 
 def __dir__() -> list[str]:
-    return sorted(set(globals()) | _RELABEL_EXPORTS)
+    return sorted(set(globals()) | set(_LAZY_EXPORTS))
 
 
 __all__ = [
@@ -52,17 +65,22 @@ __all__ = [
     "ObjectSpec",
     "RelabelResult",
     "RelabelValidationError",
+    "RetargetTcpResult",
     "SubtaskSpec",
     "TaskSpec",
     "ValidationViolation",
     "VerifyResult",
+    "VerifyTcpResult",
     "load_annotations",
     "load_task_spec",
     "relabel_dataset",
+    "retarget_calib_payload",
+    "retarget_tcp_dataset",
     "save_annotations",
     "save_task_spec",
     "validate_annotations",
     "verify_relabel",
+    "verify_tcp_retarget",
 ]
 
 __version__ = "0.1.0"

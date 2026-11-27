@@ -92,6 +92,7 @@ from lerobot_check.suggest import (
     write_suggestions_csv,
     write_suggestions_json,
 )
+from lerobot_check.tcp_retarget import retarget_tcp_dataset, verify_tcp_retarget
 from lerobot_check.validate import validate_annotations
 
 
@@ -825,6 +826,60 @@ def _cmd_verify_relabel(args: argparse.Namespace) -> int:
             f"stats.json task_index mean={result.stats_mean} count={result.stats_count} "
             f"(data mean={result.data_mean:.6f})"
         )
+    for err in result.errors:
+        print(f"ERROR {err}")
+    print("OK" if result.ok else f"{len(result.errors)} error(s)")
+    return 0 if result.ok else 1
+
+
+def _cmd_retarget_tcp(args: argparse.Namespace) -> int:
+    try:
+        src_root = resolve_dataset_root(args.src, args.repo_id)
+    except (OSError, ValueError) as exc:
+        print(f"[src] {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        result = retarget_tcp_dataset(src_root, args.dst, args.old_tool, args.new_tool)
+    except (FileExistsError, FileNotFoundError, OSError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"Wrote {result.dst}: {result.total_episodes} episodes, {result.total_frames} frames, "
+        f"arms={list(result.arms)}"
+    )
+    return 0
+
+
+def _cmd_verify_tcp(args: argparse.Namespace) -> int:
+    try:
+        src_root = resolve_dataset_root(args.src, args.repo_id)
+    except (OSError, ValueError) as exc:
+        print(f"[src] {exc}", file=sys.stderr)
+        return 1
+
+    try:
+        result = verify_tcp_retarget(
+            src_root,
+            args.dst,
+            args.old_tool,
+            args.new_tool,
+            pos_atol=args.pos_atol,
+            rot_atol=args.rot_atol,
+        )
+    except (FileNotFoundError, OSError, ValueError) as exc:
+        print(f"ERROR {exc}", file=sys.stderr)
+        return 1
+
+    print(
+        f"output: {result.total_episodes} episodes, {result.total_frames} frames, "
+        f"arms={list(result.arms)}, "
+        f"max_pos_err_m={result.max_pos_err_m:.3e}, "
+        f"max_rot_err={result.max_rot_err:.3e}, "
+        f"max_roundtrip_pos_err_m={result.max_roundtrip_pos_err_m:.3e}, "
+        f"max_roundtrip_rot_err={result.max_roundtrip_rot_err:.3e}"
+    )
     for err in result.errors:
         print(f"ERROR {err}")
     print("OK" if result.ok else f"{len(result.errors)} error(s)")
@@ -1859,6 +1914,94 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     verify_parser.set_defaults(func=_cmd_verify_relabel)
+
+    retarget_tcp_parser = subparsers.add_parser(
+        "retarget-tcp",
+        help="Write a TCP-retargeted LeRobot v3.0 dataset copy between two tool snapshots.",
+    )
+    retarget_tcp_parser.add_argument(
+        "--src",
+        "--dataset-root",
+        dest="src",
+        type=Path,
+        default=None,
+        help="Source LeRobot v3.0 dataset root.",
+    )
+    retarget_tcp_parser.add_argument(
+        "--repo-id",
+        type=str,
+        default=None,
+        help="Dataset repo ID (resolves local cache path if --src is omitted).",
+    )
+    retarget_tcp_parser.add_argument(
+        "--dst",
+        type=Path,
+        required=True,
+        help="Destination dataset root; must not exist.",
+    )
+    retarget_tcp_parser.add_argument(
+        "--old-tool",
+        type=Path,
+        required=True,
+        help="Path to the source tool snapshot JSON.",
+    )
+    retarget_tcp_parser.add_argument(
+        "--new-tool",
+        type=Path,
+        required=True,
+        help="Path to the target tool snapshot JSON.",
+    )
+    retarget_tcp_parser.set_defaults(func=_cmd_retarget_tcp)
+
+    verify_tcp_parser = subparsers.add_parser(
+        "verify-tcp",
+        help="Verify that a TCP-retargeted dataset matches the SE(3) tool transform.",
+    )
+    verify_tcp_parser.add_argument(
+        "--src",
+        "--dataset-root",
+        dest="src",
+        type=Path,
+        default=None,
+        help="Source LeRobot v3.0 dataset root before TCP retargeting.",
+    )
+    verify_tcp_parser.add_argument(
+        "--repo-id",
+        type=str,
+        default=None,
+        help="Dataset repo ID (resolves local cache path if --src is omitted).",
+    )
+    verify_tcp_parser.add_argument(
+        "--dst",
+        type=Path,
+        required=True,
+        help="TCP-retargeted LeRobot v3.0 dataset root to verify.",
+    )
+    verify_tcp_parser.add_argument(
+        "--old-tool",
+        type=Path,
+        required=True,
+        help="Path to the source tool snapshot JSON.",
+    )
+    verify_tcp_parser.add_argument(
+        "--new-tool",
+        type=Path,
+        required=True,
+        help="Path to the target tool snapshot JSON.",
+    )
+    verify_tcp_parser.add_argument(
+        "--pos-atol",
+        type=float,
+        default=1e-5,
+        help="Absolute position error tolerance in meters (default: 1e-5).",
+    )
+    verify_tcp_parser.add_argument(
+        "--rot-atol",
+        type=float,
+        default=1e-5,
+        help="Absolute 6D rotation component tolerance (default: 1e-5).",
+    )
+    verify_tcp_parser.set_defaults(func=_cmd_verify_tcp)
 
     dist_parser = subparsers.add_parser(
         "distribution",

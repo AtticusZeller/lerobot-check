@@ -44,6 +44,7 @@ CLI commands take explicit input/output paths. Write all generated artifacts out
   - `propose.py`: proprioceptive gripper event and TCP low-speed proposal
   - `render.py`: low-memory PyAV frame decoding, multi-camera PNG tiling, and `boundary-sheet` / `window-sheet` JPEG contact sheets
   - `relabel.py`: N-stage `task_index` relabeling and verification
+  - `tcp_retarget.py`: rigid-body SE(3) TCP retargeting, verification, and calibration payload retargeting across tool snapshots
   - `analysis.py`: `distribution.json` computation (frame shares, object poses/coverage, resampled trajectories, subtask-arm metrics)
   - `calib.py`: head-camera calibration frame selection (`calib-frames` with `--max-gripper`, `--max-speed`, `--no-speed-filter`, `--append`, `--arms`), joint extrinsic+tool-offset solver (`calibrate`), and projection/back-projection geometry
   - `suggest.py`: target polygon back-projection, collection placement sampling, and three-tier test point generation
