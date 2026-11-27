@@ -499,3 +499,130 @@ def test_mask_template_cli_records_anchor_layer_and_reject_layer(tmp_path, monke
     )
     assert rc == 0
     assert json.loads(reject_tool.read_text())["anchor_layer"] == "tool"
+
+
+def _write_mask_template_inputs(tmp_path, monkeypatch, head, *, object_layer):
+    monkeypatch.setattr("lerobot_check.mask_cli.load_head_calibration", lambda _p: head)
+    calib_path = tmp_path / "head.json"
+    calib_path.write_text("{}")
+    obj = {
+        "name": "phone",
+        "arm": "right",
+        "event": "grasp",
+        "median_z_m": 0.15,
+        "yaw_symmetry_deg": 360.0,
+        "poses": [],
+    }
+    if object_layer is not None:
+        obj["object_layer"] = object_layer
+    dist = {
+        "version": 1,
+        "provenance": {
+            "repo_id": "Org/demo",
+            "revision": "rev",
+            "position_point": "tool_point",
+            "calibrated_arms": ["right"],
+        },
+        "objects": [obj],
+    }
+    dist_path = tmp_path / "dist.json"
+    dist_path.write_text(json.dumps(dist))
+    return dist_path, calib_path
+
+
+def test_mask_template_reject_on_object_layer_requires_object_layer(
+    tmp_path, monkeypatch, capsys, head
+):
+    dist_path, calib_path = _write_mask_template_inputs(
+        tmp_path, monkeypatch, head, object_layer=None
+    )
+    output = tmp_path / "reject.json"
+    rc = main(
+        [
+            "mask-template",
+            "--distribution",
+            str(dist_path),
+            "--calib",
+            str(calib_path),
+            "--object",
+            "phone",
+            "--reject",
+            "Occluded",
+            "--output",
+            str(output),
+        ]
+    )
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "phone" in err
+    assert "lerobot-check object-poses" in err
+    assert not output.exists()
+
+
+def test_mask_template_reject_records_object_plane_with_empty_object_poses(
+    tmp_path, monkeypatch, head
+):
+    layer = {
+        "source": "head_mask",
+        "frame": 0,
+        "arm": "right",
+        "plane_z_m": 0.21,
+        "yaw_period_deg": 180.0,
+        "poses": [],
+        "skipped": [{"episode_index": 0, "reason": "mask touches layout box border"}],
+        "coverage": {},
+    }
+    dist_path, calib_path = _write_mask_template_inputs(
+        tmp_path, monkeypatch, head, object_layer=layer
+    )
+    output = tmp_path / "reject.json"
+    args = ["--distribution", str(dist_path), "--calib", str(calib_path), "--object", "phone"]
+    assert main(["mask-template", *args, "--reject", "No pose", "--output", str(output)]) == 0
+    template = json.loads(output.read_text())
+    assert (template["anchor_layer"], template["z_plane_m"]) == ("object", 0.21)
+
+
+@pytest.mark.parametrize(
+    ("reference", "target", "period", "expected"),
+    [
+        (179.5, 0.5, 180.0, 180.5),
+        (0.5, 179.5, 180.0, -0.5),
+        (0.0, 179.99, 180.0, -0.01),
+        (90.0, 0.0, 180.0, 0.0),
+        (359.5, 0.5, 360.0, 360.5),
+        (0.5, 359.5, 360.0, -0.5),
+    ],
+)
+def test_closest_equivalent_yaw_wraps_at_period_boundaries(reference, target, period, expected):
+    assert closest_equivalent_yaw(target, reference, period) == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(("folded", "target_yaw"), [(179.5, 0.5), (0.5, 179.5)])
+def test_object_layer_template_near_fold_boundary_turns_by_one_degree(head, folded, target_yaw):
+    pixels = np.array([[300, 200], [345, 204], [338, 224], [308, 215]], dtype=np.float64)
+    anchor = {
+        "arm": "right",
+        "x_m": -0.04,
+        "y_m": -0.12,
+        "raw_yaw_deg": folded + 180.0,
+        "folded_yaw_deg": folded,
+    }
+    local = make_local_outline(pixels, anchor, 0.21, head, layer="object")
+    template = {
+        "anchor_layer": "object",
+        "source": anchor,
+        "outline_xy_m": local.tolist(),
+        "height_offset_m": 0.01,
+    }
+    projected = np.array(
+        project_outline(template, {**anchor, "z_m": 0.20, "yaw_deg": target_yaw}, 180.0, head)
+    )
+    source_xy = backproject_pixels_to_plane_z(
+        pixels, 0.21, head.arms["right"].T_cam_base, head.intrinsics
+    )[:, :2]
+    actual_xy = backproject_pixels_to_plane_z(
+        projected, 0.21, head.arms["right"].T_cam_base, head.intrinsics
+    )[:, :2]
+    turn = 1.0 if target_yaw < folded else -1.0
+    centre = np.array([anchor["x_m"], anchor["y_m"]])
+    np.testing.assert_allclose(actual_xy, rotate_xy(source_xy - centre, turn) + centre, atol=3e-5)

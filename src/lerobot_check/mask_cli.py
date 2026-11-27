@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import math
 import sys
-from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
@@ -59,12 +58,7 @@ def run_template(args: argparse.Namespace) -> None:
         if not args.reject.strip() or args.output is None or args.preview_only or args.box:
             raise ValueError("--reject requires a reason and --output instead of segmentation")
         source = None
-        raw_layer = obj.get("object_layer") if layer == "object" else None
-        plane_z = (
-            raw_layer.get("plane_z_m")
-            if isinstance(raw_layer, Mapping)
-            else (None if layer == "object" else obj.get("median_z_m"))
-        )
+        plane_z = get_object_layer(obj, layer).plane_z_m
     else:
         if args.episode is None or args.frame is None or args.preview is None:
             raise ValueError("Supply --episode, --frame and --preview for the source image")
