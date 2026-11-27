@@ -110,6 +110,10 @@ def _candidates(
     round_count: int,
     seed: int,
 ) -> tuple[dict[str, list[_Candidate]], str, bytes, dict[str, str]]:
+    by_object = {template["object"]: template for template in templates}
+    missing_templates = sorted({obj["name"] for obj in distribution["objects"]} - by_object.keys())
+    if missing_templates:
+        raise ValueError(f"Missing reviewed templates for: {', '.join(missing_templates)}")
     suggestions = generate_suggestions(
         distribution,
         count=min(2048, max(96, round_count * 5)),
@@ -119,15 +123,15 @@ def _candidates(
         additional_poses=additional_poses,
         seed=seed,
     )
+    meta = {obj["object"]: obj for obj in suggestions["objects"]}
+    without_placements = set(suggestions["omitted_objects"]) - meta.keys()
     bundle = make_bundle(
         suggestions,
         calibration,
-        templates,
+        [template for template in templates if template["object"] not in without_placements],
         calibration_sha256=calibration_sha256,
         suggestions_sha256=sha256_bytes(json_bytes(suggestions)),
     )
-    meta = {obj["object"]: obj for obj in suggestions["objects"]}
-    by_object = {template["object"]: template for template in templates}
     first_arm = min(calibration.arms)
     from_camera = np.linalg.inv(calibration.arms[first_arm].T_cam_base)
     to_common_base = {name: from_camera @ arm.T_cam_base for name, arm in calibration.arms.items()}
@@ -138,10 +142,8 @@ def _candidates(
     manual: dict[str, str] = {}
     for item, mask in zip(suggestions["placements"], bundle["targets"], strict=True):
         name, arm = item["object"], item["arm"]
-        template = by_object.get(name)
-        reason = (
-            "No reviewed template for this object" if template is None else template.get("reason")
-        )
+        template = by_object[name]
+        reason = template.get("reason")
         if reason:
             manual[name] = reason
         if not (
@@ -176,7 +178,6 @@ def _candidates(
             if reason:
                 pools[name].append(_Candidate(target, None, None))
             continue
-        assert template is not None
         xyz = outline_base_points(template, item, period)
         transform = to_common_base[arm]
         base_xy = (xyz @ transform[:3, :3].T + transform[:3, 3])[:, :2]
