@@ -57,11 +57,17 @@ def test_outline_order_batch_iou_and_threshold():
     evaluator = AlignmentEvaluator(segmenter, min_iou=0.60)
     prepared = evaluator.prepare_round(
         PLAN,
-        [target(), target("box_base", 2), target("iphone", 3), target("box_lid", 4)],
+        [
+            target("box_base"),
+            target("paper_insert", 2, outline=None),
+            target("iphone", 3),
+            target("box_lid", 4),
+        ],
     )
     first, manual, boundary, distant = evaluator.evaluate(rgb, prepared)
     segmenter.predict.assert_called_once_with(rgb, [(2.0, 0.0, 21.0, 19.0)] * 3)
     assert [r.index for r in (first, manual, boundary, distant)] == [1, 2, 3, 4]
+    assert first.object == "box_base"
     assert first.iou == 1.0 and first.passed and first.status == "aligned"
     assert first.observed_outline is not None
     assert {tuple(p) for p in first.observed_outline} == {tuple(p) for p in OUTLINE}
@@ -89,7 +95,7 @@ def test_no_mask_and_manual_only_round():
     segmenter = Mock(predict=Mock(return_value=np.zeros((1, 24, 32), dtype=bool)))
     evaluator = AlignmentEvaluator(segmenter)
     manual = target("paper_insert", outline=None, reason="Projection unavailable")
-    base = target("box_base", 2, reason="Box pose is not reliable")
+    base = target("box_base", 2, outline=None, reason="Box pose is not reliable")
     prepared = evaluator.prepare_round(PLAN, [manual, base])
     a, b = evaluator.evaluate(rgb, prepared)
     assert (a.status, a.reason, b.status, b.reason) == (

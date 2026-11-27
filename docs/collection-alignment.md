@@ -46,7 +46,7 @@ all_aligned = bool(results) and all(result.passed for result in results)
 | `passed` | 有可用轮廓且 `iou >= min_iou` 才为 `True`。 |
 | `status`, `reason` | `aligned` 表示达到阈值，`misaligned` 表示低于阈值，`undetermined` 表示未分出可用轮廓，`manual` 表示不判定。界面可直接显示 `reason`。 |
 
-`box_base` 和 `outline: null` 不做分割，保留计划的 `reason` 或用人工确认提示。全是人工目标时，`evaluate` 不调用模型。每帧对目标边界框扩边，一次图像编码后批量解码，取各提示下模型分数最高的 mask；不沿用上一帧的 mask。附近的相似物体可能被选中，不能把 IoU 当作身份校验。
+`outline: null` 的目标不做分割，保留计划的 `reason` 或用人工确认提示。全是人工目标时，`evaluate` 不调用模型。每帧对目标边界框扩边，一次图像编码后批量解码，取各提示下模型分数最高的 mask；不沿用上一帧的 mask。附近的相似物体可能被选中，不能把 IoU 当作身份校验。
 
 ## 阈值与调度
 
