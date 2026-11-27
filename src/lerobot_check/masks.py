@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import math
 from collections.abc import Mapping, Sequence
 from typing import Any
@@ -29,10 +28,6 @@ def anchor_yaw_deg(anchor: Mapping[str, Any], layer: PoseLayer) -> float:
     if validate_pose_layer(layer) == "object":
         return float(anchor["folded_yaw_deg"])
     return float(anchor["raw_yaw_deg"])
-
-
-def sha256_bytes(content: bytes) -> str:
-    return hashlib.sha256(content).hexdigest()
 
 
 def read_head_frame(dataset: DatasetView, camera: str, episode: int, frame: int) -> Image.Image:

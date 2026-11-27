@@ -28,8 +28,7 @@ from lerobot_check.dataset import (
     default_task_spec_path,
     rotation_6d_to_matrix,
 )
-from lerobot_check.json_io import read_json
-from lerobot_check.masks import sha256_bytes
+from lerobot_check.json_io import read_json, sha256_bytes
 from lerobot_check.render import decode_video_frames_pyav
 from lerobot_check.schema import ObjectSpec, TaskSpec, load_annotations, load_task_spec
 from lerobot_check.segmentation import MODEL, MODEL_REVISION, SamSegmenter, exterior_outline

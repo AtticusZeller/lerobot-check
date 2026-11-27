@@ -23,7 +23,7 @@ from lerobot_check.calib import (
 )
 from lerobot_check.cli import main
 from lerobot_check.dataset import ArmState
-from lerobot_check.masks import sha256_bytes
+from lerobot_check.json_io import sha256_bytes
 from lerobot_check.object_pose import (
     OBJECT_LAYER_SOURCE,
     OBJECT_POSE_FRAME,

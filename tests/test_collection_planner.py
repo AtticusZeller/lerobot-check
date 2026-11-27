@@ -21,7 +21,7 @@ from lerobot_check.collection_planner import (
     delete_pending,
 )
 from lerobot_check.collection_progress import validate_plan
-from lerobot_check.masks import sha256_bytes
+from lerobot_check.json_io import sha256_bytes
 
 SHA = "a" * 64
 

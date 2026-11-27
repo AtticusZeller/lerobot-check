@@ -47,7 +47,7 @@ from lerobot_check.dataset import (
     infer_repo_id,
     resolve_dataset_root,
 )
-from lerobot_check.masks import sha256_bytes
+from lerobot_check.json_io import sha256_bytes
 from lerobot_check.object_pose import configure_object_poses_parser, load_object_poses
 from lerobot_check.propose import (
     DEFAULT_RENDER_EVENT_TYPES,

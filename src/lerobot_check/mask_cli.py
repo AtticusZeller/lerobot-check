@@ -10,12 +10,11 @@ from PIL import Image, ImageDraw
 
 from lerobot_check.calib import load_head_calibration, write_json
 from lerobot_check.dataset import DatasetView, resolve_dataset_root
-from lerobot_check.json_io import read_json
+from lerobot_check.json_io import read_json, sha256_bytes
 from lerobot_check.masks import (
     make_bundle,
     make_local_outline,
     read_head_frame,
-    sha256_bytes,
 )
 from lerobot_check.segmentation import MODEL, MODEL_REVISION, SamSegmenter, exterior_outline
 from lerobot_check.suggest import (

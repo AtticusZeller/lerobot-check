@@ -19,10 +19,10 @@ from lerobot_check.collection_progress import (
     PlanTarget,
     json_bytes,
 )
+from lerobot_check.json_io import sha256_bytes
 from lerobot_check.masks import (
     make_bundle,
     outline_base_points,
-    sha256_bytes,
     template_anchor_layer,
 )
 from lerobot_check.suggest import (
