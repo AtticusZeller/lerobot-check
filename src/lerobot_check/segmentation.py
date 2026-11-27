@@ -5,12 +5,25 @@ from contextlib import nullcontext
 from importlib import import_module
 from typing import Literal
 
+import cv2
 import numpy as np
 from PIL import Image
 
 MODEL = "facebook/sam2.1-hiera-tiny"
 MODEL_REVISION = "de431c4043854a71d8101e17995dfe596bf101a5"
 Precision = Literal["fp32", "bf16"]
+
+
+def exterior_outline(mask: np.ndarray) -> np.ndarray:
+    contours, _ = cv2.findContours(
+        np.asarray(mask, dtype=np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+    if not contours:
+        raise ValueError("Segmentation produced an empty mask")
+    outline = cv2.approxPolyDP(max(contours, key=cv2.contourArea), 0.5, True).reshape(-1, 2)
+    if len(outline) < 3 or cv2.contourArea(outline) <= 0:
+        raise ValueError("Segmentation produced a degenerate outline")
+    return outline.astype(np.float64)
 
 
 class SamSegmenter:

@@ -11,8 +11,7 @@ import cv2
 import numpy as np
 
 from lerobot_check.collection_progress import CollectionPlan, PlanTarget
-from lerobot_check.masks import exterior_outline
-from lerobot_check.segmentation import Precision, SamSegmenter
+from lerobot_check.segmentation import Precision, SamSegmenter, exterior_outline
 
 DEFAULT_MIN_IOU = 0.60
 

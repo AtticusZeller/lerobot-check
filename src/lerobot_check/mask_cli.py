@@ -12,13 +12,12 @@ from PIL import Image, ImageDraw
 from lerobot_check.calib import load_head_calibration, write_json
 from lerobot_check.dataset import DatasetView, resolve_dataset_root
 from lerobot_check.masks import (
-    exterior_outline,
     make_bundle,
     make_local_outline,
     read_head_frame,
     sha256_bytes,
 )
-from lerobot_check.segmentation import MODEL, MODEL_REVISION, SamSegmenter
+from lerobot_check.segmentation import MODEL, MODEL_REVISION, SamSegmenter, exterior_outline
 
 
 def segment(
