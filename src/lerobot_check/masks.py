@@ -5,7 +5,6 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
-import cv2
 import numpy as np
 from PIL import Image
 
@@ -29,18 +28,6 @@ def read_head_frame(dataset: DatasetView, camera: str, episode: int, frame: int)
     span = record.videos[camera]
     timestamp = span.from_timestamp + frame / dataset.fps
     return decode_video_frames_pyav(span.path, [(frame, timestamp)], fps=dataset.fps)[frame]
-
-
-def exterior_outline(mask: np.ndarray) -> np.ndarray:
-    contours, _ = cv2.findContours(
-        np.asarray(mask, dtype=np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-    if not contours:
-        raise ValueError("Segmentation produced an empty mask")
-    outline = cv2.approxPolyDP(max(contours, key=cv2.contourArea), 0.5, True).reshape(-1, 2)
-    if len(outline) < 3 or cv2.contourArea(outline) <= 0:
-        raise ValueError("Segmentation produced a degenerate outline")
-    return outline.astype(np.float64)
 
 
 def rotate_xy(points: np.ndarray, degrees: float) -> np.ndarray:
