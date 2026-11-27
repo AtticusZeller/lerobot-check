@@ -64,19 +64,25 @@ def make_local_outline(
     return rotate_xy(base[:, :2] - [anchor["x_m"], anchor["y_m"]], -anchor["raw_yaw_deg"])
 
 
-def project_outline(
-    template: Mapping[str, Any],
-    item: Mapping[str, Any],
-    period: float,
-    calibration: HeadCalibration,
-) -> list[list[float]]:
+def outline_base_points(
+    template: Mapping[str, Any], item: Mapping[str, Any], period: float
+) -> np.ndarray:
     local = np.asarray(template["outline_xy_m"], dtype=np.float64)
     if local.ndim != 2 or local.shape[1] != 2 or len(local) < 3 or not np.isfinite(local).all():
         raise ValueError("Invalid local outline")
     yaw = closest_equivalent_yaw(item["yaw_deg"], template["source"]["raw_yaw_deg"], period)
     xy = rotate_xy(local, yaw) + np.array([item["x_m"], item["y_m"]])
     plane = item["z_m"] + template["height_offset_m"]
-    xyz = np.column_stack((xy, np.full(len(xy), plane)))
+    return np.column_stack((xy, np.full(len(xy), plane)))
+
+
+def project_outline(
+    template: Mapping[str, Any],
+    item: Mapping[str, Any],
+    period: float,
+    calibration: HeadCalibration,
+) -> list[list[float]]:
+    xyz = outline_base_points(template, item, period)
     arm = calibration.arms[item["arm"]]
     pixels = np.round(project_base_points(xyz, arm.T_cam_base, calibration.intrinsics), 3)
     width, height = calibration.image_size

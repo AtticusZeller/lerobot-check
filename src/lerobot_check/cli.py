@@ -607,9 +607,8 @@ def _cmd_distribution(args: argparse.Namespace) -> int:
             print(f"[episodes] {exc}", file=sys.stderr)
             return 1
 
-    calib_path: Path | None = None
-    if args.calib is not None:
-        calib_path = args.calib
+    calib_path: Path | None = args.calib
+    if calib_path is not None:
         if not calib_path.is_file():
             print(f"[calib] Head calibration file does not exist: {calib_path}", file=sys.stderr)
             return 1
@@ -688,9 +687,8 @@ def _cmd_suggest(args: argparse.Namespace) -> int:
         print(f"[distribution] {exc}", file=sys.stderr)
         return 1
 
-    targets_path: Path | None = None
-    if args.targets is not None:
-        targets_path = args.targets
+    targets_path: Path | None = args.targets
+    if targets_path is not None:
         if not targets_path.is_file():
             print(f"[targets] Target polygon file does not exist: {targets_path}", file=sys.stderr)
             return 1
@@ -699,9 +697,8 @@ def _cmd_suggest(args: argparse.Namespace) -> int:
         if candidate.is_file():
             targets_path = candidate
 
-    calib_path: Path | None = None
-    if args.calib is not None:
-        calib_path = args.calib
+    calib_path: Path | None = args.calib
+    if calib_path is not None:
         if not calib_path.is_file():
             print(f"[calib] Head calibration file does not exist: {calib_path}", file=sys.stderr)
             return 1
@@ -978,6 +975,7 @@ def _cmd_calibrate(args: argparse.Namespace) -> int:
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the top-level argument parser for ``lerobot-check``."""
+    from lerobot_check.collection_plan_cli import configure_plan_parser
     from lerobot_check.mask_cli import configure_overlays_parser, configure_template_parser
 
     parser = argparse.ArgumentParser(
@@ -1694,6 +1692,9 @@ def build_parser() -> argparse.ArgumentParser:
         subparsers.add_parser(
             "mask-overlays", help="Project reviewed outlines onto collection targets."
         )
+    )
+    configure_plan_parser(
+        subparsers.add_parser("collection-plan", help="Generate and review collection rounds.")
     )
     return parser
 

@@ -352,6 +352,7 @@ def generate_suggestions(
     targets: Mapping[str, Any] | None = None,
     calibration: HeadCalibration | None = None,
     object_filter: Sequence[str] | None = None,
+    additional_poses: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
     seed: int = 0,
     distribution_path: Path | str | None = None,
     targets_path: Path | str | None = None,
@@ -372,6 +373,7 @@ def generate_suggestions(
         targets: Optional parsed ``targets/<org>__<name>.json`` dictionary.
         calibration: Optional loaded ``HeadCalibration`` from ``head.json``.
         object_filter: Optional subset of object names to generate suggestions for.
+        additional_poses: Supplemental coverage observations, without changing the region.
         seed: Random seed for reproducible sampling.
         distribution_path: Recorded in provenance when provided.
         targets_path: Recorded in provenance when provided.
@@ -502,7 +504,7 @@ def generate_suggestions(
         _, num_yaw_bins = yaw_bin_index(0.0, yaw_symmetry_deg=yaw_sym, yaw_bin_deg=yaw_bin_deg)
         xy_counts: dict[tuple[int, int], int] = defaultdict(int)
         xy_yaw_counts: dict[tuple[int, int, int], int] = defaultdict(int)
-        for p in poses:
+        for p in (*poses, *((additional_poses or {}).get(obj_name, ()))):
             ix = math.floor(float(p["x_m"]) / xy_bin_m)
             iy = math.floor(float(p["y_m"]) / xy_bin_m)
             yb, _ = yaw_bin_index(

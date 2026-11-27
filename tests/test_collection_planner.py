@@ -1,0 +1,204 @@
+import math
+import warnings
+from dataclasses import replace
+
+import numpy as np
+import pytest
+
+from lerobot_check.calib import ArmCalibration, HeadCalibration, parse_intrinsics
+from lerobot_check.collection_planner import (
+    _candidates,
+    _coverage_history,
+    build_plan,
+    convex_hulls_overlap,
+    delete_pending,
+)
+from lerobot_check.collection_progress import validate_plan
+from lerobot_check.masks import sha256_bytes
+
+SHA = "a" * 64
+
+
+@pytest.fixture
+def calibrated_inputs():
+    camera = "head"
+    intrinsics = parse_intrinsics(
+        {
+            "version": 1,
+            "camera": camera,
+            "image_size": [640, 480],
+            "fx": 325,
+            "fy": 325,
+            "cx": 320,
+            "cy": 240,
+            "distortion": [0, 0, 0, 0, 0],
+            "serial_number": "0032",
+        }
+    )
+    identity = np.eye(4)
+    identity[2, 3] = 1
+    right = ArmCalibration("right", identity, np.zeros(3), 10, 0.5, None, ())
+    shifted = identity.copy()
+    shifted[0, 3] = 0.15
+    left = replace(right, arm="left", T_cam_base=shifted)
+    head = HeadCalibration(
+        "org/demo", "local", camera, (640, 480), intrinsics, {"right": right, "left": left}
+    )
+    objects = []
+    templates = []
+    for name, arm, shift in [
+        ("lid", "right", 0),
+        ("phone", "left", -0.15),
+        ("box_base", "right", 0),
+    ]:
+        objects.append(
+            {
+                "name": name,
+                "arm": arm,
+                "median_z_m": 0,
+                "yaw_symmetry_deg": 180,
+                "poses": [
+                    {"episode_index": 0, "x_m": -0.22 + shift, "y_m": -0.22, "folded_yaw_deg": 0},
+                    {"episode_index": 1, "x_m": 0.22 + shift, "y_m": 0.22, "folded_yaw_deg": 0},
+                ],
+            }
+        )
+        templates.append(
+            {
+                "object": name,
+                "arm": arm,
+                "z_plane_m": 0,
+                "height_offset_m": 0.01,
+                "version": 1,
+                "repo_id": "org/demo",
+                "revision": "local",
+                "calibration_sha256": SHA,
+                "source": {"raw_yaw_deg": 0},
+                "outline_xy_m": [[-0.04, -0.03], [0.04, -0.03], [0.04, 0.03], [-0.04, 0.03]],
+                "reason": "No reliable pose proxy" if name == "box_base" else None,
+            }
+        )
+    distribution = {
+        "provenance": {
+            "repo_id": "org/demo",
+            "revision": "local",
+            "task_name": "demo",
+            "position_point": "tool_point",
+        },
+        "coverage_config": {"xy_bin_m": 0.05, "yaw_bin_deg": 30, "sparse_threshold": 3},
+        "objects": objects,
+    }
+    return distribution, head, templates
+
+
+def make_plan(inputs, *, round_count=4, objects_per_round=2, **options):
+    distribution, head, templates = inputs
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message="No target polygon provided")
+        return build_plan(
+            distribution,
+            head,
+            calibration_sha256=SHA,
+            templates=templates,
+            source_episode_count=2,
+            round_count=round_count,
+            objects_per_round=objects_per_round,
+            **options,
+        )
+
+
+def test_hull_overlap_includes_touch_and_containment():
+    a = np.asarray([[0, 0], [1, 0], [1, 1], [0, 1]], dtype=float)
+    assert convex_hulls_overlap(a, a + np.array([0.5, 0]))
+    assert convex_hulls_overlap(a, a + np.array([1, 1]))
+    assert convex_hulls_overlap(a, a * 0.25 + 0.3)
+    assert not convex_hulls_overlap(a, a + np.array([1.01, 0]))
+
+
+def test_mixed_arm_plan_is_deterministic_and_excludes_unchecked_base(calibrated_inputs):
+    plan, bundle = make_plan(calibrated_inputs)
+    repeated, second_bundle = make_plan(calibrated_inputs)
+    validate_plan(plan)
+    assert plan["camera_serial"] == "0032"
+    assert plan["rounds"] == repeated["rounds"] and bundle == second_bundle
+    assert plan["mask_bundle_sha256"] == sha256_bytes(bundle)
+    assert plan["excluded_objects"] == {"box_base": "No reliable pose proxy"}
+    for r in plan["rounds"]:
+        a, b = r["targets"]
+        assert {a["arm"], b["arm"]} == {"right", "left"}
+        assert a["outline_plane_z_m"] == b["outline_plane_z_m"] == 0.01
+        assert not convex_hulls_overlap(np.array(a["outline"]), np.array(b["outline"]))
+    with pytest.raises(ValueError, match=r"only 2 are eligible.*box_base"):
+        make_plan(calibrated_inputs, objects_per_round=3)
+    single, _ = make_plan(calibrated_inputs, objects_per_round=1, round_count=3)
+    base = next(t for r in single["rounds"] for t in r["targets"] if t["object"] == "box_base")
+    assert base["outline"] is None and base["outline_plane_z_m"] is None and base["reason"]
+
+
+def test_no_collision_solution_reports_shortage(calibrated_inputs):
+    distribution, head, templates = calibrated_inputs
+    for template in templates:
+        template["outline_xy_m"] = [[-0.32, -0.32], [0.32, -0.32], [0.32, 0.32], [-0.32, 0.32]]
+    target = {
+        "camera": "head",
+        "image_size": [640, 480],
+        "polygon": [[315, 235], [325, 235], [325, 245], [315, 245]],
+    }
+    with pytest.raises(ValueError, match="Found 0/4"):
+        make_plan((distribution, head, templates), targets=target)
+
+
+def test_history_augments_coverage_without_double_counting(calibrated_inputs):
+    distribution, head, templates = calibrated_inputs
+    old, _ = make_plan(calibrated_inputs)
+    done, skipped = old["rounds"][:2]
+    done["status"], done["episode_index"] = "collected", 2
+    skipped["status"] = "skipped"
+    first = done["targets"][0]
+    real_pose = {
+        "episode_index": 2,
+        "x_m": first["x_m"] + 0.06,
+        "y_m": first["y_m"],
+        "folded_yaw_deg": 1.0,
+    }
+    distribution["objects"][0]["poses"].append(real_pose)
+    extra, avoid = _coverage_history(distribution, old["rounds"])
+    assert set(extra) == {done["targets"][1]["object"]}
+    assert avoid[first["object"]] == [
+        (first["x_m"], first["y_m"]),
+        (real_pose["x_m"], real_pose["y_m"]),
+    ]
+    assert skipped["targets"][0]["x_m"] not in {x for x, _ in avoid[first["object"]]}
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        _, _, baseline_bundle, _ = _candidates(distribution, head, templates, SHA, None, {}, 4, 0)
+        _, _, augmented_bundle, _ = _candidates(
+            distribution, head, templates, SHA, None, extra, 4, 0
+        )
+    assert sha256_bytes(baseline_bundle) != sha256_bytes(augmented_bundle)
+    updated, _ = make_plan(calibrated_inputs, previous=old)
+    assert updated["rounds"][:2] == [done, skipped]
+    for r in updated["rounds"][2:]:
+        for t in r["targets"]:
+            assert all(
+                math.hypot(t["x_m"] - x, t["y_m"] - y) >= 0.025 for x, y in avoid[t["object"]]
+            )
+
+
+def test_replacing_or_deleting_one_pending_round_keeps_all_others(calibrated_inputs):
+    original, _ = make_plan(calibrated_inputs)
+    original["rounds"][0]["status"] = "skipped"
+    updated, _ = make_plan(calibrated_inputs, previous=original, replace_round_id=2)
+    assert updated["rounds"][1]["id"] == original["next_round_id"]
+    assert updated["rounds"][0] == original["rounds"][0]
+    assert updated["rounds"][2:] == original["rounds"][2:]
+    old_round = original["rounds"][1]
+    for target in updated["rounds"][1]["targets"]:
+        prior = next(t for t in old_round["targets"] if t["object"] == target["object"])
+        assert math.hypot(target["x_m"] - prior["x_m"], target["y_m"] - prior["y_m"]) >= 0.025
+    with pytest.raises(ValueError, match="no longer pending"):
+        delete_pending(updated, 1)
+    delete_pending(updated, 3)
+    assert updated["rounds"][2:] == original["rounds"][3:]
+    assert updated["generation"] == 3
+    validate_plan(updated)
