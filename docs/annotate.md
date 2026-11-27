@@ -34,7 +34,30 @@ Read the task spec YAML comments for any subtask-specific boundary overrides, an
 Search each non-final subtask boundary separately, coarse to fine, using `lerobot-check window-sheet`:
 
 1. **One agent per non-final boundary**: assign one annotating agent to each non-final boundary `k` (`1 .. N-1`). Each agent judges only its own boundary across all episodes.
-2. **Choose the search window**: if an earlier annotation of the same task already established a time window for boundary `k`, reuse it. Otherwise, first run `window-sheet` over the full episode length at ~4 s spacing on ~8 episodes: set `HI` to at least the longest `duration_s` printed by `info` (each window is clamped to its episode's last frame) and `--samples` to about `HI / 4 + 1` (for example, with a longest episode of 106.5 s, `--episodes 0,15,30,45,60,75,90,100 --window-s 0:108 --samples 28`). Choose a window covering the observed boundary times with margin.
+2. **Choose the search window**: if an earlier annotation of the same task already established a time window for boundary `k`, reuse it. Otherwise, pre-scan the full episode length on ~8 episodes in consecutive 28 s ranges, one `window-sheet` run per range with `--samples 8` (4 s spacing, one sheet of about 2400 px width per range). Add ranges until they reach the longest `duration_s` printed by `info`. Each window is clamped to its episode's last frame, but a range that starts at or after an episode's end is rejected, so leave such episodes out of that range's `--episodes`. For `Xense/pack_iphone_box_1119` (these 8 episodes are 69–107 s long; only episodes 15 and 30 run past 84 s):
+
+```bash
+for range in 0:28 28:56 56:84; do
+  uv run lerobot-check window-sheet \
+    --repo-id Xense/pack_iphone_box_1119 \
+    --episodes 0,15,30,45,60,75,90,100 \
+    --window-s "$range" \
+    --samples 8 \
+    --crop head=90,40,550,360 \
+    --name "pre_${range/:/-}" \
+    -o /tmp/lerobot-check/window-pre
+done
+uv run lerobot-check window-sheet \
+  --repo-id Xense/pack_iphone_box_1119 \
+  --episodes 15,30 \
+  --window-s 84:112 \
+  --samples 8 \
+  --crop head=90,40,550,360 \
+  --name pre_84-112 \
+  -o /tmp/lerobot-check/window-pre
+```
+
+   Choose a window covering the observed boundary times with margin.
 3. **Round 1 (`--window-s`, ~4 s spacing)**: render 8 evenly spaced frames inside the window with 8 episodes per sheet (`--per-page 8`, default). Crop `head` to the active workspace when helpful:
 
 ```bash
