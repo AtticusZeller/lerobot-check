@@ -374,3 +374,15 @@ def test_object_frame_offsets_reject_arm_mismatch_and_handle_no_pairs() -> None:
     assert object_frame_tool_offsets([obj], [], yaw_period_deg=180.0) is None
     with pytest.raises(ValueError, match="arm"):
         object_frame_tool_offsets([obj], [{**tool, "arm": "left"}], yaw_period_deg=180.0)
+
+
+def test_object_frame_reference_yaw_is_centred_so_offset_sign_is_stable() -> None:
+    local = (0.025, 0.006)
+    pairs = [_object_and_tool(ep, 0.8, 0.1, yaw, local) for ep, yaw in enumerate([-1.5, -1.0, 0.5])]
+    stats = object_frame_tool_offsets(
+        [o for o, _ in pairs], [t for _, t in pairs], yaw_period_deg=180.0
+    )
+    assert stats is not None
+    assert -90.0 < stats.reference_yaw_deg <= 90.0
+    assert stats.reference_yaw_deg == pytest.approx(0.0, abs=1.0)
+    assert stats.mean_xy_m == pytest.approx(local, abs=1e-12)

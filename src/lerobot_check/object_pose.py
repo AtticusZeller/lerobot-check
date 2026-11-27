@@ -934,9 +934,8 @@ def object_frame_tool_offsets(
     period = float(yaw_period_deg)
     yaws = np.array([fold_angle_deg(float(obj["raw_yaw_deg"]), period) for obj, _ in pairs])
     phase = np.radians(yaws) * (360.0 / period)
-    reference = fold_angle_deg(
-        math.degrees(math.atan2(np.sin(phase).mean(), np.cos(phase).mean())) * period / 360.0,
-        period,
+    reference = (
+        math.degrees(math.atan2(np.sin(phase).mean(), np.cos(phase).mean())) * period / 360.0
     )
     unwrapped = reference + (yaws - reference + period / 2.0) % period - period / 2.0
     base_delta = np.array(
