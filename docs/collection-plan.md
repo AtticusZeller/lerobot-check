@@ -4,7 +4,7 @@ COLLECTION 计划是供离线审核、现场摆放和进度回传的单个 UTF-8
 
 ## 生成、审核、回传
 
-准备工具点版 `distribution.json`、同一数据集 revision 的 `head.json`，以及 [已审核的物体模板](../README.md#补采目标轮廓)。将模板放在 `<lerobot_root>/.xense-viewer/mask-templates/<org>__<name>@<revision>/`，每个物体一个 JSON。无有效外形的对象可在模板中显式写 `reason`；不要把诊断模板当作审核结果。默认计划路径为 `.xense-viewer/plans/<org>__<name>@<revision>.json`。CLI 的 `--viewer-root` 接受显式的 `.xense-viewer` 目录；`--template` 可重复，提供时替代目录扫描。Viewer 使用 `LOCAL_DATASET_ROOT` 下的同一套路径。
+准备工具点版 `distribution.json`、同一数据集 revision 的 `head.json`，以及 [已审核的物体模板](../README.md#补采目标轮廓)。将模板放在 `<lerobot_root>/.xense-viewer/mask-templates/<org>__<name>@<revision>/`，分布中的每个物体都必须提供一个模板 JSON；缺少时 `generate` 会列出全部缺失物体并退出，不改写计划。无可靠轮廓的物体用 `mask-template --reject` 生成模板，才能参加单物体人工轮；不要把诊断模板当作审核结果。默认计划路径为 `.xense-viewer/plans/<org>__<name>@<revision>.json`。CLI 的 `--viewer-root` 接受显式的 `.xense-viewer` 目录；`--template` 可重复，提供时替代目录扫描。Viewer 使用 `LOCAL_DATASET_ROOT` 下的同一套路径。
 
 ```sh
 uv run lerobot-check collection-plan generate \

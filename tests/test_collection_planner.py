@@ -1,3 +1,4 @@
+import json
 import math
 import warnings
 from dataclasses import replace
@@ -6,6 +7,7 @@ import numpy as np
 import pytest
 
 from lerobot_check.calib import ArmCalibration, HeadCalibration, parse_intrinsics
+from lerobot_check.cli import main
 from lerobot_check.collection_planner import (
     _candidates,
     _coverage_history,
@@ -133,6 +135,62 @@ def test_mixed_arm_plan_is_deterministic_and_excludes_unchecked_base(calibrated_
     single, _ = make_plan(calibrated_inputs, objects_per_round=1, round_count=3)
     base = next(t for r in single["rounds"] for t in r["targets"] if t["object"] == "box_base")
     assert base["outline"] is None and base["outline_plane_z_m"] is None and base["reason"]
+
+
+def test_generate_reports_all_missing_templates(tmp_path, monkeypatch, capsys, calibrated_inputs):
+    distribution, head, templates = calibrated_inputs
+    monkeypatch.setattr(
+        "lerobot_check.collection_plan_cli.parse_head_calibration", lambda *_a, **_kw: head
+    )
+    (tmp_path / "meta").mkdir()
+    (tmp_path / "meta" / "info.json").write_text('{"total_episodes": 2}')
+    dist_path = tmp_path / "distribution.json"
+    dist_path.write_text(json.dumps({"version": 1, **distribution}))
+    calib_path = tmp_path / "head.json"
+    calib_path.write_text("{}")
+    template_dir = tmp_path / "templates"
+    template_dir.mkdir()
+    (template_dir / "box_base.json").write_text(json.dumps(templates[-1]))
+    plan_path = tmp_path / "plan.json"
+
+    assert (
+        main(
+            [
+                "collection-plan",
+                "generate",
+                "--dataset-root",
+                str(tmp_path),
+                "--repo-id",
+                head.repo_id,
+                "--viewer-root",
+                str(tmp_path),
+                "--distribution",
+                str(dist_path),
+                "--calib",
+                str(calib_path),
+                "--template-dir",
+                str(template_dir),
+                "--plan",
+                str(plan_path),
+                "--rounds",
+                "3",
+            ]
+        )
+        == 1
+    )
+    message = "[collection-plan] Missing reviewed templates for: lid, phone\n"
+    assert capsys.readouterr().err == message
+    assert not plan_path.exists()
+    assert not (tmp_path / "bundles").exists()
+
+
+def test_object_without_placement_poses_still_requires_a_template(calibrated_inputs):
+    distribution, head, templates = calibrated_inputs
+    distribution["objects"][0]["poses"] = []
+    with pytest.raises(ValueError, match="Missing reviewed templates for: lid"):
+        make_plan((distribution, head, templates[1:]), objects_per_round=1)
+    plan, _ = make_plan(calibrated_inputs, objects_per_round=1)
+    assert plan["excluded_objects"] == {"lid": "No calibrated placement candidates"}
 
 
 def test_no_collision_solution_reports_shortage(calibrated_inputs):
