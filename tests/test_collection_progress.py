@@ -150,3 +150,14 @@ def test_corrupt_plan_refused(tmp_path, raw):
     file.write_text(raw)
     with pytest.raises(ValueError, match="Invalid collection plan"):
         load_plan(file)
+
+
+def test_plan_layer_validation(plan_file):
+    from lerobot_check.collection_progress import validate_plan
+
+    plan = load_plan(plan_file)
+    assert "layer" not in plan
+    validate_plan({**plan, "layer": "object"})
+    validate_plan({**plan, "layer": "tool"})
+    with pytest.raises(ValueError, match="layer"):
+        validate_plan({**plan, "layer": "unknown"})

@@ -3,6 +3,7 @@ import math
 import warnings
 from collections import Counter
 from dataclasses import replace
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -97,7 +98,7 @@ def calibrated_inputs():
     return distribution, head, templates
 
 
-def make_plan(inputs, *, round_count=4, objects_per_round=2, **options):
+def make_plan(inputs, *, round_count=4, objects_per_round=2, layer="tool", **options):
     distribution, head, templates = inputs
     with warnings.catch_warnings():
         warnings.filterwarnings("ignore", message="No target polygon provided")
@@ -109,6 +110,7 @@ def make_plan(inputs, *, round_count=4, objects_per_round=2, **options):
             source_episode_count=2,
             round_count=round_count,
             objects_per_round=objects_per_round,
+            layer=layer,
             **options,
         )
 
@@ -176,6 +178,8 @@ def test_generate_reports_all_missing_templates(tmp_path, monkeypatch, capsys, c
                 str(template_dir),
                 "--plan",
                 str(plan_path),
+                "--layer",
+                "tool",
                 "--rounds",
                 "3",
             ]
@@ -224,7 +228,7 @@ def test_history_augments_coverage_without_double_counting(calibrated_inputs):
         "folded_yaw_deg": 1.0,
     }
     distribution["objects"][0]["poses"].append(real_pose)
-    extra, avoid = _coverage_history(distribution, old["rounds"])
+    extra, avoid = _coverage_history(distribution, old["rounds"], layer="tool")
     assert set(extra) == {done["targets"][1]["object"]}
     assert avoid[first["object"]] == [
         (first["x_m"], first["y_m"]),
@@ -233,9 +237,11 @@ def test_history_augments_coverage_without_double_counting(calibrated_inputs):
     assert skipped["targets"][0]["x_m"] not in {x for x, _ in avoid[first["object"]]}
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        _, _, baseline_bundle, _ = _candidates(distribution, head, templates, SHA, None, {}, 4, 0)
+        _, _, baseline_bundle, _ = _candidates(
+            distribution, head, templates, SHA, None, {}, 4, 0, layer="tool"
+        )
         _, _, augmented_bundle, _ = _candidates(
-            distribution, head, templates, SHA, None, extra, 4, 0
+            distribution, head, templates, SHA, None, extra, 4, 0, layer="tool"
         )
     assert sha256_bytes(baseline_bundle) != sha256_bytes(augmented_bundle)
     updated, _ = make_plan(calibrated_inputs, previous=old)
@@ -281,7 +287,7 @@ def test_replacement_history_counts_other_pending_rounds_but_avoids_all(calibrat
     skipped["status"] = "skipped"
     original["settings"]["min_revisit_distance_m"] = 0.11
 
-    history = _planning_history(distribution, original, replacing["id"])
+    history = _planning_history(distribution, original, replacing["id"], layer="tool")
 
     assert history.distance == 0.11
     assert history.kept == [done, skipped]
@@ -298,7 +304,9 @@ def test_round_selection_respects_revisit_usage_and_collision(calibrated_inputs)
     distribution, head, templates = calibrated_inputs
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)
-        pools, _, _, _ = _candidates(distribution, head, templates, SHA, None, {}, 4, 0)
+        pools, _, _, _ = _candidates(
+            distribution, head, templates, SHA, None, {}, 4, 0, layer="tool"
+        )
     lid, phone = pools["lid"], pools["phone"]
     order = {"lid": 0, "phone": 1}
     first_xy = (lid[0].target["x_m"], lid[0].target["y_m"])
@@ -329,3 +337,122 @@ def test_replacing_or_deleting_one_pending_round_keeps_all_others(calibrated_inp
     assert updated["rounds"][2:] == original["rounds"][3:]
     assert updated["generation"] == 3
     validate_plan(updated)
+
+
+def _with_object_layer(calibrated_inputs):
+    distribution, head, templates = calibrated_inputs
+    obj_objects = []
+    for obj in distribution["objects"]:
+        obj_copy = {**obj, "yaw_symmetry_deg": 360}
+        obj_copy["object_layer"] = {
+            "source": "head_mask",
+            "frame": 0,
+            "arm": obj["arm"],
+            "plane_z_m": 0.05,
+            "yaw_period_deg": 180,
+            "poses": [
+                {
+                    "episode_index": p["episode_index"],
+                    "frame": 0,
+                    "arm": obj["arm"],
+                    "x_m": p["x_m"],
+                    "y_m": p["y_m"],
+                    "z_m": 0.05,
+                    "raw_yaw_deg": 180.0,
+                    "folded_yaw_deg": 0.0,
+                    "length_m": 0.08,
+                    "width_m": 0.06,
+                }
+                for p in obj["poses"]
+            ],
+            "skipped": [],
+            "coverage": {},
+        }
+        obj_objects.append(obj_copy)
+    obj_dist = {**distribution, "objects": obj_objects}
+    obj_templates = [
+        {
+            **t,
+            "anchor_layer": "object",
+            "z_plane_m": 0.05,
+            "source": {"raw_yaw_deg": 180.0, "folded_yaw_deg": 0.0}
+            if t["reason"] is None
+            else None,
+        }
+        for t in templates
+    ]
+    return obj_dist, head, obj_templates
+
+
+def test_plan_default_object_layer_errors_when_missing(calibrated_inputs):
+    distribution, head, templates = calibrated_inputs
+    with pytest.raises(
+        ValueError, match=r"lid, phone, box_base.*lerobot-check object-poses.*distribution"
+    ):
+        build_plan(
+            distribution,
+            head,
+            calibration_sha256=SHA,
+            templates=templates,
+            source_episode_count=2,
+            round_count=2,
+            objects_per_round=1,
+        )
+
+
+def test_plan_object_layer_provenance_template_mismatch_and_history(calibrated_inputs):
+    obj_inputs = _with_object_layer(calibrated_inputs)
+    obj_dist, head, obj_templates = obj_inputs
+    _, _, legacy_templates = calibrated_inputs
+
+    plan, _ = make_plan(obj_inputs, layer="object")
+    validate_plan(plan)
+    assert plan["layer"] == "object"
+    for r in plan["rounds"]:
+        for t in r["targets"]:
+            assert t["z_m"] == pytest.approx(0.05)
+            assert t["yaw_symmetry_deg"] == 180
+            assert 0 <= t["yaw_deg"] < 180
+
+    with pytest.raises(ValueError, match=r"Template for lid.*tool.*object"):
+        make_plan((obj_dist, head, [legacy_templates[0], *obj_templates[1:]]), layer="object")
+
+    with pytest.raises(ValueError, match=r"Template for lid.*object.*tool"):
+        make_plan((obj_dist, head, [obj_templates[0], *legacy_templates[1:]]), layer="tool")
+
+    with pytest.raises(ValueError, match=r"Existing plan uses layer 'object'.*'tool'"):
+        make_plan(calibrated_inputs, previous=plan, layer="tool")
+
+    tool_plan, _ = make_plan(calibrated_inputs, layer="tool")
+    assert tool_plan["layer"] == "tool"
+    with pytest.raises(ValueError, match=r"Existing plan uses layer 'tool'.*'object'"):
+        make_plan(obj_inputs, previous=tool_plan, layer="object")
+
+    legacy_plan = {k: v for k, v in tool_plan.items() if k != "layer"}
+    with pytest.raises(ValueError, match=r"Existing plan uses layer 'tool'.*'object'"):
+        make_plan(obj_inputs, previous=cast(Any, legacy_plan), layer="object")
+
+    done = plan["rounds"][0]
+    done["status"], done["episode_index"] = "collected", 2
+    first = done["targets"][0]
+    obj_entry = next(o for o in obj_dist["objects"] if o["name"] == first["object"])
+    obj_entry["object_layer"]["poses"].append(
+        {
+            "episode_index": 2,
+            "frame": 0,
+            "arm": first["arm"],
+            "x_m": first["x_m"] + 0.07,
+            "y_m": first["y_m"],
+            "z_m": 0.05,
+            "raw_yaw_deg": 190.0,
+            "folded_yaw_deg": 10.0,
+            "length_m": 0.08,
+            "width_m": 0.06,
+        }
+    )
+    extra, avoid = _coverage_history(obj_dist, plan["rounds"], layer="object")
+    assert first["object"] not in extra
+    assert avoid[first["object"]] == [
+        (first["x_m"], first["y_m"]),
+        (first["x_m"] + 0.07, first["y_m"]),
+    ]

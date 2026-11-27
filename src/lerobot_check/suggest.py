@@ -8,8 +8,9 @@ import math
 import warnings
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 
@@ -28,6 +29,67 @@ COLLISION_NOTE = (
     "Placements are sampled independently per object; inter-object collisions are not checked."
 )
 TEST_TIERS: tuple[str, ...] = ("dense", "edge", "empty")
+PoseLayer = Literal["object", "tool"]
+POSE_LAYERS: tuple[PoseLayer, ...] = ("object", "tool")
+DEFAULT_POSE_LAYER: PoseLayer = "object"
+
+
+@dataclass(frozen=True)
+class ObjectLayerData:
+    poses: list[Mapping[str, Any]]
+    plane_z_m: float | None
+    yaw_period_deg: float
+    coverage: Mapping[str, Any] | None
+
+
+def validate_pose_layer(layer: str) -> PoseLayer:
+    if layer not in POSE_LAYERS:
+        raise ValueError(f"Unsupported layer {layer!r}; expected one of {', '.join(POSE_LAYERS)}")
+    return layer
+
+
+def require_object_layers(objects: Sequence[Mapping[str, Any]], layer: PoseLayer) -> None:
+    if validate_pose_layer(layer) != "object":
+        return
+    missing = [
+        str(obj["name"]) for obj in objects if not isinstance(obj.get("object_layer"), Mapping)
+    ]
+    if missing:
+        names = ", ".join(missing)
+        raise ValueError(
+            f"Missing object_layer in distribution.json for object(s): {names}. "
+            "Run 'lerobot-check object-poses' and then 'lerobot-check distribution', "
+            "or pass --layer tool to use end-effector poses."
+        )
+
+
+def get_object_layer(
+    obj: Mapping[str, Any], layer: PoseLayer = DEFAULT_POSE_LAYER
+) -> ObjectLayerData:
+    resolved = validate_pose_layer(layer)
+    if resolved == "tool":
+        median_z = obj.get("median_z_m")
+        return ObjectLayerData(
+            poses=list(obj.get("poses", ())),
+            plane_z_m=None if median_z is None else float(median_z),
+            yaw_period_deg=float(obj["yaw_symmetry_deg"]),
+            coverage=obj.get("coverage"),
+        )
+    raw = obj.get("object_layer")
+    if not isinstance(raw, Mapping):
+        name = str(obj.get("name", "<unknown>"))
+        raise ValueError(
+            f"Missing object_layer in distribution.json for object(s): {name}. "
+            "Run 'lerobot-check object-poses' and then 'lerobot-check distribution', "
+            "or pass --layer tool to use end-effector poses."
+        )
+    plane_z = raw.get("plane_z_m")
+    return ObjectLayerData(
+        poses=list(raw.get("poses", ())),
+        plane_z_m=None if plane_z is None else float(plane_z),
+        yaw_period_deg=float(raw["yaw_period_deg"]),
+        coverage=raw.get("coverage"),
+    )
 
 
 def load_target_polygon(path: Path) -> dict[str, Any]:
@@ -354,6 +416,7 @@ def generate_suggestions(
     object_filter: Sequence[str] | None = None,
     additional_poses: Mapping[str, Sequence[Mapping[str, Any]]] | None = None,
     seed: int = 0,
+    layer: PoseLayer = DEFAULT_POSE_LAYER,
     distribution_path: Path | str | None = None,
     targets_path: Path | str | None = None,
     calib_path: Path | str | None = None,
@@ -386,6 +449,7 @@ def generate_suggestions(
         ValueError: If ``count < 1``, ``test_per_tier < 0``, ``targets`` is supplied
             without calibration, or a requested object/arm cannot be resolved.
     """
+    resolved_layer = validate_pose_layer(layer)
     if count < 1:
         raise ValueError(f"count must be >= 1, got {count}")
     if test_per_tier < 0:
@@ -407,6 +471,19 @@ def generate_suggestions(
             "so object poses and z-planes use the calibrated tool point before running 'suggest'."
         )
 
+    all_objects: list[Mapping[str, Any]] = list(distribution.get("objects", []))
+    if object_filter:
+        wanted = set(object_filter)
+        known = {str(o["name"]) for o in all_objects}
+        missing = sorted(wanted - known)
+        if missing:
+            raise ValueError(f"Unknown object(s) in --object: {missing}")
+        selected_objects = [o for o in all_objects if str(o["name"]) in wanted]
+    else:
+        selected_objects = all_objects
+
+    require_object_layers(selected_objects, resolved_layer)
+
     if targets is None:
         warnings.warn(
             "No target polygon provided; falling back to observed data bounding box + 5 cm.",
@@ -424,17 +501,6 @@ def generate_suggestions(
     yaw_bin_deg = float(cov_cfg["yaw_bin_deg"])
     sparse_threshold = int(cov_cfg["sparse_threshold"])
 
-    all_objects: list[Mapping[str, Any]] = list(distribution.get("objects", []))
-    if object_filter:
-        wanted = set(object_filter)
-        known = {str(o["name"]) for o in all_objects}
-        missing = sorted(wanted - known)
-        if missing:
-            raise ValueError(f"Unknown object(s) in --object: {missing}")
-        selected_objects = [o for o in all_objects if str(o["name"]) in wanted]
-    else:
-        selected_objects = all_objects
-
     rng = np.random.default_rng(seed)
     objects_meta: list[dict[str, Any]] = []
     omitted_objects: list[str] = []
@@ -444,13 +510,13 @@ def generate_suggestions(
     for obj in selected_objects:
         obj_name = str(obj["name"])
         arm = str(obj["arm"])
-        yaw_sym = float(obj["yaw_symmetry_deg"])
-        poses: list[Mapping[str, Any]] = list(obj.get("poses", []))
-        median_z_raw = obj.get("median_z_m")
-        if not poses or median_z_raw is None:
+        layer_data = get_object_layer(obj, resolved_layer)
+        yaw_sym = layer_data.yaw_period_deg
+        poses = layer_data.poses
+        if not poses or layer_data.plane_z_m is None:
             omitted_objects.append(obj_name)
             continue
-        z_plane_m = float(median_z_raw)
+        z_plane_m = layer_data.plane_z_m
 
         arm_cal = calibration.arms.get(arm) if calibration is not None else None
         if arm_cal is not None and dist_calibrated_arms and arm not in dist_calibrated_arms:
@@ -651,6 +717,7 @@ def generate_suggestions(
             "revision": prov["revision"],
             "task_name": prov["task_name"],
             "position_point": dist_position_point,
+            "layer": resolved_layer,
             "distribution_path": str(distribution_path) if distribution_path is not None else None,
             "targets_path": str(targets_path) if targets_path is not None else None,
             "calib_path": str(calib_path) if calib_path is not None else None,

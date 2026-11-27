@@ -19,8 +19,20 @@ from lerobot_check.collection_progress import (
     PlanTarget,
     json_bytes,
 )
-from lerobot_check.masks import make_bundle, outline_base_points, sha256_bytes
-from lerobot_check.suggest import generate_suggestions
+from lerobot_check.masks import (
+    make_bundle,
+    outline_base_points,
+    sha256_bytes,
+    template_anchor_layer,
+)
+from lerobot_check.suggest import (
+    DEFAULT_POSE_LAYER,
+    PoseLayer,
+    generate_suggestions,
+    get_object_layer,
+    require_object_layers,
+    validate_pose_layer,
+)
 
 
 @dataclass(frozen=True)
@@ -59,12 +71,16 @@ def _collides(a: _Candidate, b: _Candidate) -> bool:
 
 
 def _coverage_history(
-    distribution: Mapping[str, Any], rounds: Sequence[PlanRound]
+    distribution: Mapping[str, Any],
+    rounds: Sequence[PlanRound],
+    *,
+    layer: PoseLayer = DEFAULT_POSE_LAYER,
 ) -> tuple[dict[str, list[Mapping[str, Any]]], dict[str, list[tuple[float, float]]]]:
+    resolved_layer = validate_pose_layer(layer)
     observed = {
         (obj["name"], pose["episode_index"]): pose
         for obj in distribution["objects"]
-        for pose in obj["poses"]
+        for pose in get_object_layer(obj, resolved_layer).poses
     }
     extra: dict[str, list[Mapping[str, Any]]] = defaultdict(list)
     avoid: dict[str, list[tuple[float, float]]] = defaultdict(list)
@@ -109,11 +125,22 @@ def _candidates(
     additional_poses: Mapping[str, Sequence[Mapping[str, Any]]],
     round_count: int,
     seed: int,
+    *,
+    layer: PoseLayer = DEFAULT_POSE_LAYER,
 ) -> tuple[dict[str, list[_Candidate]], str, bytes, dict[str, str]]:
+    resolved_layer = validate_pose_layer(layer)
     by_object = {template["object"]: template for template in templates}
     missing_templates = sorted({obj["name"] for obj in distribution["objects"]} - by_object.keys())
     if missing_templates:
         raise ValueError(f"Missing reviewed templates for: {', '.join(missing_templates)}")
+    for template in templates:
+        name = str(template["object"])
+        actual_layer = template_anchor_layer(template)
+        if actual_layer != resolved_layer:
+            raise ValueError(
+                f"Template for {name} uses anchor_layer={actual_layer!r}, "
+                f"expected {resolved_layer!r}"
+            )
     suggestions = generate_suggestions(
         distribution,
         count=min(2048, max(96, round_count * 5)),
@@ -122,6 +149,7 @@ def _candidates(
         calibration=calibration,
         additional_poses=additional_poses,
         seed=seed,
+        layer=resolved_layer,
     )
     suggested_names = {obj["object"] for obj in suggestions["objects"]}
     without_placements = set(suggestions["omitted_objects"]) - suggested_names
@@ -250,7 +278,9 @@ def _validate_plan_request(
     round_count: int,
     objects_per_round: int,
     seed: int,
-) -> None:
+    layer: PoseLayer = DEFAULT_POSE_LAYER,
+) -> PoseLayer:
+    resolved_layer = validate_pose_layer(layer)
     if not calibration.arms or (calibration.camera, calibration.image_size) != (
         calibration.intrinsics.camera,
         calibration.intrinsics.image_size,
@@ -263,6 +293,13 @@ def _validate_plan_request(
         previous["calibration_sha256"],
     ):
         raise ValueError("Existing plan uses another dataset or calibration")
+    if previous is not None:
+        previous_layer = validate_pose_layer(str(previous.get("layer", "tool")))
+        if previous_layer != resolved_layer:
+            raise ValueError(
+                f"Existing plan uses layer {previous_layer!r}; "
+                f"cannot generate with layer {resolved_layer!r}"
+            )
     if targets and (targets["camera"], targets["image_size"]) != (
         calibration.camera,
         list(calibration.image_size),
@@ -272,6 +309,8 @@ def _validate_plan_request(
         raise ValueError("Request 1–500 rounds and 1–all objects per round")
     if not 0 <= seed <= 2**53 - 1:
         raise ValueError("Seed must be a nonnegative safe integer")
+    require_object_layers(distribution["objects"], resolved_layer)
+    return resolved_layer
 
 
 @dataclass(frozen=True)
@@ -284,10 +323,14 @@ class _PlanningHistory:
 
 
 def _planning_history(
-    distribution: Mapping[str, Any], previous: CollectionPlan | None, replace_round_id: int | None
+    distribution: Mapping[str, Any],
+    previous: CollectionPlan | None,
+    replace_round_id: int | None,
+    *,
+    layer: PoseLayer = DEFAULT_POSE_LAYER,
 ) -> _PlanningHistory:
     old_rounds = [] if previous is None else previous["rounds"]
-    additional_poses, avoid = _coverage_history(distribution, old_rounds)
+    additional_poses, avoid = _coverage_history(distribution, old_rounds, layer=layer)
     distance = float(distribution["coverage_config"]["xy_bin_m"]) / 2
     kept = [r for r in old_rounds if r["status"] != "pending"]
     usage: Counter[str] = Counter(
@@ -398,8 +441,9 @@ def build_plan(
     objects_per_round: int,
     seed: int = 0,
     replace_round_id: int | None = None,
+    layer: PoseLayer = DEFAULT_POSE_LAYER,
 ) -> tuple[CollectionPlan, bytes]:
-    _validate_plan_request(
+    resolved_layer = _validate_plan_request(
         distribution,
         calibration,
         calibration_sha256,
@@ -408,8 +452,9 @@ def build_plan(
         round_count,
         objects_per_round,
         seed,
+        layer=layer,
     )
-    history = _planning_history(distribution, previous, replace_round_id)
+    history = _planning_history(distribution, previous, replace_round_id, layer=resolved_layer)
     if replace_round_id is not None and previous is not None:
         round_count = 1
         objects_per_round = previous["settings"]["objects_per_round"]
@@ -422,6 +467,7 @@ def build_plan(
         history.additional_poses,
         round_count,
         seed,
+        layer=resolved_layer,
     )
     pools, exclusions = _eligible_pools(pools, exclusions, objects_per_round)
     digest = sha256_bytes(bundle)
@@ -463,6 +509,7 @@ def build_plan(
         "camera_serial": _camera_serial(calibration),
         "calibration_sha256": calibration_sha256,
         "mask_bundle_sha256": digest,
+        "layer": resolved_layer,
         "settings": settings,
         "rounds": rounds,
         "excluded_objects": exclusions,

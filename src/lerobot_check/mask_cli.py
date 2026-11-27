@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,12 @@ from lerobot_check.masks import (
     sha256_bytes,
 )
 from lerobot_check.segmentation import MODEL, MODEL_REVISION, SamSegmenter, exterior_outline
+from lerobot_check.suggest import (
+    DEFAULT_POSE_LAYER,
+    POSE_LAYERS,
+    get_object_layer,
+    validate_pose_layer,
+)
 
 
 def segment(
@@ -31,6 +38,7 @@ def segment(
 
 
 def run_template(args: argparse.Namespace) -> None:
+    layer = validate_pose_layer(args.layer)
     calibration = load_head_calibration(args.calib)
     distribution = read_json(args.distribution, args.distribution.read_bytes())
     prov = distribution["provenance"]
@@ -51,6 +59,12 @@ def run_template(args: argparse.Namespace) -> None:
         if not args.reject.strip() or args.output is None or args.preview_only or args.box:
             raise ValueError("--reject requires a reason and --output instead of segmentation")
         source = None
+        raw_layer = obj.get("object_layer") if layer == "object" else None
+        plane_z = (
+            raw_layer.get("plane_z_m")
+            if isinstance(raw_layer, Mapping)
+            else (None if layer == "object" else obj.get("median_z_m"))
+        )
     else:
         if args.episode is None or args.frame is None or args.preview is None:
             raise ValueError("Supply --episode, --frame and --preview for the source image")
@@ -73,14 +87,18 @@ def run_template(args: argparse.Namespace) -> None:
             raise ValueError("--box must be a nonempty rectangle inside the calibrated image")
         if not math.isfinite(args.height_offset_m):
             raise ValueError("--height-offset-m must be finite")
-        anchor = next((p for p in obj["poses"] if p["episode_index"] == args.episode), None)
+        layer_data = get_object_layer(obj, layer)
+        anchor = next((p for p in layer_data.poses if p["episode_index"] == args.episode), None)
         if anchor is None:
-            raise ValueError(f"Episode {args.episode} has no {args.object} event pose")
+            raise ValueError(f"Episode {args.episode} has no {args.object} {layer}-layer pose")
+        if layer_data.plane_z_m is None:
+            raise ValueError(f"Object {args.object!r} has no {layer}-layer plane_z_m")
+        plane_z = layer_data.plane_z_m
         pixels = exterior_outline(
             segment(image, args.box, args.positive, args.negative, args.device)
         )
-        plane = obj["median_z_m"] + args.height_offset_m
-        outline_xy_m = make_local_outline(pixels, anchor, plane, calibration).tolist()
+        plane = plane_z + args.height_offset_m
+        outline_xy_m = make_local_outline(pixels, anchor, plane, calibration, layer=layer).tolist()
         vertices = [tuple(point) for point in pixels.tolist()]
         tinted = Image.new("RGBA", image.size)
         ImageDraw.Draw(tinted).polygon(
@@ -90,11 +108,16 @@ def run_template(args: argparse.Namespace) -> None:
         source = {
             "episode": args.episode,
             "image_frame": args.frame,
-            "event": obj["event"],
+            "event": (
+                obj["object_layer"].get("source", "head_mask")
+                if layer == "object"
+                else obj["event"]
+            ),
             "event_frame": anchor["frame"],
             "x_m": anchor["x_m"],
             "y_m": anchor["y_m"],
             "raw_yaw_deg": anchor["raw_yaw_deg"],
+            **({"folded_yaw_deg": anchor["folded_yaw_deg"]} if layer == "object" else {}),
             "model": MODEL,
             "model_revision": MODEL_REVISION,
             "box": args.box,
@@ -107,7 +130,8 @@ def run_template(args: argparse.Namespace) -> None:
         "revision": prov["revision"],
         "object": args.object,
         "arm": obj["arm"],
-        "z_plane_m": obj["median_z_m"],
+        "anchor_layer": layer,
+        "z_plane_m": plane_z,
         "height_offset_m": args.height_offset_m,
         "calibration_sha256": sha256_bytes(args.calib.read_bytes()),
         "source": source,
@@ -154,6 +178,7 @@ def configure_template_parser(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--positive", type=float, nargs=2, action="append", default=[])
     parser.add_argument("--negative", type=float, nargs=2, action="append", default=[])
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    parser.add_argument("--layer", choices=POSE_LAYERS, default=DEFAULT_POSE_LAYER)
     parser.add_argument("--height-offset-m", type=float, default=0.0)
     parser.add_argument(
         "--reject", help="Write a no-mask template with this reason instead of segmenting."

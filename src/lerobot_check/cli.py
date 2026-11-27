@@ -86,6 +86,8 @@ from lerobot_check.schema import (
     load_task_spec,
 )
 from lerobot_check.suggest import (
+    DEFAULT_POSE_LAYER,
+    POSE_LAYERS,
     format_suggestions_summary,
     generate_suggestions,
     load_target_polygon,
@@ -1018,6 +1020,7 @@ def _cmd_suggest(args: argparse.Namespace) -> int:
             calibration=calibration,
             object_filter=args.object,
             seed=args.seed,
+            layer=args.layer,
             distribution_path=dist_path.resolve(),
             targets_path=targets_path.resolve() if targets_path is not None else None,
             calib_path=calib_path.resolve() if calib_path is not None else None,
@@ -1991,6 +1994,15 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Random seed for reproducible sampling (default: 0).",
+    )
+    suggest_parser.add_argument(
+        "--layer",
+        choices=POSE_LAYERS,
+        default=DEFAULT_POSE_LAYER,
+        help=(
+            "Pose layer to read from distribution.json: 'object' (head-mask object_layer, "
+            "default) or 'tool' (end-effector event poses)."
+        ),
     )
     suggest_parser.add_argument(
         "-o",

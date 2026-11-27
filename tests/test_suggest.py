@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from pathlib import Path
+from typing import Any, cast
 
 import numpy as np
 import pytest
@@ -18,6 +19,7 @@ from lerobot_check.calib import (
 from lerobot_check.suggest import (
     ARROW_LENGTH_M,
     generate_suggestions,
+    get_object_layer,
     point_in_polygon,
     write_suggestions_csv,
 )
@@ -239,6 +241,7 @@ def test_suggest_with_polygon_prioritizes_empty_and_places_test_tiers(tmp_path: 
         targets=targets,
         calibration=cal,
         seed=42,
+        layer="tool",
     )
     assert result["version"] == 1
     assert result["provenance"]["region_source"] == "target_polygon"
@@ -310,11 +313,13 @@ def test_suggest_targets_without_calib_errors_and_bbox_fallback_warns() -> None:
     }
     # Explicit target polygon without calibration must error, never silently fall back.
     with pytest.raises(ValueError, match="without head-camera calibration"):
-        generate_suggestions(dist, count=5, targets=targets, calibration=None)
+        generate_suggestions(dist, count=5, targets=targets, calibration=None, layer="tool")
 
     # Without targets and without calibration: warns, uses bbox + 5 cm, pixels are null.
     with pytest.warns(UserWarning, match="bounding box"):
-        res = generate_suggestions(dist, count=6, test_per_tier=2, targets=None, calibration=None)
+        res = generate_suggestions(
+            dist, count=6, test_per_tier=2, targets=None, calibration=None, layer="tool"
+        )
     assert res["provenance"]["region_source"] == "data_bbox_plus_5cm"
     assert len(res["placements"]) == 6
     assert all(
@@ -352,6 +357,8 @@ def test_suggest_cli_errors_on_targets_without_calib(tmp_path: Path) -> None:
             str(dist_path),
             "--targets",
             str(targets_path),
+            "--layer",
+            "tool",
             "-n",
             "5",
             "-o",
@@ -432,7 +439,9 @@ def test_suggest_refuses_tcp_distribution_with_calib_and_uses_tool_point_plane()
         trajectory_samples=4,
     )
     with pytest.raises(ValueError, match="raw 'tcp' positions"):
-        generate_suggestions(dist_tcp, count=4, test_per_tier=1, targets=None, calibration=cal)
+        generate_suggestions(
+            dist_tcp, count=4, test_per_tier=1, targets=None, calibration=cal, layer="tool"
+        )
 
     # Distribution with calibration uses tool point -> suggest back-projects onto tool-point z.
     dist_tool = compute_distribution_from_states(
@@ -465,8 +474,237 @@ def test_suggest_refuses_tcp_distribution_with_calib_and_uses_tool_point_plane()
         "polygon": project_base_points(base_corners, T, cal.intrinsics).tolist(),
     }
     res = generate_suggestions(
-        dist_tool, count=5, test_per_tier=1, targets=targets, calibration=cal
+        dist_tool, count=5, test_per_tier=1, targets=targets, calibration=cal, layer="tool"
     )
     assert res["provenance"]["position_point"] == "tool_point"
+    assert res["provenance"]["layer"] == "tool"
     assert res["objects"][0]["z_plane_m"] == pytest.approx(z_tool)
     assert all(p["z_m"] == pytest.approx(z_tool) for p in res["placements"])
+
+
+def _attach_object_layer(
+    obj: dict,
+    *,
+    plane_z_m: float = -0.42,
+    yaw_period_deg: float = 180.0,
+    poses: list[dict] | None = None,
+) -> dict:
+    if poses is None:
+        poses = [
+            {
+                "episode_index": p["episode_index"],
+                "frame": 0,
+                "arm": obj["arm"],
+                "x_m": p["x_m"] + 0.05,
+                "y_m": p["y_m"],
+                "z_m": plane_z_m,
+                "raw_yaw_deg": float(p["raw_yaw_deg"]) + 180.0,
+                "folded_yaw_deg": float(p["raw_yaw_deg"]) % yaw_period_deg,
+                "length_m": 0.08,
+                "width_m": 0.05,
+            }
+            for p in obj["poses"]
+        ]
+    obj["object_layer"] = {
+        "source": "head_mask",
+        "frame": 0,
+        "arm": obj["arm"],
+        "plane_z_m": plane_z_m,
+        "yaw_period_deg": yaw_period_deg,
+        "poses": poses,
+        "skipped": [],
+        "coverage": {
+            "sample_count": len(poses),
+            "xy_bin_m": 0.05,
+            "yaw_bin_deg": 30.0,
+            "sparse_threshold": 3,
+            "num_yaw_bins": round(yaw_period_deg / 30.0),
+            "ix_range": [20, 22],
+            "iy_range": [0, 2],
+            "bins": [],
+        },
+    }
+    return obj
+
+
+def test_get_object_layer_reads_both_layers_and_rejects_missing() -> None:
+    dist = _make_distribution_with_tiers()
+    obj = dist["objects"][0]
+    obj["yaw_symmetry_deg"] = 360.0
+    _attach_object_layer(obj, plane_z_m=-0.4254, yaw_period_deg=180.0)
+
+    tool_data = get_object_layer(obj, "tool")
+    assert tool_data.poses == obj["poses"]
+    assert tool_data.plane_z_m == pytest.approx(-0.35)
+    assert tool_data.yaw_period_deg == 360.0
+    assert tool_data.coverage == obj["coverage"]
+
+    obj_data = get_object_layer(obj, "object")
+    assert obj_data.poses == obj["object_layer"]["poses"]
+    assert obj_data.plane_z_m == pytest.approx(-0.4254)
+    assert obj_data.yaw_period_deg == 180.0
+    assert obj_data.coverage == obj["object_layer"]["coverage"]
+
+    assert get_object_layer(obj) == obj_data
+
+    without_layer = {k: v for k, v in obj.items() if k != "object_layer"}
+    with pytest.raises(ValueError, match=r"box.*lerobot-check object-poses.*distribution"):
+        get_object_layer(without_layer, "object")
+    with pytest.raises(ValueError, match="Unsupported layer"):
+        get_object_layer(obj, cast(Any, "invalid"))
+
+
+def test_suggest_default_object_layer_errors_when_missing_naming_all_objects(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    import json
+
+    from lerobot_check.cli import main
+
+    dist = _make_distribution_with_tiers()
+    second = {**dist["objects"][0], "name": "phone"}
+    dist["objects"].append(second)
+
+    with pytest.raises(ValueError, match=r"box, phone.*lerobot-check object-poses.*distribution"):
+        generate_suggestions(dist, count=4, test_per_tier=1)
+
+    dist_path = tmp_path / "dist.json"
+    dist_path.write_text(json.dumps(dist), encoding="utf-8")
+    out_path = tmp_path / "suggestions.json"
+    rc = main(["suggest", "--distribution", str(dist_path), "-o", str(out_path)])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "box, phone" in err
+    assert "lerobot-check object-poses" in err
+    assert "distribution" in err
+    assert not out_path.exists()
+
+
+def test_suggest_object_layer_uses_plane_poses_and_yaw_period() -> None:
+    cal = _make_plausible_calibration()
+    dist = _make_distribution_with_tiers()
+    obj = dist["objects"][0]
+    obj["yaw_symmetry_deg"] = 360.0
+    _attach_object_layer(obj, plane_z_m=-0.4254, yaw_period_deg=180.0)
+    T = cal.arms["right"].T_cam_base
+    z_obj = -0.4254
+    base_corners = np.array(
+        [
+            [0.95, -0.05, z_obj],
+            [1.20, -0.05, z_obj],
+            [1.20, 0.20, z_obj],
+            [0.95, 0.20, z_obj],
+        ],
+        dtype=np.float64,
+    )
+    targets = {
+        "version": 1,
+        "camera": "observation.images.head",
+        "image_size": [640, 480],
+        "polygon": project_base_points(base_corners, T, cal.intrinsics).tolist(),
+    }
+
+    res = generate_suggestions(dist, count=12, test_per_tier=2, targets=targets, calibration=cal)
+    assert res["provenance"]["layer"] == "object"
+    assert res["objects"][0]["z_plane_m"] == pytest.approx(z_obj)
+    assert res["objects"][0]["yaw_symmetry_deg"] == 180.0
+    assert all(p["z_m"] == pytest.approx(z_obj) for p in res["placements"])
+    assert all(0.0 <= p["yaw_deg"] < 180.0 for p in res["placements"])
+    assert {p["yaw_bin"] for p in res["placements"]} == {0, 1, 2, 3, 4, 5}
+    dense_cells = {(tp["ix"], tp["iy"]) for tp in res["test_points"] if tp["tier"] == "dense"}
+    assert dense_cells == {(21, 1)}
+
+
+def test_suggest_tool_layer_matches_existing_fixture_via_cli(tmp_path: Path) -> None:
+    import json
+
+    from lerobot_check.calib import write_json
+    from lerobot_check.cli import main
+
+    fixtures_dir = Path(__file__).resolve().parent / "fixtures"
+    dist_fixture = fixtures_dir / "distribution.example.json"
+    suggest_fixture = fixtures_dir / "suggestions.example.json"
+    fixture_suggest = json.loads(suggest_fixture.read_text(encoding="utf-8"))
+
+    intr_raw = {
+        "version": 1,
+        "camera": "observation.images.head",
+        "image_size": [640, 480],
+        "fx": 600.0,
+        "fy": 600.0,
+        "cx": 320.0,
+        "cy": 240.0,
+        "distortion_model": "inverse_brown_conrady",
+        "distortion": [0.0, 0.0, 0.0, 0.0, 0.0],
+    }
+    cam_pos = np.array([0.35, 0.08, 0.45], dtype=np.float64)
+    look_at = np.array([1.05, 0.08, -0.50], dtype=np.float64)
+    z_ax = look_at - cam_pos
+    z_ax /= np.linalg.norm(z_ax)
+    x_ax = np.cross(z_ax, np.array([0.0, 0.0, 1.0]))
+    x_ax /= np.linalg.norm(x_ax)
+    y_ax = np.cross(z_ax, x_ax)
+    R_cb = np.vstack([x_ax, y_ax, z_ax])
+    T_cb = np.eye(4, dtype=np.float64)
+    T_cb[:3, :3] = R_cb
+    T_cb[:3, 3] = -(R_cb @ cam_pos)
+
+    calib_path = tmp_path / "head.json"
+    write_json(
+        {
+            "version": 1,
+            "repo_id": "Synthetic/demo",
+            "revision": "synthetic0001",
+            "camera": "observation.images.head",
+            "image_size": [640, 480],
+            "intrinsics": intr_raw,
+            "arms": {
+                "right": {
+                    "T_cam_base": T_cb.tolist(),
+                    "tool_offset": [0.0, 0.0, -0.15],
+                    "n_points": 15,
+                    "rms_px": 0.5,
+                    "loo_rms_px": 0.7,
+                    "residuals": [],
+                }
+            },
+        },
+        calib_path,
+    )
+    targets_path = tmp_path / "targets.json"
+    write_json(
+        {
+            "version": 1,
+            "camera": "observation.images.head",
+            "image_size": [640, 480],
+            "polygon": fixture_suggest["objects"][0]["polygon_pixel"],
+        },
+        targets_path,
+    )
+    out_path = tmp_path / "out.json"
+    rc = main(
+        [
+            "suggest",
+            "--distribution",
+            str(dist_fixture),
+            "--targets",
+            str(targets_path),
+            "--calib",
+            str(calib_path),
+            "--layer",
+            "tool",
+            "-n",
+            "4",
+            "--test-per-tier",
+            "2",
+            "--seed",
+            "0",
+            "-o",
+            str(out_path),
+        ]
+    )
+    assert rc == 0
+    cli_out = json.loads(out_path.read_text(encoding="utf-8"))
+    for key in ("version", "objects", "omitted_objects", "placements", "test_points"):
+        assert cli_out[key] == fixture_suggest[key]
+    assert cli_out["provenance"]["layer"] == "tool"

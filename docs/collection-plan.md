@@ -4,15 +4,20 @@ COLLECTION 计划是供离线审核、现场摆放和进度回传的单个 UTF-8
 
 ## 生成、审核、回传
 
-准备工具点版 `distribution.json`、同一数据集 revision 的 `head.json`，以及 [已审核的物体模板](../README.md#补采目标轮廓)。将模板放在 `<lerobot_root>/.xense-viewer/mask-templates/<org>__<name>@<revision>/`，分布中的每个物体都必须提供一个模板 JSON；缺少时 `generate` 会列出全部缺失物体并退出，不改写计划。无可靠轮廓的物体用 `mask-template --reject` 生成模板，才能参加单物体人工轮；不要把诊断模板当作审核结果。默认计划路径为 `.xense-viewer/plans/<org>__<name>@<revision>.json`。CLI 的 `--viewer-root` 接受显式的 `.xense-viewer` 目录；`--template` 可重复，提供时替代目录扫描。Viewer 使用 `LOCAL_DATASET_ROOT` 下的同一套路径。
+准备已标定的 `distribution.json`、同一数据集 revision 的 `head.json`，以及 [已审核的物体模板](../README.md#补采目标轮廓)。补采规划支持两套位姿层，通过 `--layer object|tool` 选择，默认为 `object`：
+
+- `object`（物体层，默认）：读取 `distribution.json` 中各物体的 `object_layer`（头图第 0 帧物体 mask 反投到 `plane_z_m` 的质心与最小外接矩形长轴朝向，折叠周期为 `yaw_period_deg`，矩形不超过 `180°`）。若任一物体缺少 `object_layer`，`generate` 直接报错并列出缺失物体，提示先运行 `lerobot-check object-poses` 再重跑 `lerobot-check distribution`，不静默回退。
+- `tool`（末端工具层）：读取事件帧标定工具点位姿、`median_z_m` 与 `yaw_symmetry_deg`，用于兼容未生成物体层的数据集或复现旧版工具点采样。
+
+将模板放在 `<lerobot_root>/.xense-viewer/mask-templates/<org>__<name>@<revision>/`，分布中的每个物体都必须提供一个模板 JSON；缺少时 `generate` 会列出全部缺失物体并退出，不改写计划。所有模板（包括 `--reject` 模板）的 `anchor_layer` 必须与当前 `--layer` 一致（不含 `anchor_layer` 的旧版模板按 `tool` 处理），不匹配时会点名拒绝。无可靠轮廓的物体用 `mask-template --reject` 生成模板，才能参加单物体人工轮；不要把诊断模板当作审核结果。默认计划路径为 `.xense-viewer/plans/<org>__<name>@<revision>.json`。CLI 的 `--viewer-root` 接受显式的 `.xense-viewer` 目录；`--template` 可重复，提供时替代目录扫描。Viewer 使用 `LOCAL_DATASET_ROOT` 下的同一套路径。
 
 ```sh
 uv run lerobot-check collection-plan generate \
   --dataset-root "$DATASET" --rounds 20 --objects-per-round 2
 ```
 
-- `--rounds` 是这次要生成的待采轮数；`--objects-per-round` 是每轮恰好几个不同物体。默认种子为 `0`，可传 `--seed`。轮内同时检查共同基座 XY 和相机像素上的凸包，不允许交叠或接触。已审核模板只近似一个平面；检查不涵盖物体高度、实物误差或未规划物体。采集时把其他物体放到不干扰的位置。本数据集的 `box_base` 只能参加单物体人工轮。多物体候选不足或搜索预算内找不到足够的轮次时，生成失败，已有计划不变。
-- 整批重生成保留已采和跳过的轮次，仅替换待采。已采目标补入覆盖统计，按 `object` 与 `episode_index` 已有真实观测时使用真实观测，不重复计数；若计划锚点与真实观测都存在，新点同时避开两者。默认同物体锚点至少相隔半个 XY 分箱宽度，与 yaw 无关。跳过不计数，也不排除位置。改标定、数据集或基准 revision 时归档旧计划，创建新计划。
+- `--rounds` 是这次要生成的待采轮数；`--objects-per-round` 是每轮恰好几个不同物体；`--layer` 可选 `object`（默认）或 `tool`。默认种子为 `0`，可传 `--seed`。轮内同时检查共同基座 XY 和相机像素上的凸包，不允许交叠或接触。已审核模板只近似一个平面；检查不涵盖物体高度、实物误差或未规划物体。采集时把其他物体放到不干扰的位置。本数据集的 `box_base` 只能参加单物体人工轮。多物体候选不足或搜索预算内找不到足够的轮次时，生成失败，已有计划不变。
+- 整批重生成保留已采和跳过的轮次，仅替换待采。已采目标补入覆盖统计（按当前所选位姿层读取已有观测），按 `object` 与 `episode_index` 已有真实观测时使用真实观测，不重复计数；若计划锚点与真实观测都存在，新点同时避开两者。默认同物体锚点至少相隔半个 XY 分箱宽度，与 yaw 无关。跳过不计数，也不排除位置。同一计划记录了 `layer`，不能在不同层之间混用；在已有计划上以不同 `--layer` 执行 `generate`（含 `--replace-round`）会报错（不含 `layer` 的旧计划按 `tool` 视之）。改标定、数据集、基准 revision 或切换位姿层时归档旧计划，创建新计划。
 - 在 COLLECTION 选择一轮可同时预览目标，并可重抽或删除该待采轮。重抽保持物体数、在原位置换入新轮 ID，且避开被换轮、已采及其他待采目标。删除只移除该轮。两种操作都保留其他轮的顺序、目标和进度。CLI 可用 `generate --replace-round ID` 或 `delete-round --plan PATH --round-id ID`；网页请求以 `--expect-plan-id`、`--expect-generation` 防止应用到未审核版本。
 - 审核完毕下载 JSON，再将同一文件用 `scp` 传到采集机；由 [viewer #5](https://github.com/AtticusZeller/xense-lerobot-viewer/issues/5) 的显式录制参数加载。外部副本在录制端使用期间不编辑或重新生成笔记本上的计划。采集结束后，取回写有进度的 JSON，合并后在 viewer 点刷新。不要拿返回文件直接覆盖已有计划。
 
@@ -32,6 +37,7 @@ uv run lerobot-check collection-plan import-progress \
 | `repo_id`, `revision`, `source_episode_count` | 数据集标识、生成时基准 revision（单一本地缓存树 commit 或 `"local"`）、首次生成时的 episode 总数。同一计划只追加到这一个本地数据集。 |
 | `camera`, `image_size`, `camera_serial` | 头部图像 feature key、`[width,height]` 原生像素、相机序列号字符串（保留前导零）。序列号来自 `intrinsics.serial_number` 或旧版标定的 RealSense 设备说明。`null` 表示可离线审核、不可实时引导。 |
 | `calibration_sha256`, `mask_bundle_sha256` | 小写 64 位十六进制，分别是读入的 `head.json` 文件字节与最近一次生成的候选 v1 mask bundle 字节的 SHA-256。每个轮次另记自己使用的 `mask_bundle_sha256`；重生成不改历史轮次的哈希。 |
+| `layer` | `"object"` 或 `"tool"`，记录计划使用的位姿层。不含该字段的旧版 v1 计划按 `"tool"` 视之；重生成或替换轮次时禁止切换层。 |
 | `settings` | 最近一次整批生成的 `round_count`、`objects_per_round`、`seed`、`min_revisit_distance_m`、`region_source`。逐轮编辑不改变整批设置；实际剩余数量看 `rounds`。 |
 | `excluded_objects` | 最近一次生成中不能参加当前批次的物体及原因，以物体名为键。 |
 | `rounds` | 按执行顺序排列的轮次，允许为空。每轮为 `{id, mask_bundle_sha256, targets, status, episode_index}`。 |
@@ -39,7 +45,7 @@ uv run lerobot-check collection-plan import-progress \
 每个 `targets` 元素含 `kind: "placement"`、`object`、`index`、`arm`、`x_m`、`y_m`、`z_m`、`yaw_deg`、`yaw_symmetry_deg`、`pixel`、`arrow_end_pixel`、`outline`、`outline_plane_z_m` 和 `reason`。
 
 - `object` 是分布的物体名，同轮唯一。`index` 是该轮对应 bundle 中该物体的候选序号，不等于轮 ID、目标显示编号或 episode 编号。展示编号可按该轮 `targets` 数组从 1 计。
-- `arm` 是 `head.json.arms` 的键。`x_m/y_m/z_m` 是该臂基座坐标系下的标定工具锚点（米），不是物体几何中心。`yaw_deg` 是围绕基座正 Z 的折叠角（度，`0 <= yaw_deg < yaw_symmetry_deg`）。`outline_plane_z_m` 是投影轮廓所在基座平面高度（含模板的可见面偏移），与锚点 `z_m` 可以不同。
+- `arm` 是 `head.json.arms` 的键。`object` 层下 `x_m/y_m/z_m` 是头图物体 mask 反投到 `plane_z_m` 的物体质心（米），`yaw_symmetry_deg` 记入物体层周期 `yaw_period_deg`（矩形为 `180°`）；`tool` 层下 `x_m/y_m/z_m` 是该臂基座坐标系下的标定工具锚点（米），`yaw_symmetry_deg` 为任务定义的工具对称周期。`yaw_deg` 是围绕基座正 Z 的折叠角（度，`0 <= yaw_deg < yaw_symmetry_deg`）。`outline_plane_z_m` 是投影轮廓所在基座平面高度（含模板的可见面偏移），与锚点 `z_m` 可以不同。
 - `pixel` 与 `arrow_end_pixel` 是原生头图 `[u,v]`，从左上角开始，右/下为正；箭头端点可能超出画幅，绘制时裁切。`outline` 是至少三个点的隐式闭合外环，所有点在原生画幅内，`reason` 为 `null`。无可靠轮廓时，`outline` 和 `outline_plane_z_m` 都为 `null`，`reason` 为非空文本；仅单物体轮允许此形态。
 - 计划内嵌所有选中目标，不需要用 `<slug>@<revision>.json` 去找单点 mask。候选 bundle 的确切字节保存在计划同目录的 `bundles/<sha256>.json` 供离线追溯，使用原有 mask bundle v1 结构；旧版 placements/test points、CSV 与 mask bundle 不覆写。导出无需传输候选 bundle。
 

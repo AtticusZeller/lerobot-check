@@ -15,7 +15,7 @@ CLI 入口为 `lerobot-check`，提供以下子命令：
 - `validate`：对照数据集元数据中的 episode 长度、数据集 revision 与 task spec 校验标注表，逐条输出违规并以非零状态码退出。标注表中 `contact` 不再要求标注（留空合法），`grasp` 仍用于提取 `event: grasp` 物体的初始位姿。
 - `relabel` / `verify-relabel`：按标注表与 task spec 逐帧重标 N 个 subtask 的 `task_index`（视频硬链接不重编码），并校验除 task 相关字段外与源数据零差异。
 - `distribution`：输出机读 `distribution.json`（含标注来源统计、各 subtask 帧占比、物体初始位姿与覆盖网格、各 subtask 参与臂的起终点与 0→1 进度重采样轨迹、起终点覆盖与轨迹离散度指标），支持 `--episodes` 过滤；存在 `calib/*.head.json`（或显式传 `--calib`）时自动将各臂位置换算到标定后的工具点 `p_tcp + R_tcp @ tool_offset`，并在 `provenance.position_point` 记录（`tool_point` 或 `tcp`）。
-- `suggest`：读取 `distribution.json`、头部图像像素空间目标多边形（`targets/*.json`）与头部相机外参（`calib/*.head.json`），将多边形反投到各物体所在平面（`z` 取事件帧工具点 `z` 中位数），在多边形内按空白优先、稀疏其次、yaw 分箱均衡的原则抽样 N 个补采摆放，并生成 `dense` / `edge` / `empty` 三类测试点（附带头部像素坐标与朝向箭头端点）；写出 `suggestions/*.json`，可选导出 CSV。未提供目标多边形时默认使用数据包围盒外扩 5 cm；若已有标定但 `distribution.json` 仍基于原始 `tcp` 计算，则拒绝混用并提示重跑 `distribution`。
+- `suggest`：读取 `distribution.json`、头部图像像素空间目标多边形（`targets/*.json`）与头部相机外参（`calib/*.head.json`），支持 `--layer object|tool`（默认 `object`）。`object` 层使用各物体的 `object_layer`（头图第 0 帧物体 mask 质心、`plane_z_m` 平面与 `yaw_period_deg` 折叠周期，矩形为 `180°`）；若存在物体缺少 `object_layer`，直接报错列出缺失物体并提示先运行 `lerobot-check object-poses` 再重跑 `distribution`（不静默回退）。`tool` 层沿用事件帧工具点位姿、`median_z_m` 与 `yaw_symmetry_deg`。将多边形反投到对应平面后，按空白优先、稀疏其次、yaw 分箱均衡的原则抽样 N 个补采摆放，并生成 `dense` / `edge` / `empty` 三类测试点（附带头部像素坐标与朝向箭头端点）；写出 `suggestions/*.json`（在 `provenance.layer` 记录所用层），可选导出 CSV。未提供目标多边形时默认使用数据包围盒外扩 5 cm；若已有标定但 `distribution.json` 仍基于原始 `tcp` 计算，则拒绝混用并提示重跑 `distribution`。
 - `calib-frames`：跨全部 episode 筛选夹爪闭合（默认 `gripper <= 0.05`，可通过 `--max-gripper` 调整）且低速运动（默认 TCP 速度 `<= 0.03 m/s`，同 episode 中心差分，可通过 `--max-speed` 调整或 `--no-speed-filter` 关闭）的帧，对每条臂的 TCP 位置与姿态执行最远点采样（默认每臂 15 帧），写出含 `speed_mps` 的 `calib/*.frames.json`；已有文件时默认拒绝覆盖（防止重置 ID 导致已点选数据失效），支持 `--append K`（可配合 `--arms left[,right]` 按臂追加）保留已有条目与 ID 并以全部已有帧作为最远点种子继续采样，或显式传 `--overwrite` 重新生成。
 - `calibrate`：读取 `calib/*.points.json` 与 `calib/*.intrinsics.json`，按臂独立执行 `solvePnP` / `solvePnPRansac` 初始化与 `soft_l1` 鲁棒外参 + 工具偏移 `tool_offset` 联合最小二乘求解，输出 `calib/*.head.json`（含每点残差与离群点标记 `outlier`、全点与内点 RMS/留一误差）。
 
@@ -61,7 +61,12 @@ uv run lerobot-check mask-overlays --suggestions "$SUGGESTIONS" --calib "$HEAD" 
 
 `DIST`、`HEAD` 和 `SUGGESTIONS` 是上述默认目录里的已有文件路径；`SLUG` 为 `org__name`，`REVISION` 与建议文件同名。若数据集不在默认本地缓存，给 `mask-template` 加 `--dataset-root /path/to/dataset`。框示例针对 `Xense/pack_iphone_box_1119` 的参考帧，其他图必须重新框选。`mask-template --preview-only` 不需要模型。只有分割步骤使用可选的 Transformers 依赖和固定版本 SAM 2.1 Hiera Tiny（约 156 MB 权重，首次运行下载；缓存后可设 `HF_HUB_OFFLINE=1`）。默认 CPU，也可用 `--device cuda`。
 
-轮廓使用事件帧记录的工具点及 yaw 做锚，在 `suggest` 的平面拟合并变换到目标位置。工具并不测量真实物体中心、厚度或三维朝向。若已知可见面的高度不同，用 `--height-offset-m` 给一个相对建议平面的有符号偏移。更换标定或平面后重建模板，建议点变化后重新投影。`mask-overlays` 不装模型，不修改采样，也不改变 `suggestions.json`。
+`mask-template` 支持 `--layer object|tool`（默认 `object`），并在模板 JSON 中写入 `"anchor_layer"`（`--reject` 模板同样记录该字段；不含 `anchor_layer` 的旧模板视为 `"tool"`）：
+
+- `object` 层（默认）：使用源 episode 的 `object_layer` 位姿（`x_m`、`y_m`、`folded_yaw_deg`）与 `plane_z_m` 做锚，投影到目标位姿时按 `yaw_period_deg`（矩形为 `180°`，不区分首尾）选取最接近参考角的等价朝向。
+- `tool` 层：沿用事件帧记录的标定工具点（`x_m`、`y_m`、`raw_yaw_deg`）与 `median_z_m` 做锚，按 `yaw_symmetry_deg` 折叠，不测量真实物体中心。
+
+`mask-overlays` 与 `collection-plan` 会检查每个模板的 `anchor_layer` 与当前使用的位姿层一致，层不匹配时点名拒绝。若已知可见面的高度不同，用 `--height-offset-m` 给一个相对当前平面的有符号偏移。更换标定、平面或切换位姿层后需重建模板，建议点变化后重新投影。`mask-overlays` 不装模型，不修改采样，也不改变 `suggestions.json`。
 
 ## 补采轮次与进度
 

@@ -15,6 +15,20 @@ from lerobot_check.calib import (
 )
 from lerobot_check.dataset import DatasetView
 from lerobot_check.render import decode_video_frames_pyav
+from lerobot_check.suggest import PoseLayer, validate_pose_layer
+
+
+def template_anchor_layer(template: Mapping[str, Any]) -> PoseLayer:
+    raw = template.get("anchor_layer", "tool")
+    if not isinstance(raw, str):
+        raise ValueError(f"Invalid template anchor_layer: {raw!r}")
+    return validate_pose_layer(raw)
+
+
+def anchor_yaw_deg(anchor: Mapping[str, Any], layer: PoseLayer) -> float:
+    if validate_pose_layer(layer) == "object":
+        return float(anchor["folded_yaw_deg"])
+    return float(anchor["raw_yaw_deg"])
 
 
 def sha256_bytes(content: bytes) -> str:
@@ -45,10 +59,15 @@ def make_local_outline(
     anchor: Mapping[str, Any],
     plane: float,
     calibration: HeadCalibration,
+    *,
+    layer: PoseLayer = "tool",
 ) -> np.ndarray:
     arm = calibration.arms[anchor["arm"]]
     base = backproject_pixels_to_plane_z(pixels, plane, arm.T_cam_base, calibration.intrinsics)
-    return rotate_xy(base[:, :2] - [anchor["x_m"], anchor["y_m"]], -anchor["raw_yaw_deg"])
+    return rotate_xy(
+        base[:, :2] - [anchor["x_m"], anchor["y_m"]],
+        -anchor_yaw_deg(anchor, layer),
+    )
 
 
 def outline_base_points(
@@ -57,7 +76,8 @@ def outline_base_points(
     local = np.asarray(template["outline_xy_m"], dtype=np.float64)
     if local.ndim != 2 or local.shape[1] != 2 or len(local) < 3 or not np.isfinite(local).all():
         raise ValueError("Invalid local outline")
-    yaw = closest_equivalent_yaw(item["yaw_deg"], template["source"]["raw_yaw_deg"], period)
+    ref_yaw = anchor_yaw_deg(template["source"], template_anchor_layer(template))
+    yaw = closest_equivalent_yaw(item["yaw_deg"], ref_yaw, period)
     xy = rotate_xy(local, yaw) + np.array([item["x_m"], item["y_m"]])
     plane = item["z_m"] + template["height_offset_m"]
     return np.column_stack((xy, np.full(len(xy), plane)))
@@ -105,6 +125,7 @@ def make_bundle(
         raise ValueError("Expected calibrated v1 suggestions (position_point=tool_point)")
     if (repo_id, revision) != (calibration.repo_id, calibration.revision):
         raise ValueError("Suggestions and calibration refer to different dataset revisions")
+    expected_layer = validate_pose_layer(str(provenance.get("layer", "tool")))
     objects = {obj["object"]: obj for obj in suggestions["objects"]}
     by_object: dict[str, Mapping[str, Any]] = {}
     for template in templates:
@@ -117,6 +138,12 @@ def make_bundle(
         )
         if actual != expected:
             raise ValueError(f"Template for {name} uses another dataset or calibration")
+        actual_layer = template_anchor_layer(template)
+        if actual_layer != expected_layer:
+            raise ValueError(
+                f"Template for {name} uses anchor_layer={actual_layer!r}, "
+                f"expected {expected_layer!r}"
+            )
         if not template.get("reason"):
             obj = objects[name]
             if template["arm"] != obj["arm"] or not math.isclose(

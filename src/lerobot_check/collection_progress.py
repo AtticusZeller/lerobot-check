@@ -9,7 +9,7 @@ from collections.abc import Generator
 from contextlib import contextmanager
 from copy import deepcopy
 from pathlib import Path
-from typing import Any, Literal, TypedDict, cast
+from typing import Any, Literal, NotRequired, TypedDict, cast
 from uuid import UUID
 
 
@@ -60,6 +60,7 @@ class CollectionPlan(TypedDict):
     camera_serial: str | None
     calibration_sha256: str
     mask_bundle_sha256: str
+    layer: NotRequired[Literal["object", "tool"]]
     settings: PlanSettings
     excluded_objects: dict[str, str]
     rounds: list[PlanRound]
@@ -145,6 +146,8 @@ def validate_plan(plan: Any) -> CollectionPlan:
     _require(plan["camera_serial"] is None or _text(plan["camera_serial"]), "camera_serial")
     for key in ("calibration_sha256", "mask_bundle_sha256"):
         _require(_sha(plan.get(key)), key)
+    if "layer" in plan:
+        _require(plan["layer"] in ("object", "tool"), "layer")
     size = plan.get("image_size")
     _require(isinstance(size, list) and len(size) == 2 and all(map(_int, size)), "image_size")
     settings = plan.get("settings")

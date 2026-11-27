@@ -5,6 +5,7 @@
     "revision": "synthetic0001",
     "task_name": "synthetic_pick_place",
     "position_point": "tool_point",
+    "layer": "tool",
     "distribution_path": "/path/to/.xense-viewer/distribution/Synthetic__demo@synthetic0001.json",
     "targets_path": "/path/to/.xense-viewer/targets/Synthetic__demo.json",
     "calib_path": "/path/to/.xense-viewer/calib/Synthetic__demo.head.json",

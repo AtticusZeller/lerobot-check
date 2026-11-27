@@ -24,7 +24,7 @@ from lerobot_check.dataset import (
 )
 from lerobot_check.json_io import read_json
 from lerobot_check.masks import sha256_bytes
-from lerobot_check.suggest import load_target_polygon
+from lerobot_check.suggest import DEFAULT_POSE_LAYER, POSE_LAYERS, load_target_polygon
 
 
 def configure_plan_parser(parser: argparse.ArgumentParser) -> None:
@@ -42,6 +42,7 @@ def configure_plan_parser(parser: argparse.ArgumentParser) -> None:
     generate.add_argument("--rounds", type=int, default=10)
     generate.add_argument("--objects-per-round", type=int, default=1)
     generate.add_argument("--seed", type=int, default=0)
+    generate.add_argument("--layer", choices=POSE_LAYERS, default=DEFAULT_POSE_LAYER)
     generate.add_argument("--replace-round", type=int)
     generate.add_argument("--expect-missing", action="store_true")
     generate.add_argument("--expect-plan-id")
@@ -115,6 +116,7 @@ def _generate(args: argparse.Namespace) -> None:
             objects_per_round=args.objects_per_round,
             seed=args.seed,
             replace_round_id=args.replace_round,
+            layer=args.layer,
         )
         validate_plan(plan)
         atomic_write(plan_path.parent / "bundles" / f"{plan['mask_bundle_sha256']}.json", bundle)

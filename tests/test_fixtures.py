@@ -199,6 +199,7 @@ def build_synthetic_fixtures() -> tuple[dict[str, Any], dict[str, Any]]:
         targets=targets,
         calibration=cal,
         seed=0,
+        layer="tool",
         distribution_path="/path/to/.xense-viewer/distribution/Synthetic__demo@synthetic0001.json",
         targets_path="/path/to/.xense-viewer/targets/Synthetic__demo.json",
         calib_path="/path/to/.xense-viewer/calib/Synthetic__demo.head.json",
