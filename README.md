@@ -39,7 +39,7 @@ CLI 入口为 `lerobot-check`，提供以下子命令：
 沿用已有的 calibrated `distribution.json`、`suggestions.json` 和 `head.json`。这些命令只读数据集。把生成物留在本地，不提交视频帧、标定或模板。
 
 ```bash
-# 先按该物体的事件帧在附近找一个无遮挡、物体没有移动的头图。
+# 默认 object 层以第 0 帧的物体位姿为锚，取该 episode 第 0 帧头图；--layer tool 时在事件帧附近找一个无遮挡、物体没有移动的头图。
 uv run lerobot-check mask-template --distribution "$DIST" --calib "$HEAD" \
   --object iphone --episode 0 --frame 0 --preview /tmp/iphone-source.png --preview-only
 

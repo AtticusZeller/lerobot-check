@@ -424,7 +424,8 @@ def generate_suggestions(
     """Generate next-batch collection placements and three-tier test points.
 
     When ``targets`` is provided, ``calibration`` is required so the pixel-space
-    polygon can be back-projected onto each object's plane ``z = median_z_m``.
+    polygon can be back-projected onto each object's layer plane (``object_layer.plane_z_m``
+    or ``median_z_m``).
     When ``targets`` is ``None``, falls back to the object's observed data
     bounding box expanded by 5 cm with a warning.
 
