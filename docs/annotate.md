@@ -34,7 +34,7 @@ Read the task spec YAML comments for any subtask-specific boundary overrides, an
 Search each non-final subtask boundary separately, coarse to fine, using `lerobot-check window-sheet`:
 
 1. **One agent per non-final boundary**: assign one annotating agent to each non-final boundary `k` (`1 .. N-1`). Each agent judges only its own boundary across all episodes.
-2. **Choose the search window**: if an earlier annotation of the same task already established a time window for boundary `k`, reuse it. Otherwise, first run `window-sheet` over the full episode length at ~4 s spacing on ~8 episodes (for example `--episodes 0,15,30,45,60,75,90,100 --window-s 0:60 --samples 16`) and choose a window covering the observed boundary times with margin.
+2. **Choose the search window**: if an earlier annotation of the same task already established a time window for boundary `k`, reuse it. Otherwise, first run `window-sheet` over the full episode length at ~4 s spacing on ~8 episodes: set `HI` to at least the longest `duration_s` printed by `info` (each window is clamped to its episode's last frame) and `--samples` to about `HI / 4 + 1` (for example, with a longest episode of 106.5 s, `--episodes 0,15,30,45,60,75,90,100 --window-s 0:108 --samples 28`). Choose a window covering the observed boundary times with margin.
 3. **Round 1 (`--window-s`, ~4 s spacing)**: render 8 evenly spaced frames inside the window with 8 episodes per sheet (`--per-page 8`, default). Crop `head` to the active workspace when helpful:
 
 ```bash
@@ -62,7 +62,7 @@ uv run lerobot-check window-sheet \
   -o /tmp/lerobot-check/window-r2
 ```
 
-From Round 2, each boundary agent outputs a CSV with header `episode_index,end` for its boundary.
+From Round 2, each boundary agent outputs a CSV with header `episode_index,end` for its boundary, using each episode's first `"yes"` frame as `end`; Step 3 refines it to the exact frame.
 
 5. **Assemble the initial annotation table**: the coordinator combines the per-boundary `episode_index,end` CSVs into one annotation CSV per `(repo_id, revision)` (default `<lerobot_root>/.xense-viewer/subtasks/<org>__<name>@<revision>.csv`), setting `start = 0` for the first subtask, each subsequent row's `start` to the previous row's `end`, and the final subtask's `end` to `episode_length`, with the exact header:
 
