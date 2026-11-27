@@ -1,6 +1,7 @@
 import json
 import math
 import warnings
+from collections import Counter
 from dataclasses import replace
 
 import numpy as np
@@ -11,6 +12,9 @@ from lerobot_check.cli import main
 from lerobot_check.collection_planner import (
     _candidates,
     _coverage_history,
+    _placement_candidate,
+    _planning_history,
+    _select_round,
     build_plan,
     convex_hulls_overlap,
     delete_pending,
@@ -241,6 +245,71 @@ def test_history_augments_coverage_without_double_counting(calibrated_inputs):
             assert all(
                 math.hypot(t["x_m"] - x, t["y_m"] - y) >= 0.025 for x, y in avoid[t["object"]]
             )
+
+
+def test_placement_candidate_requires_rejection_for_missing_outline(calibrated_inputs):
+    _, head, templates = calibrated_inputs
+    item = {
+        "object": "lid",
+        "index": 1,
+        "arm": "right",
+        "x_m": 0,
+        "y_m": 0,
+        "z_m": 0,
+        "yaw_deg": 0,
+        "pixel": [320, 240],
+        "arrow_end_pixel": [332, 240],
+    }
+    mask = {"outline": None, "reason": "Projection failed"}
+    args = (180, head.image_size, np.eye(4))
+    assert _placement_candidate(item, mask, templates[0], *args) is None
+
+    reason = "No reliable pose proxy"
+    rejected = {**templates[0], "reason": reason}
+    manual_mask = {"outline": None, "reason": reason}
+    manual = _placement_candidate(item, manual_mask, rejected, *args)
+    assert manual is not None and manual.target["reason"] == reason
+    assert manual.base_hull is None and manual.image_hull is None
+    assert _placement_candidate({**item, "pixel": [640, 240]}, manual_mask, rejected, *args) is None
+
+
+def test_replacement_history_counts_other_pending_rounds_but_avoids_all(calibrated_inputs):
+    distribution, _, _ = calibrated_inputs
+    original, _ = make_plan(calibrated_inputs, objects_per_round=1)
+    done, skipped, replacing, other = original["rounds"]
+    done["status"], done["episode_index"] = "collected", 2
+    skipped["status"] = "skipped"
+    original["settings"]["min_revisit_distance_m"] = 0.11
+
+    history = _planning_history(distribution, original, replacing["id"])
+
+    assert history.distance == 0.11
+    assert history.kept == [done, skipped]
+    assert history.usage == Counter(r["targets"][0]["object"] for r in (done, other))
+    expected = {
+        (target["object"], target["x_m"], target["y_m"])
+        for round_ in (done, replacing, other)
+        for target in round_["targets"]
+    }
+    assert {(name, x, y) for name, poses in history.avoid.items() for x, y in poses} == expected
+
+
+def test_round_selection_respects_revisit_usage_and_collision(calibrated_inputs):
+    distribution, head, templates = calibrated_inputs
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", UserWarning)
+        pools, _, _, _ = _candidates(distribution, head, templates, SHA, None, {}, 4, 0)
+    lid, phone = pools["lid"], pools["phone"]
+    order = {"lid": 0, "phone": 1}
+    first_xy = (lid[0].target["x_m"], lid[0].target["y_m"])
+    avoid = {"lid": [first_xy]}
+    available = {"lid": lid, "phone": phone}
+    selected = _select_round(available, avoid, Counter({"lid": 1}), order, 0.025, 1)
+    assert selected == [phone[0].target]
+    assert _select_round({"lid": lid[:1]}, avoid, Counter(), order, 0.025, 1) is None
+
+    colliding = replace(phone[0], image_hull=lid[0].image_hull)
+    assert _select_round({"lid": lid[:1], "phone": [colliding]}, {}, Counter(), order, 0, 2) is None
 
 
 def test_replacing_or_deleting_one_pending_round_keeps_all_others(calibrated_inputs):

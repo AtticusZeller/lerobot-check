@@ -22,7 +22,7 @@ from lerobot_check.dataset import (
     infer_repo_id,
     resolve_dataset_root,
 )
-from lerobot_check.mask_cli import read_json
+from lerobot_check.json_io import read_json
 from lerobot_check.masks import sha256_bytes
 from lerobot_check.suggest import load_target_polygon
 

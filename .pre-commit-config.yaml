@@ -1,0 +1,6 @@
+repos:
+  - repo: https://github.com/AtticusZeller/no-comments
+    rev: v0.8.0
+    hooks:
+      - id: no-comments
+        language_version: python3.12
